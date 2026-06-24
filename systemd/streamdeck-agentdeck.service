@@ -1,0 +1,12 @@
+[Unit]
+Description=Stream Deck Plus -> agent-deck headless bridge
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/streamdeck-agentdeck/deck.py
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

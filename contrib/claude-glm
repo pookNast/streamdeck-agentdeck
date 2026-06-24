@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# claude-glm — Claude Code via Z.AI GLM-5.1 (reads a user-local secret).
+#
+# Install to ~/bin/claude-glm (chmod 755) and put your key in
+#   ~/.config/claude-glm/secrets   (chmod 600):
+#       ZAI_API_KEY=your-zai-api-key
+#
+# Then "claude-glm" runs Claude Code against the GLM backend. Used as one of the
+# spawn TOOLS in deck.py (directly, or via `ssh -t <host> bash -lc claude-glm`).
+SECRETS="$HOME/.config/claude-glm/secrets"
+[[ -f "$SECRETS" ]] && source "$SECRETS"
+if [[ -z "$ZAI_API_KEY" ]]; then
+  echo "ERROR: ZAI_API_KEY not set. Check $SECRETS" >&2; exit 1
+fi
+export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
+export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.1"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="glm-5.1"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-4.5-air"
+export API_TIMEOUT_MS="3000000"
+exec claude "$@"
