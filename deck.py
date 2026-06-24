@@ -80,9 +80,10 @@ _sessions = []
 _active_id = None
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
-_pending_tool = None       # command chosen in the tool menu
+_pending_tool = None       # (label, command) chosen in the tool menu -> spawn new
+_pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
-_win_map = {}              # session id -> konsole X window id we opened for it
+_win_map = {}              # session id -> konsole process pid we opened for it
 
 # ---- plumbing -------------------------------------------------------------
 def _run(cmd, timeout=30):
@@ -247,19 +248,21 @@ def _attach_cmd(sid):
     # the session is already running, so we silence that and attach regardless.
     return "%s session start %s >/dev/null 2>&1; %s session attach %s" % (AD, sid, AD, sid)
 
-def open_session_window(s):
-    place_konsole(_attach_cmd(s["id"]), "window", sid=s["id"])
+def open_existing(s, mode):
+    """(Re)open an existing session in the chosen placement (window/tab/split)."""
+    place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"])
 
-def toggle_session_window(s):
-    """If this session's konsole is still alive: minimize it when visible,
-    restore+raise when minimized. Otherwise (closed / never opened) open one.
-    Re-resolves the window from the tracked pid each time, so closing it with the
-    X button (or X id reuse) can't leave the deck out of sync."""
+def toggle_or_place(deck, s):
+    """If this session's konsole window is alive: minimize it when visible,
+    restore+raise when minimized. If it has NO window yet, open the placement
+    menu for it (window / tab / split), just like spawning a new one — so an
+    existing session can be dropped into a split of your konsole too.
+    Re-resolves the window from the tracked pid, so an X-close can't desync it."""
+    global _pending_session, _pending_tool
     if not s:
         return
-    sid = s["id"]
     with _lock:
-        pid = _win_map.get(sid)
+        pid = _win_map.get(s["id"])
     wins = _windows_of_pid(pid)
     if wins:
         wid = wins[0]
@@ -268,10 +271,11 @@ def toggle_session_window(s):
         else:
             _xrun(["wmctrl", "-i", "-a", wid]); log("restore window for %s", s.get("title"))
     else:
-        log("no live window for %s; opening", s.get("title")); open_session_window(s)
-
-def act_toggle():
-    toggle_session_window(active_session())
+        log("no window for %s; placement menu", s.get("title"))
+        _pending_tool = None
+        _pending_session = s
+        open_menu("place")
+        repaint(deck)
 
 def spawn(tool, mode):
     label, cmd = tool
@@ -315,8 +319,8 @@ def open_menu(mode):
     _menu_deadline = time.monotonic() + MENU_TIMEOUT
 
 def close_menu():
-    global _ui_mode, _pending_tool
-    _ui_mode = "board"; _pending_tool = None
+    global _ui_mode, _pending_tool, _pending_session
+    _ui_mode = "board"; _pending_tool = None; _pending_session = None
 
 # ---- rendering ------------------------------------------------------------
 def _multiline(draw, text, font, max_w):
@@ -385,8 +389,9 @@ def render_touchscreen(deck):
         d.text((16, 30), "pick agent for new session  ·  Cancel = key 8",
                font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
     elif _ui_mode == "place":
-        d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" %
-               (_pending_tool[0] if _pending_tool else ""),
+        _what = (_pending_tool[0] if _pending_tool
+                 else _pending_session.get("title", "session") if _pending_session else "")
+        d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" % _what,
                font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
     else:
         s = active_session()
@@ -431,8 +436,13 @@ def on_key(deck, key, pressed):
         if key == CANCEL_KEY:
             close_menu()
         elif key < len(PLACEMENTS):
-            tool, mode = _pending_tool, PLACEMENTS[key][1]
-            close_menu(); _bg(spawn, tool, mode)
+            mode = PLACEMENTS[key][1]
+            if _pending_tool:                       # spawn a NEW session
+                tool = _pending_tool; close_menu(); _bg(spawn, tool, mode)
+            elif _pending_session:                  # (re)open an EXISTING session
+                s = _pending_session; close_menu(); _bg(open_existing, s, mode)
+            else:
+                close_menu()
         repaint(deck); return
     # board mode
     with _lock:
@@ -440,7 +450,7 @@ def on_key(deck, key, pressed):
     if key < len(sess):
         s = sess[key]
         if s["id"] == active:
-            _bg(toggle_session_window, s)
+            _bg(toggle_or_place, deck, s)
         else:
             with _lock:
                 _active_id = s["id"]
@@ -457,7 +467,8 @@ def on_dial(deck, dial, event, value):
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
-        {0: act_toggle, 1: lambda: (open_menu("tool"), repaint(deck)),
+        {0: lambda: _bg(toggle_or_place, deck, active_session()),
+         1: lambda: (open_menu("tool"), repaint(deck)),
          2: act_restart, 3: act_stop}.get(dial, lambda: None)()
         if dial in (2, 3):
             _bg(repaint, deck)
