@@ -1,0 +1,6 @@
+# secrets & local state — never commit
+secrets
+*.secret
+.config/
+__pycache__/
+*.pyc

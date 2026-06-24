@@ -1,0 +1,5 @@
+# Elgato Stream Deck family — grant the active local user direct hidraw/usb
+# access via systemd-logind uaccess (no root, no static group needed).
+# Covers Original, Mini, XL, MK.2, Pedal, Plus (vendor 0fd9).
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
