@@ -82,6 +82,7 @@ _brightness = 60
 _ui_mode = "board"         # board | tool | place
 _pending_tool = None       # command chosen in the tool menu
 _menu_deadline = 0.0
+_win_map = {}              # session id -> konsole X window id we opened for it
 
 # ---- plumbing -------------------------------------------------------------
 def _run(cmd, timeout=30):
@@ -150,23 +151,53 @@ def _session_list(svc):
 def _run_in_session(svc, sid, cmd):
     _qdbus(svc, "/Sessions/%s" % sid, "org.kde.konsole.Session.runCommand", cmd)
 
-def _new_window(cmd):
-    env = _dbus_env()
-    term = "konsole" if shutil.which("konsole") else "xterm"
-    subprocess.Popen([term, "-e", "bash", "-lc", "%s; exec bash" % cmd], env=env,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    log("opened new %s window", term)
+def _xrun(args, timeout=5):
+    try:
+        return subprocess.check_output(args, env=_dbus_env(), text=True, timeout=timeout)
+    except Exception:
+        return ""
 
-def place_konsole(cmd, mode):
-    """cmd runs in the chosen placement. window -> fresh konsole; tab/split ->
-    inside the focused konsole window via D-Bus (falls back to a new window)."""
+def _konsole_windows():
+    return set(_xrun(["xdotool", "search", "--class", "konsole"]).split())
+
+def _window_alive(wid):
+    return bool(_xrun(["xdotool", "getwindowname", wid]).strip())
+
+def _window_visible(wid):
+    return wid in _xrun(["xdotool", "search", "--onlyvisible", "--class", "konsole"]).split()
+
+def _new_window(cmd, sid=None):
+    env = _dbus_env()
+    if not shutil.which("konsole"):
+        subprocess.Popen(["xterm", "-e", "bash", "-lc", "%s; exec bash" % cmd], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("opened new xterm window"); return
+    before = _konsole_windows()
+    subprocess.Popen(["konsole", "-e", "bash", "-lc", "%s; exec bash" % cmd], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # capture the new window id so re-taps minimize/restore instead of reopening
+    if sid and shutil.which("xdotool"):
+        for _ in range(20):
+            time.sleep(0.2)
+            new = _konsole_windows() - before
+            if new:
+                wid = sorted(new)[-1]
+                with _lock:
+                    _win_map[sid] = wid
+                log("opened+tracked window %s for session %s", wid, sid[:8]); return
+    log("opened new konsole window")
+
+def place_konsole(cmd, mode, sid=None):
+    """cmd runs in the chosen placement. window -> fresh konsole (tracked by sid);
+    tab/split -> inside the focused konsole window via D-Bus (falls back to a window)."""
     if not _dbus_env().get("DISPLAY"):
         log("no DISPLAY; cannot open terminal"); return
     if mode == "window":
-        _new_window(cmd); return
+        _new_window(cmd, sid=sid); return
     svc = _focused_konsole()
     if not svc:
-        log("no focused konsole for %s; opening new window", mode); _new_window(cmd); return
+        log("no focused konsole for %s; opening new window", mode)
+        _new_window(cmd, sid=sid); return
     if mode == "tab":
         sid = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.newSession")
         if sid:
@@ -201,10 +232,27 @@ def act_reply(zone):
     label, keys = REPLY_ZONES[zone]
     log("reply '%s' -> %s", label, s.get("title")); tmux_send(s, keys)
 
-def act_attach():
-    s = active_session()
-    if s:
-        place_konsole("%s session attach %s" % (AD, s["id"]), "window")
+def open_session_window(s):
+    place_konsole("%s session attach %s" % (AD, s["id"]), "window", sid=s["id"])
+
+def toggle_session_window(s):
+    """If this session already has a window: minimize it when visible, restore+raise
+    when minimized. Otherwise open (and track) one. No more duplicate windows."""
+    if not s:
+        return
+    sid = s["id"]
+    with _lock:
+        wid = _win_map.get(sid)
+    if wid and _window_alive(wid):
+        if _window_visible(wid):
+            _xrun(["xdotool", "windowminimize", wid]); log("minimize window for %s", s.get("title"))
+        else:
+            _xrun(["wmctrl", "-i", "-a", wid]); log("restore window for %s", s.get("title"))
+    else:
+        log("no live window for %s; opening", s.get("title")); open_session_window(s)
+
+def act_toggle():
+    toggle_session_window(active_session())
 
 def spawn(tool_cmd, mode):
     log("spawn '%s' as %s in %s", tool_cmd, mode, NEW_SESSION_DIR)
@@ -216,7 +264,7 @@ def spawn(tool_cmd, mode):
     except Exception as e:
         log("spawn parse error: %s", e); return
     if sid:
-        place_konsole("%s session attach %s" % (AD, sid), mode)
+        place_konsole("%s session attach %s" % (AD, sid), mode, sid=sid)
 
 def act_restart():
     s = active_session()
@@ -368,7 +416,7 @@ def on_key(deck, key, pressed):
     if key < len(sess):
         s = sess[key]
         if s["id"] == active:
-            log("attach %s", s.get("title")); _bg(act_attach)
+            _bg(toggle_session_window, s)
         else:
             with _lock:
                 _active_id = s["id"]
@@ -385,7 +433,7 @@ def on_dial(deck, dial, event, value):
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
-        {0: act_attach, 1: lambda: (open_menu("tool"), repaint(deck)),
+        {0: act_toggle, 1: lambda: (open_menu("tool"), repaint(deck)),
          2: act_restart, 3: act_stop}.get(dial, lambda: None)()
         if dial in (2, 3):
             _bg(repaint, deck)
