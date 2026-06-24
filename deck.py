@@ -62,12 +62,20 @@ PLACEMENTS = [("Window", "window"), ("Tab", "tab"),
               ("Split →", "split-right"), ("Split ↓", "split-down")]
 CANCEL_KEY = 7             # last key cancels any open menu
 
-# Bottom-row reply sets. Pushing knob N (dial N) sends slot N to the active
-# session; knob 2 (dial 1) scroll cycles between sets. Values are tmux key
-# sequences (None = blank slot, does nothing). Add sets to extend.
+# Bottom-row reply sets: (name, [(label, tmux-keys-or-None) x4]). Pushing knob N
+# sends slot N to the active session; knob 2 (dial 1) scroll cycles sets.
+# "select" answers Claude's numbered permission MENUS, which are arrow-navigated
+# (digits don't work) — send nav+Enter as ONE contiguous send-keys (a lone Enter
+# or a long burst gets dropped by the TUI; Up resets to the top option).
+# "type" types the literal digit (for plain text input fields). "keys" = misc.
 REPLY_SETS = [
-    [("1", ["1", "Enter"]), ("2", ["2", "Enter"]), ("3", ["3", "Enter"]), ("Esc", ["Escape"])],
-    [("Enter", ["Enter"]), ("Space", ["Space"]), ("", None), ("", None)],
+    ("select", [("1", ["Up", "Enter"]),
+                ("2", ["Down", "Enter"]),
+                ("3", ["Down", "Down", "Enter"]),
+                ("Esc", ["Escape"])]),
+    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]), ("", None), ("", None)]),
+    ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
+                ("3", ["3", "Enter"]), ("Esc", ["Escape"])]),
 ]
 
 STATE_COLOR = {"waiting": (235, 150, 25), "running": (38, 140, 60),
@@ -249,7 +257,7 @@ def act_reply(slot):
     s = active_session()
     if not s:
         log("reply: no active session"); return
-    label, keys = REPLY_SETS[_reply_set][slot]
+    label, keys = REPLY_SETS[_reply_set][1][slot]
     if not keys:
         return                                  # blank slot
     log("reply '%s' -> %s", label, s.get("title")); tmux_send(s, keys)
@@ -414,9 +422,9 @@ def render_touchscreen(deck):
         else:
             head = "▶ no session selected"
         d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
-        d.text((img.width - 12, 8), "set %d/%d" % (_reply_set + 1, len(REPLY_SETS)),
+        setname, zones = REPLY_SETS[_reply_set]
+        d.text((img.width - 12, 8), "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
                font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(120, 130, 150))
-        zones = REPLY_SETS[_reply_set]
         zw = img.width / 4
         for i, (label, _) in enumerate(zones):
             x0 = i * zw
