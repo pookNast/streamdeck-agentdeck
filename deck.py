@@ -241,8 +241,14 @@ def act_reply(zone):
     label, keys = REPLY_ZONES[zone]
     log("reply '%s' -> %s", label, s.get("title")); tmux_send(s, keys)
 
+def _attach_cmd(sid):
+    # start-if-needed then attach: `start` revives a stopped/killed session (so a
+    # session you stopped with dial-4 reopens cleanly); it errors harmlessly when
+    # the session is already running, so we silence that and attach regardless.
+    return "%s session start %s >/dev/null 2>&1; %s session attach %s" % (AD, sid, AD, sid)
+
 def open_session_window(s):
-    place_konsole("%s session attach %s" % (AD, s["id"]), "window", sid=s["id"])
+    place_konsole(_attach_cmd(s["id"]), "window", sid=s["id"])
 
 def toggle_session_window(s):
     """If this session's konsole is still alive: minimize it when visible,
@@ -267,9 +273,13 @@ def toggle_session_window(s):
 def act_toggle():
     toggle_session_window(active_session())
 
-def spawn(tool_cmd, mode):
-    log("spawn '%s' as %s in %s", tool_cmd, mode, NEW_SESSION_DIR)
-    r = _run([AD, "launch", NEW_SESSION_DIR, "-cmd", tool_cmd, "--json"], timeout=40)
+def spawn(tool, mode):
+    label, cmd = tool
+    log("spawn '%s' (%s) as %s in %s", label, cmd, mode, NEW_SESSION_DIR)
+    # -t names the session after the tool; -title-lock keeps Claude's session-name
+    # sync from overriding it back to the folder name (e.g. "pooknast").
+    r = _run([AD, "launch", NEW_SESSION_DIR, "-cmd", cmd,
+              "-t", label, "-title-lock", "--json"], timeout=40)
     if not (r and r.returncode == 0):
         log("spawn failed: %s", (r.stderr.strip()[:140] if r else "no result")); return
     try:
@@ -277,7 +287,7 @@ def spawn(tool_cmd, mode):
     except Exception as e:
         log("spawn parse error: %s", e); return
     if sid:
-        place_konsole("%s session attach %s" % (AD, sid), mode, sid=sid)
+        place_konsole(_attach_cmd(sid), mode, sid=sid)
 
 def act_restart():
     s = active_session()
@@ -375,7 +385,8 @@ def render_touchscreen(deck):
         d.text((16, 30), "pick agent for new session  ·  Cancel = key 8",
                font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
     elif _ui_mode == "place":
-        d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" % (_pending_tool or ""),
+        d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" %
+               (_pending_tool[0] if _pending_tool else ""),
                font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
     else:
         s = active_session()
@@ -414,7 +425,7 @@ def on_key(deck, key, pressed):
         if key == CANCEL_KEY:
             close_menu()
         elif key < len(TOOLS):
-            _pending_tool = TOOLS[key][1]; open_menu("place")
+            _pending_tool = TOOLS[key]; open_menu("place")
         repaint(deck); return
     if _ui_mode == "place":
         if key == CANCEL_KEY:
