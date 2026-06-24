@@ -45,10 +45,14 @@ SSH_HOST = "batkave"
 def _remote(tool):
     return "ssh -t %s bash -lc %s" % (SSH_HOST, tool)
 
-TOOLS = [("claude",     _remote("claude")),
-         ("claude-glm", _remote("claude-glm")),
-         ("claude-gpt", _remote("claude-gpt")),
-         ("oc-start",   _remote("oc-start"))]
+# label doubles as the session title AND the tmux name slug:
+# `-t glm` -> session "glm" -> tmux "agentdeck_glm_<rand>". Keep labels short so
+# the deck button and the tmux session name correlate (agent-deck adds " (2)" for
+# duplicates -> agentdeck_glm-2_<rand>).
+TOOLS = [("claude", _remote("claude")),
+         ("glm",    _remote("claude-glm")),
+         ("gpt",    _remote("claude-gpt")),
+         ("local",  _remote("oc-start"))]
 
 # (label, mode). Tab/split act INSIDE the focused konsole window via D-Bus;
 # "window" opens a fresh konsole. Konsole places the new split pane on the right
@@ -58,8 +62,13 @@ PLACEMENTS = [("Window", "window"), ("Tab", "tab"),
               ("Split →", "split-right"), ("Split ↓", "split-down")]
 CANCEL_KEY = 7             # last key cancels any open menu
 
-REPLY_ZONES = [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
-               ("3", ["3", "Enter"]), ("Esc", ["Escape"])]
+# Bottom-row reply sets. Pushing knob N (dial N) sends slot N to the active
+# session; knob 2 (dial 1) scroll cycles between sets. Values are tmux key
+# sequences (None = blank slot, does nothing). Add sets to extend.
+REPLY_SETS = [
+    [("1", ["1", "Enter"]), ("2", ["2", "Enter"]), ("3", ["3", "Enter"]), ("Esc", ["Escape"])],
+    [("Enter", ["Enter"]), ("Space", ["Space"]), ("", None), ("", None)],
+]
 
 STATE_COLOR = {"waiting": (235, 150, 25), "running": (38, 140, 60),
                "idle": (58, 64, 78), "starting": (40, 90, 165),
@@ -84,6 +93,7 @@ _pending_tool = None       # (label, command) chosen in the tool menu -> spawn n
 _pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
 _win_map = {}              # session id -> konsole process pid we opened for it
+_reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 
 # ---- plumbing -------------------------------------------------------------
 def _run(cmd, timeout=30):
@@ -235,11 +245,13 @@ def active_session():
     with _lock:
         return next((s for s in _sessions if s.get("id") == _active_id), None)
 
-def act_reply(zone):
+def act_reply(slot):
     s = active_session()
     if not s:
         log("reply: no active session"); return
-    label, keys = REPLY_ZONES[zone]
+    label, keys = REPLY_SETS[_reply_set][slot]
+    if not keys:
+        return                                  # blank slot
     log("reply '%s' -> %s", label, s.get("title")); tmux_send(s, keys)
 
 def _attach_cmd(sid):
@@ -402,8 +414,11 @@ def render_touchscreen(deck):
         else:
             head = "▶ no session selected"
         d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
-        zw = img.width / len(REPLY_ZONES)
-        for i, (label, _) in enumerate(REPLY_ZONES):
+        d.text((img.width - 12, 8), "set %d/%d" % (_reply_set + 1, len(REPLY_SETS)),
+               font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(120, 130, 150))
+        zones = REPLY_SETS[_reply_set]
+        zw = img.width / 4
+        for i, (label, _) in enumerate(zones):
             x0 = i * zw
             if i:
                 d.line([(x0, 44), (x0, img.height)], fill=(40, 44, 56), width=2)
@@ -459,25 +474,27 @@ def on_key(deck, key, pressed):
         open_menu("tool"); repaint(deck)
 
 def on_dial(deck, dial, event, value):
-    global _brightness
+    global _brightness, _reply_set
     if event == DialEventType.TURN:
-        if dial == 0 and _ui_mode == "board":
+        if _ui_mode != "board":
+            return
+        if dial == 0:                                   # knob 1: select session
             select_delta(1 if value > 0 else -1); repaint(deck)
-        elif dial == 3:
+        elif dial == 1:                                 # knob 2: cycle reply set
+            _reply_set = (_reply_set + (1 if value > 0 else -1)) % len(REPLY_SETS)
+            log("reply set -> %d", _reply_set); repaint(deck)
+        elif dial == 3:                                 # knob 4: brightness
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
+        # dial 2 (knob 3) scroll: reserved for now
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
-        {0: lambda: _bg(toggle_or_place, deck, active_session()),
-         1: lambda: (open_menu("tool"), repaint(deck)),
-         2: act_restart, 3: act_stop}.get(dial, lambda: None)()
-        if dial in (2, 3):
-            _bg(repaint, deck)
+        _bg(act_reply, dial)        # push knob N -> send reply slot N to active session
 
 def on_touch(deck, evt, value):
     if _ui_mode != "board" or evt not in (TouchscreenEventType.SHORT, TouchscreenEventType.LONG):
         return
     x = (value or {}).get("x", 0)
-    zone = max(0, min(len(REPLY_ZONES) - 1, int(x // (800 / len(REPLY_ZONES)))))
+    zone = max(0, min(3, int(x // (800 / 4))))
     _bg(act_reply, zone)
 
 # ---- main -----------------------------------------------------------------
