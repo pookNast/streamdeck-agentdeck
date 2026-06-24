@@ -160,8 +160,14 @@ def _xrun(args, timeout=5):
 def _konsole_windows():
     return set(_xrun(["xdotool", "search", "--class", "konsole"]).split())
 
-def _window_alive(wid):
-    return bool(_xrun(["xdotool", "getwindowname", wid]).strip())
+def _windows_of_pid(pid):
+    """Live konsole window id(s) belonging to konsole process `pid`. Empty if the
+    process is gone — so a closed window (or a reused X id) resolves to nothing."""
+    if not pid:
+        return []
+    res = _xrun(["xdotool", "search", "--pid", str(pid)]).split()
+    konsole = _konsole_windows()
+    return [w for w in res if w in konsole]
 
 def _window_visible(wid):
     return wid in _xrun(["xdotool", "search", "--onlyvisible", "--class", "konsole"]).split()
@@ -175,16 +181,19 @@ def _new_window(cmd, sid=None):
     before = _konsole_windows()
     subprocess.Popen(["konsole", "-e", "bash", "-lc", "%s; exec bash" % cmd], env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # capture the new window id so re-taps minimize/restore instead of reopening
+    # track the konsole PROCESS pid (not the reusable X window id) so a later tap
+    # can re-resolve the window — survives X id reuse, detects a real close.
     if sid and shutil.which("xdotool"):
         for _ in range(20):
             time.sleep(0.2)
             new = _konsole_windows() - before
             if new:
                 wid = sorted(new)[-1]
+                pid = _xrun(["xdotool", "getwindowpid", wid]).strip()
                 with _lock:
-                    _win_map[sid] = wid
-                log("opened+tracked window %s for session %s", wid, sid[:8]); return
+                    _win_map[sid] = pid
+                log("opened+tracked konsole pid %s (win %s) for session %s",
+                    pid, wid, sid[:8]); return
     log("opened new konsole window")
 
 def place_konsole(cmd, mode, sid=None):
@@ -236,14 +245,18 @@ def open_session_window(s):
     place_konsole("%s session attach %s" % (AD, s["id"]), "window", sid=s["id"])
 
 def toggle_session_window(s):
-    """If this session already has a window: minimize it when visible, restore+raise
-    when minimized. Otherwise open (and track) one. No more duplicate windows."""
+    """If this session's konsole is still alive: minimize it when visible,
+    restore+raise when minimized. Otherwise (closed / never opened) open one.
+    Re-resolves the window from the tracked pid each time, so closing it with the
+    X button (or X id reuse) can't leave the deck out of sync."""
     if not s:
         return
     sid = s["id"]
     with _lock:
-        wid = _win_map.get(sid)
-    if wid and _window_alive(wid):
+        pid = _win_map.get(sid)
+    wins = _windows_of_pid(pid)
+    if wins:
+        wid = wins[0]
         if _window_visible(wid):
             _xrun(["xdotool", "windowminimize", wid]); log("minimize window for %s", s.get("title"))
         else:
