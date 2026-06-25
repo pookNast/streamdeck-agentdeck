@@ -102,6 +102,14 @@ _pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
 _win_map = {}              # session id -> konsole process pid we opened for it
 _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
+_activity = {}             # session id -> (label, needs_choice) from pane parsing
+_blink = False             # animation phase for the choice-needed border
+
+# Claude TUI scraping: working spinner ("✻ Vibing… (8m 23s)") and the arrow-nav
+# permission menus ("❯ 1. Yes" / "Do you want to proceed?").
+SPIN_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*]\s+([A-Za-z][\w-]+?)…")
+ELAPSED_RE = re.compile(r"\b(\d+m\s?\d+s|\d+m|\d+s)\b")
+CHOICE_RE = re.compile(r"❯\s*\d+\.|Do you want to proceed|\b1\.\s+Yes\b")
 
 # ---- plumbing -------------------------------------------------------------
 def _run(cmd, timeout=30):
@@ -130,6 +138,24 @@ def tmux_send(sess, keys):
         log("no tmux_session for %s", sess.get("title")); return
     _run(["tmux", "send-keys", "-t", t, *keys], timeout=8)
     log("send-keys -> %s : %s", t, " ".join(keys))
+
+def session_activity(sess):
+    """Scrape the session's pane -> (label, needs_choice). label is the live
+    action (e.g. 'Vibing 8m23s' while thinking, 'choose…' at a prompt) else the
+    agent-deck status. Only captures for active states to keep it cheap."""
+    st = sess.get("status", "idle")
+    t = sess.get("tmux_session")
+    if not t or st not in ("running", "starting", "waiting"):
+        return (st, False)
+    r = _run(["tmux", "capture-pane", "-p", "-t", t, "-S", "-20"], timeout=5)
+    pane = (r.stdout if r else "") or ""
+    if st == "waiting" and CHOICE_RE.search(pane):
+        return ("choose…", True)
+    m = SPIN_RE.search(pane)
+    if m:
+        el = ELAPSED_RE.search(pane)
+        return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False)
+    return ("thinking" if st in ("running", "starting") else st, False)
 
 # --- konsole control via D-Bus: tab/split happen INSIDE the focused window ----
 def _dbus_env():
@@ -362,7 +388,7 @@ def _key_img(deck, bg):
     ImageDraw.Draw(img).rectangle([0, 0, img.width, img.height], fill=bg)
     return img
 
-def _centered(deck, bg, text, size=20, sub=None, border=None):
+def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4):
     img = _key_img(deck, bg)
     d = ImageDraw.Draw(img)
     f = ImageFont.truetype(FONT_B, size)
@@ -374,20 +400,38 @@ def _centered(deck, bg, text, size=20, sub=None, border=None):
         d.text((img.width / 2, img.height - 18), sub, font=ImageFont.truetype(FONT_R, 15),
                anchor="ma", fill=(235, 235, 235))
     if border:
-        d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=4)
+        d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=border_w)
     return PILHelper.to_native_key_format(deck, img)
+
+def _render_session(deck, s, is_active):
+    st = s.get("status", "idle")
+    label, needs = _activity.get(s["id"], (st, False))
+    if needs:                                   # choice needed -> blink a white border
+        border = (255, 255, 255) if _blink else None
+        bw = 7
+    elif is_active:
+        border = (255, 255, 255); bw = 4
+    else:
+        border = None; bw = 4
+    return _centered(deck, STATE_COLOR.get(st, (50, 50, 58)), s.get("title", "?"),
+                     sub=str(label)[:13], border=border, border_w=bw)
 
 def paint_board(deck):
     with _lock:
         sess = list(_sessions[:deck.key_count()]); active = _active_id
     for i in range(deck.key_count()):
         if i < len(sess):
-            s = sess[i]; st = s.get("status", "idle")
-            deck.set_key_image(i, _centered(
-                deck, STATE_COLOR.get(st, (50, 50, 58)), s.get("title", "?"),
-                sub=st, border=(255, 255, 255) if s["id"] == active else None))
+            deck.set_key_image(i, _render_session(deck, sess[i], sess[i]["id"] == active))
         else:
             deck.set_key_image(i, _centered(deck, EMPTY_COLOR, "+", size=40, sub="new"))
+
+def blink_animating(deck):
+    """Redraw only the keys whose session needs a choice, so their border blinks."""
+    with _lock:
+        sess = list(_sessions[:deck.key_count()]); active = _active_id
+    for i, s in enumerate(sess):
+        if _activity.get(s["id"], (None, False))[1]:
+            deck.set_key_image(i, _render_session(deck, s, s["id"] == active))
 
 def paint_menu(deck, items):
     for i in range(deck.key_count()):
@@ -507,7 +551,7 @@ def on_touch(deck, evt, value):
 
 # ---- main -----------------------------------------------------------------
 def main():
-    global _sessions, _active_id
+    global _sessions, _active_id, _activity, _blink
     decks = DeviceManager().enumerate()
     plus = next((d for d in decks if "+" in d.deck_type()), None)
     if not plus:
@@ -519,6 +563,7 @@ def main():
 
     _sessions = fetch_sessions()
     _active_id = _sessions[0]["id"] if _sessions else None
+    _activity = {s["id"]: session_activity(s) for s in _sessions[:plus.key_count()]}
     repaint(plus)
     log("session board ready: %d sessions, tools=%s", len(_sessions),
         [t[0] for t in TOOLS])
@@ -529,16 +574,32 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    while not stop.wait(REFRESH_SECS):
-        new = fetch_sessions()
-        with _lock:
-            _sessions = new
-            if _active_id not in [s["id"] for s in new]:
-                _active_id = new[0]["id"] if new else None
-        if _ui_mode != "board" and time.monotonic() > _menu_deadline:
-            close_menu()
+    # tick fast for the choice-needed border animation; do the expensive
+    # fetch + pane scrape only every Nth tick.
+    ANIM = 0.45
+    per_refresh = max(1, round(REFRESH_SECS / ANIM))
+    tick = 0
+    while not stop.wait(ANIM):
+        tick += 1
+        _blink = not _blink
+        do_refresh = (tick % per_refresh == 0)
+        if do_refresh:
+            new = fetch_sessions()
+            act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
+            with _lock:
+                _sessions = new; _activity = act
+                if _active_id not in [s["id"] for s in new]:
+                    _active_id = new[0]["id"] if new else None
+            if _ui_mode != "board" and time.monotonic() > _menu_deadline:
+                close_menu()
         try:
-            repaint(plus)
+            if _ui_mode != "board":
+                if do_refresh:
+                    repaint(plus)
+            elif do_refresh:
+                repaint(plus)               # full board (current blink phase)
+            else:
+                blink_animating(plus)       # only choice-needed keys -> blinking border
         except Exception as e:
             log("repaint error: %s", e)
     try:
