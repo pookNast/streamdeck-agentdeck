@@ -34,6 +34,7 @@ if not os.path.exists(FONT_R):
     FONT_R = FONT_B
 REFRESH_SECS = 2
 MENU_TIMEOUT = 12          # seconds before an open picker reverts to the board
+SLEEP_SECS = 3600         # idle seconds before the OLEDs blank (wake on any input)
 
 # All agent commands run on BatKave over `ssh -t` (PTY): the agent-deck session
 # lives on k11 (so it's on the board and you reply via tmux send-keys), but the
@@ -104,6 +105,8 @@ _win_map = {}              # session id -> konsole process pid we opened for it
 _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 _activity = {}             # session id -> (label, needs_choice) from pane parsing
 _blink = False             # animation phase for the choice-needed border
+_last_input = 0.0          # monotonic time of last user input (for sleep timer)
+_asleep = False            # True when the OLEDs are blanked
 
 # Claude TUI scraping: working spinner ("✻ Vibing… (8m 23s)") and the arrow-nav
 # permission menus ("❯ 1. Yes" / "Do you want to proceed?").
@@ -388,17 +391,18 @@ def _key_img(deck, bg):
     ImageDraw.Draw(img).rectangle([0, 0, img.width, img.height], fill=bg)
     return img
 
-def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4):
+def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
+              text_fill=(255, 255, 255)):
     img = _key_img(deck, bg)
     d = ImageDraw.Draw(img)
     f = ImageFont.truetype(FONT_B, size)
     lines = _multiline(d, text, f, img.width - 8)
     y = (img.height - len(lines) * (size + 2)) / 2 - (8 if sub else 0)
     for ln in lines:
-        d.text((img.width / 2, y), ln, font=f, anchor="ma", fill="white"); y += size + 2
+        d.text((img.width / 2, y), ln, font=f, anchor="ma", fill=text_fill); y += size + 2
     if sub:
         d.text((img.width / 2, img.height - 18), sub, font=ImageFont.truetype(FONT_R, 15),
-               anchor="ma", fill=(235, 235, 235))
+               anchor="ma", fill=text_fill)
     if border:
         d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=border_w)
     return PILHelper.to_native_key_format(deck, img)
@@ -406,15 +410,15 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4):
 def _render_session(deck, s, is_active):
     st = s.get("status", "idle")
     label, needs = _activity.get(s["id"], (st, False))
-    if needs:                                   # choice needed -> blink a white border
-        border = (255, 255, 255) if _blink else None
-        bw = 7
-    elif is_active:
-        border = (255, 255, 255); bw = 4
-    else:
-        border = None; bw = 4
-    return _centered(deck, STATE_COLOR.get(st, (50, 50, 58)), s.get("title", "?"),
-                     sub=str(label)[:13], border=border, border_w=bw)
+    title, sub = s.get("title", "?"), str(label)[:13]
+    if needs:                                   # choice needed -> blink the WHOLE key
+        if _blink:
+            return _centered(deck, (255, 200, 60), title, sub=sub, text_fill=(15, 15, 15),
+                             border=(255, 255, 255), border_w=7)
+        return _centered(deck, (70, 45, 0), title, sub=sub,
+                         border=(130, 95, 0), border_w=7)
+    border = (255, 255, 255) if is_active else None
+    return _centered(deck, STATE_COLOR.get(st, (50, 50, 58)), title, sub=sub, border=border)
 
 def paint_board(deck):
     with _lock:
@@ -489,8 +493,22 @@ def repaint(deck):
     render_touchscreen(deck)
 
 # ---- callbacks ------------------------------------------------------------
+def _wake_and_note(deck):
+    """Record input time; if the display is asleep, wake it and report True so the
+    caller consumes this event (the waking press/turn just wakes, no action)."""
+    global _last_input, _asleep
+    _last_input = time.monotonic()
+    if _asleep:
+        _asleep = False
+        deck.set_brightness(_brightness)
+        log("display wake"); repaint(deck)
+        return True
+    return False
+
 def on_key(deck, key, pressed):
     if not pressed:
+        return
+    if _wake_and_note(deck):
         return
     global _active_id, _pending_tool
     if _ui_mode == "tool":
@@ -526,6 +544,8 @@ def on_key(deck, key, pressed):
         open_menu("tool"); repaint(deck)
 
 def on_dial(deck, dial, event, value):
+    if _wake_and_note(deck):
+        return
     global _brightness, _reply_set
     if event == DialEventType.TURN:
         if _ui_mode != "board":
@@ -543,6 +563,8 @@ def on_dial(deck, dial, event, value):
         _bg(act_reply, dial)        # push knob N -> send reply slot N to active session
 
 def on_touch(deck, evt, value):
+    if _wake_and_note(deck):
+        return
     if _ui_mode != "board" or evt not in (TouchscreenEventType.SHORT, TouchscreenEventType.LONG):
         return
     x = (value or {}).get("x", 0)
@@ -551,7 +573,7 @@ def on_touch(deck, evt, value):
 
 # ---- main -----------------------------------------------------------------
 def main():
-    global _sessions, _active_id, _activity, _blink
+    global _sessions, _active_id, _activity, _blink, _last_input, _asleep
     decks = DeviceManager().enumerate()
     plus = next((d for d in decks if "+" in d.deck_type()), None)
     if not plus:
@@ -564,6 +586,7 @@ def main():
     _sessions = fetch_sessions()
     _active_id = _sessions[0]["id"] if _sessions else None
     _activity = {s["id"]: session_activity(s) for s in _sessions[:plus.key_count()]}
+    _last_input = time.monotonic()
     repaint(plus)
     log("session board ready: %d sessions, tools=%s", len(_sessions),
         [t[0] for t in TOOLS])
@@ -580,6 +603,13 @@ def main():
     per_refresh = max(1, round(REFRESH_SECS / ANIM))
     tick = 0
     while not stop.wait(ANIM):
+        # idle sleep: blank the OLEDs after SLEEP_SECS with no input; a callback
+        # (key/dial/touch) wakes it back up via _wake_and_note().
+        if not _asleep and (time.monotonic() - _last_input) > SLEEP_SECS:
+            _asleep = True; plus.set_brightness(0)
+            log("display asleep (idle %d min)", SLEEP_SECS // 60)
+        if _asleep:
+            continue
         tick += 1
         _blink = not _blink
         do_refresh = (tick % per_refresh == 0)
