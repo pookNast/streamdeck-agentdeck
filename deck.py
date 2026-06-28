@@ -119,10 +119,10 @@ _auto_restart_at = {}      # session id -> monotonic time the next retry is allo
 # Return 0 = environment is ready (restart is worth attempting).
 # ponytail: hardcoded probes — upgrade: derive from tool command when it grows.
 TOOL_READY = {
-    "glm":    'bash -lc "test -f /opt/claude-glm/secrets && . /opt/claude-glm/secrets && test -n \\"$ZAI_API_KEY\\""',
-    "local":  'bash -lc "curl -sf --max-time 3 http://localhost:11434/health >/dev/null 2>&1 || pgrep -x ollama >/dev/null 2>&1"',
-    "claude": 'bash -lc "which claude >/dev/null 2>&1"',
-    "gpt":    'bash -lc "which claude >/dev/null 2>&1"',
+    "glm":    'test -f /opt/claude-glm/secrets && . /opt/claude-glm/secrets && test -n "$ZAI_API_KEY"',
+    "local":  'curl -sf --max-time 3 http://localhost:11434/health >/dev/null 2>&1 || pgrep -x ollama >/dev/null 2>&1',
+    "claude": 'which claude >/dev/null 2>&1',
+    "gpt":    'which claude >/dev/null 2>&1',
 }
 
 def _tool_label_for(sess):
@@ -136,8 +136,10 @@ def _env_ready(label):
     probe = TOOL_READY.get(label)
     if not probe:
         return True                       # unknown tool — don't block a restart
-    host_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=4 %s %s" % (SSH_HOST, probe)
-    r = _run(["bash", "-c", host_cmd], timeout=10)
+    # Pass probe as a single ssh arg so the REMOTE shell expands any $vars
+    # (a local `bash -c` wrapper mangled quoting and expanded $ZAI_API_KEY here).
+    r = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+              SSH_HOST, probe], timeout=10)
     ok = bool(r and r.returncode == 0)
     if not ok:
         log("env check FAILED for '%s' — skipping auto-restart", label)
