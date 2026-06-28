@@ -108,7 +108,11 @@ _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 _manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
 MANUAL_GRACE = 5.0         # seconds the deck respects manual selection before resuming auto
 _activity = {}             # session id -> (label, needs_choice) from pane parsing
-_blink = False             # animation phase for the choice-needed border
+_needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
+_urgency = {}              # session id -> "menu" | "urgent" | "patient" (drives blink speed + focus)
+INPUT_TIMEOUT = 10.0       # seconds before text-input sessions demote to slow-blink patient
+_blink = False             # fast animation phase for urgent choice-needed keys
+_blink_slow = False        # slow animation phase (toggles every other tick) for patient keys
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
 
@@ -192,8 +196,10 @@ def fetch_sessions():
     except Exception:
         return []
     data = data if isinstance(data, list) else data.get("items", data.get("sessions", []))
-    data.sort(key=lambda s: (STATE_RANK.get(s.get("status", "idle"), 9),
-                             s.get("created_at", "")))
+    # Static layout: sort by creation order only. Blinking + auto-focus draws
+    # attention to sessions needing input; physical position stays stable so the
+    # user develops muscle memory for which key is which session.
+    data.sort(key=lambda s: s.get("created_at", ""))
     return data
 
 def tmux_send(sess, keys):
@@ -610,7 +616,10 @@ def _render_session(deck, s, is_active):
     if needs:                                   # choice needed -> blink BACKGROUND only
         # ponytail: no thick border on blink — it hid the active-session cursor
         # when knob 1 moved the selector. Background flash (amber↔dark) is enough.
-        if _blink:
+        # Urgency drives blink speed: "menu"/"urgent" = fast, "patient" = slow.
+        urg = _urgency.get(s["id"], "urgent")
+        phase = _blink_slow if urg == "patient" else _blink
+        if phase:
             bg, fill = (255, 200, 60), (15, 15, 15)
         else:
             bg, fill = (70, 45, 0), (255, 255, 255)
@@ -778,7 +787,8 @@ def on_touch(deck, evt, value):
 
 # ---- main -----------------------------------------------------------------
 def main():
-    global _sessions, _active_id, _activity, _blink, _last_input, _asleep, _reply_set, _manual_until
+    global _sessions, _active_id, _activity, _blink, _blink_slow, _last_input, _asleep
+    global _reply_set, _manual_until, _needed_since, _urgency
     decks = DeviceManager().enumerate()
     plus = next((d for d in decks if "+" in d.deck_type()), None)
     if not plus:
@@ -817,16 +827,39 @@ def main():
             continue
         tick += 1
         _blink = not _blink
+        _blink_slow = (tick % 2 == 0)             # slow phase: toggles every other tick
         do_refresh = (tick % per_refresh == 0)
         if do_refresh:
             new = fetch_sessions()
             act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
             maybe_remediate(new)                    # auto-restart errored sessions
-            # Auto-select the first flashing (choice-needed) session so the
-            # touchscreen replies land on it without manually hunting with knob 1.
-            # Skip if the current session also needs a choice, or a menu is open.
-            choice_id = next((sid for sid, (_, need) in act.items() if need), None)
-            manual = time.monotonic() < _manual_until
+            now = time.monotonic()
+            # Track when sessions first started needing input (for 10s timeout).
+            for sid, (label, need) in act.items():
+                if need:
+                    _needed_since.setdefault(sid, now)
+                else:
+                    _needed_since.pop(sid, None)
+            # Classify urgency: "menu" (numbered choice, always focusable),
+            # "urgent" (text input < 10s), "patient" (text input > 10s, slow blink).
+            urg = {}
+            for sid, (label, need) in act.items():
+                if not need:
+                    continue
+                if label == "choose…":
+                    urg[sid] = "menu"
+                elif (now - _needed_since.get(sid, now)) < INPUT_TIMEOUT:
+                    urg[sid] = "urgent"
+                else:
+                    urg[sid] = "patient"
+            _urgency.clear(); _urgency.update(urg)
+            # Auto-focus priority: menus first (quick 1/2/3 choices), then
+            # urgent text inputs (< 10s). Patient sessions (> 10s) are skipped
+            # — they slow-blink but don't steal focus.
+            focus_order = ([sid for sid in act if urg.get(sid) == "menu"]
+                         + [sid for sid in act if urg.get(sid) == "urgent"])
+            choice_id = focus_order[0] if focus_order else None
+            manual = now < _manual_until
             if choice_id and _reply_set != 0 and not manual:
                 _reply_set = 0                        # auto-switch to arrow-nav set
                 log("reply set -> select (choice needed)")
