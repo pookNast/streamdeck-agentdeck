@@ -108,8 +108,10 @@ _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 _manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
 MANUAL_GRACE = 2.0         # seconds the deck respects manual selection before resuming auto
 _activity = {}             # session id -> (label, needs_choice) from pane parsing
-_urgency = {}              # session id -> "menu" | "text" (drives blink speed + focus priority)
-_blink = False             # fast animation phase for menu choice-needed keys
+_needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
+_urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
+INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
+_blink = False             # fast animation phase for menu + urgent keys
 _blink_slow = False        # slow animation phase (toggles every other tick) for text-input keys
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
@@ -627,7 +629,7 @@ def _render_session(deck, s, is_active):
         # when knob 1 moved the selector. Background flash (amber↔dark) is enough.
         # Urgency drives blink speed: "menu"/"urgent" = fast, "patient" = slow.
         urg = _urgency.get(s["id"], "menu")
-        phase = _blink_slow if urg == "text" else _blink
+        phase = _blink_slow if urg == "patient" else _blink
         if phase:
             bg, fill = (255, 200, 60), (15, 15, 15)
         else:
@@ -843,19 +845,31 @@ def main():
             act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
             maybe_remediate(new)                    # auto-restart errored sessions
             now = time.monotonic()
-            # Classify urgency by label type (no timeout):
-            #   "menu"  = numbered choice ("1/2/3") → fast blink, top focus priority
-            #   "text"  = text input prompt → slow blink, secondary focus priority
+            # Track when sessions first started needing input (for 10s slow-blink).
+            for sid, (label, need) in act.items():
+                if need:
+                    _needed_since.setdefault(sid, now)
+                else:
+                    _needed_since.pop(sid, None)
+            # Classify urgency:
+            #   "menu"    = numbered choice → fast blink, top focus priority
+            #   "urgent"  = text input < 10s → fast blink, secondary focus
+            #   "patient" = text input > 10s → slow blink, lowest focus priority
             urg = {}
             for sid, (label, need) in act.items():
                 if not need:
                     continue
-                urg[sid] = "menu" if label == "choose…" else "text"
+                if label == "choose…":
+                    urg[sid] = "menu"
+                elif (now - _needed_since.get(sid, now)) < INPUT_TIMEOUT:
+                    urg[sid] = "urgent"
+                else:
+                    urg[sid] = "patient"
             _urgency.clear(); _urgency.update(urg)
-            # Auto-focus priority: menus first (quick 1/2/3 button press), then
-            # text inputs (slow blink, needs typing). Both are focusable.
+            # Auto-focus priority: menus → urgent text → patient text. All focusable.
             focus_order = ([sid for sid in act if urg.get(sid) == "menu"]
-                         + [sid for sid in act if urg.get(sid) == "text"])
+                         + [sid for sid in act if urg.get(sid) == "urgent"]
+                         + [sid for sid in act if urg.get(sid) == "patient"])
             choice_id = focus_order[0] if focus_order else None
             manual = now < _manual_until
             if choice_id and _reply_set != 0 and not manual:
@@ -866,7 +880,6 @@ def main():
                 if _active_id not in [s["id"] for s in new]:
                     _active_id = new[0]["id"] if new else None
                 if (choice_id and _ui_mode == "board"
-                        and not manual
                         and not act.get(_active_id, (None, False))[1]
                         and _active_id != choice_id):
                     _active_id = choice_id
