@@ -881,7 +881,7 @@ def _render_session(deck, s, is_active):
         return _centered(deck, base, title, sub=sub, border=border)
     _render_text(d, img, title, sub=sub, text_fill=text_fill)
     if is_active:
-        d.rectangle([1, 1, img.width - 2, img.height - 2], outline=(180, 185, 195), width=4)
+        _draw_selector(d, img)
     return PILHelper.to_native_key_format(deck, img)
 
 def paint_board(deck):
@@ -921,6 +921,32 @@ def _overlay_activity(draw, img, phase):
         draw.arc([bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy],
                  start, end, fill=(0, 0, 0), width=2)
     draw.arc(bbox, start, end, fill=color, width=2)
+
+def _draw_selector(draw, img):
+    """Active session selector — bright white corner brackets (viewfinder style).
+    Steady and non-breathing by design: the needy accent borders breathe gold/pink,
+    so a SOLID white corner-bracket is visually orthogonal and unmistakable.
+    Drawn LAST in the per-key pipeline so nothing paints over it. Corner arms
+    are 14px long / 4px thick — reads instantly as 'focused' even at 120x120."""
+    w, h = img.width, img.height
+    c = (255, 255, 255)
+    sh = (0, 0, 0)
+    arm = 14
+    th = 4
+    brackets = [
+        # (hx0, hy0, hx1, hy3, vx0, vy0, vx3, vy3) per corner
+        (0,      0,     arm,        th - 1,   0,     0,     th - 1, arm),       # TL
+        (w - arm, 0,     w - 1,      th - 1,   w - th, 0,     w - 1,  arm),       # TR
+        (0,      h - th, arm,        h - 1,    0,     h - arm, th - 1, h - 1),   # BL
+        (w - arm, h - th, w - 1,     h - 1,    w - th, h - arm, w - 1,  h - 1),   # BR
+    ]
+    for hx0, hy0, hx1, hy1, vx0, vy0, vx1, vy1 in brackets:
+        # 1px dark backing for contrast over any scene pixel
+        draw.rectangle([hx0 - 1, hy0 - 1, hx1 + 1, hy1 + 1], fill=sh)
+        draw.rectangle([vx0 - 1, vy0 - 1, vx1 + 1, vy1 + 1], fill=sh)
+        # bright white bracket arm
+        draw.rectangle([hx0, hy0, hx1, hy1], fill=c)
+        draw.rectangle([vx0, vy0, vx1, vy1], fill=c)
 
 def _overlay_status_dot(draw, img, status):
     """Tiny 6x6 status indicator in the top-right corner. Color-coded:
@@ -975,15 +1001,11 @@ def _animate_cinema(deck):
                 border_c = _lerp_color((20, 20, 28), accent, 0.65 + pulse * 0.35)
                 d.rectangle([2, 2, tile.width - 3, tile.height - 3],
                             outline=border_c, width=3)
-            # 4) Active session selector — unmistakable double border drawn
-            #    LAST so it dominates every other element. Outer thick pure-
-            #    white frame + inner dark hairline. This is the ONLY white
-            #    border on the deck; accent borders never reach white.
+            # 4) Active session selector — corner brackets drawn LAST so they
+            #    dominate every other element. Viewfinder-style, steady white,
+            #    visually orthogonal to the breathing accent borders.
             if s["id"] == active:
-                d.rectangle([0, 0, tile.width - 1, tile.height - 1],
-                            outline=(255, 255, 255), width=4)
-                d.rectangle([3, 3, tile.width - 4, tile.height - 4],
-                            outline=(0, 0, 0), width=1)
+                _draw_selector(d, tile)
         # Empty slots: pure scene tile, no overlay — the battle plays through.
         frame = PILHelper.to_native_key_format(deck, tile)
         deck.set_key_image(i, frame)
@@ -1286,10 +1308,17 @@ def main():
                 else:
                     urg[sid] = "patient"
             _urgency.clear(); _urgency.update(urg)
-            # Auto-focus priority: menus → urgent text → patient text. All focusable.
-            focus_order = ([sid for sid in act if urg.get(sid) == "menu"]
-                         + [sid for sid in act if urg.get(sid) == "urgent"]
-                         + [sid for sid in act if urg.get(sid) == "patient"])
+            # Auto-focus priority queue: menus → urgent text → patient text.
+            # Strict priority: if the currently focused session is needy but at
+            # a LOWER priority than the top of the queue, we upgrade instantly.
+            # Equal-priority competitors do NOT yank focus (avoids jitter when
+            # two menus appear in the same poll). Lower rank number = higher
+            # priority. The selector snaps on the next 20fps frame (~50ms).
+            URG_RANK = {"menu": 0, "urgent": 1, "patient": 2}
+            focus_order = sorted(
+                [sid for sid in act if act[sid][1]],
+                key=lambda sid: URG_RANK.get(urg.get(sid), 99),
+            )
             choice_id = focus_order[0] if focus_order else None
             manual = now < _manual_until
             if choice_id and _reply_set != 0 and not manual:
@@ -1299,11 +1328,14 @@ def main():
                 _sessions = new; _activity = act
                 if _active_id not in [s["id"] for s in new]:
                     _active_id = new[0]["id"] if new else None
-                if (choice_id and _ui_mode == "board"
-                        and not act.get(_active_id, (None, False))[1]
-                        and _active_id != choice_id):
-                    _active_id = choice_id
-                    log("auto-select flashing session %s", choice_id[:8])
+                if choice_id and _ui_mode == "board" and not manual:
+                    cur_needs = act.get(_active_id, (None, False))[1]
+                    cur_rank = URG_RANK.get(urg.get(_active_id), 99) if cur_needs else 99
+                    choice_rank = URG_RANK.get(urg.get(choice_id), 99)
+                    if choice_rank < cur_rank:
+                        _active_id = choice_id
+                        log("auto-select session %s (priority %d < %d)",
+                            choice_id[:8], choice_rank, cur_rank)
             if _ui_mode != "board" and time.monotonic() > _menu_deadline:
                 close_menu()
         try:
