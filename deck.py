@@ -169,7 +169,7 @@ def maybe_remediate(sessions):
 
 # Claude TUI scraping: working spinner ("✻ Vibing… (8m 23s)") and the arrow-nav
 # permission menus ("❯ 1. Yes" / "Do you want to proceed?").
-SPIN_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*]\s+([A-Za-z][\w-]+?)…")
+SPIN_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓]\s+([A-Za-z][\w-]+?)…")
 ELAPSED_RE = re.compile(r"\b(\d+m\s?\d+s|\d+m|\d+s)\b")
 CHOICE_RE = re.compile(r"❯\s*\d+\.|Do you want to proceed|\b1\.\s+Yes\b")
 
@@ -233,10 +233,16 @@ def _voice_toggle(sess):
 def session_activity(sess):
     """Scrape the session's pane -> (label, needs_choice). label is the live
     action (e.g. 'Vibing 8m23s' while thinking, 'choose…' at a prompt) else the
-    agent-deck status. Only captures for active states to keep it cheap."""
+    agent-deck status. agent-deck can't track shell-tool activity (oc-start,
+    plain shells), so also scrape idle shells for spinner/prompt evidence."""
     st = sess.get("status", "idle")
     t = sess.get("tmux_session")
-    if not t or st not in ("running", "starting", "waiting"):
+    tool = sess.get("tool", "")
+    # Scrape when agent-deck reports an active state, OR for shell-tool sessions
+    # where agent-deck has no visibility (status stuck at 'idle' while running).
+    scrape = st in ("running", "starting", "waiting") or (
+        st == "idle" and tool == "shell" and bool(t))
+    if not t or not scrape:
         return (st, False)
     r = _run(["tmux", "capture-pane", "-p", "-t", t, "-S", "-20"], timeout=5)
     pane = (r.stdout if r else "") or ""
@@ -248,6 +254,14 @@ def session_activity(sess):
     if m:
         el = ELAPSED_RE.search(pane)
         return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False)
+    # Shell-tool idle without a spinner: detect opencode 'waiting for input'
+    # state via its distinctive footer marker ([oc] in status bar). For oc
+    # sessions, no spinner means the agent finished its turn and is waiting
+    # for user input — blink so the deck surfaces it.
+    if st == "idle" and tool == "shell" and re.search(r"\[oc\]\s+\d+:", pane):
+        return ("input…", True)
+    # Shell-tool idle that doesn't match a spinner is genuinely idle (prompt
+    # visible). Other active states without a spinner show as 'thinking'.
     return ("thinking" if st in ("running", "starting") else st, False)
 
 # --- konsole control via D-Bus: tab/split happen INSIDE the focused window ----
