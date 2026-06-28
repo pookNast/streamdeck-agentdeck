@@ -360,18 +360,25 @@ def open_existing(s, mode):
 
 def focus_terminal(s):
     """Raise and focus the session's konsole window for manual typing.
-    Opens a new window if none exists yet."""
+    Searches deck-tracked windows first, then falls back to title search.
+    Opens a new window (attach-only, no restart) only if none is found."""
     if not s:
         return
+    sid = s["id"]; title = s.get("title", "")
     with _lock:
-        pid = _win_map.get(s["id"])
+        pid = _win_map.get(sid)
     wins = _windows_of_pid(pid)
+    if not wins and title:                      # fallback: search by window title
+        candidates = _xrun(["xdotool", "search", "--name", title]).split()
+        konsole = _konsole_windows()
+        wins = [w for w in candidates if w in konsole]
     if wins:
         _xrun(["wmctrl", "-i", "-a", wins[0]])
-        log("focus terminal for %s", s.get("title"))
+        log("focus terminal for %s", title)
     else:
-        place_konsole(_attach_cmd(s["id"]), "window", sid=s["id"])
-        log("open terminal for %s", s.get("title"))
+        # attach only — don't `session start` (that restarts a running agent)
+        place_konsole("%s session attach %s" % (AD, sid), "window", sid=sid)
+        log("open terminal for %s", title)
 
 def toggle_or_place(deck, s):
     """If this session's konsole window is alive: minimize it when visible,
