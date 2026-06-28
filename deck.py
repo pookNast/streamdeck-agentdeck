@@ -257,12 +257,17 @@ def session_activity(sess):
         # No spinner + agent-deck says waiting = genuinely waiting for user
         # input (numbered menu or text prompt). CHOICE_RE refines the label.
         return ("choose…" if CHOICE_RE.search(pane) else "input…", True)
-    # Shell-tool idle without a spinner: detect opencode 'waiting for input'
-    # state via its distinctive footer marker ([oc] in status bar). For oc
-    # sessions, no spinner means the agent finished its turn and is waiting
-    # for user input — blink so the deck surfaces it.
+    # Shell-tool idle without a spinner: detect when opencode is ASKING a
+    # question (not merely done with its turn). Heuristics, in order:
+    #   - ◎ ... for <elapsed>  = just-finished completion marker → idle, no blink
+    #   - otherwise, a '?' in the pane = agent asked a question → blink
+    # The [oc] footer alone is NOT enough — it's present in every oc state.
     if st == "idle" and tool == "shell" and re.search(r"\[oc\]\s+\d+:", pane):
-        return ("input…", True)
+        if re.search(r"◎\s+\S.*\bfor\b\s+\d+[ms]", pane):
+            return ("idle", False)            # turn done, awaiting next instruction
+        if "?" in pane:
+            return ("input…", True)           # agent asked a question → blink
+        return ("idle", False)                # plain oc prompt, no question
     # Shell-tool idle that doesn't match a spinner is genuinely idle (prompt
     # visible). Other active states without a spinner show as 'thinking'.
     return ("thinking" if st in ("running", "starting") else st, False)
