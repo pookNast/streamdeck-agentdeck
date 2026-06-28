@@ -105,6 +105,7 @@ _pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
 _win_map = {}              # session id -> konsole process pid we opened for it
 _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
+_reply_set_locked = False  # user manually changed reply set; don't auto-switch
 _activity = {}             # session id -> (label, needs_choice) from pane parsing
 _blink = False             # animation phase for the choice-needed border
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
@@ -729,7 +730,7 @@ def on_key(deck, key, pressed):
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
-    global _brightness, _reply_set
+    global _brightness, _reply_set, _reply_set_locked
     if event == DialEventType.TURN:
         if _ui_mode != "board":
             return
@@ -737,7 +738,8 @@ def on_dial(deck, dial, event, value):
             select_delta(1 if value > 0 else -1); repaint(deck)
         elif dial == 1:                                 # knob 2: cycle reply set
             _reply_set = (_reply_set + (1 if value > 0 else -1)) % len(REPLY_SETS)
-            log("reply set -> %d", _reply_set); repaint(deck)
+            _reply_set_locked = True   # respect manual choice until it resolves
+            log("reply set -> %d (locked)", _reply_set); repaint(deck)
         elif dial == 3:                                 # knob 4: brightness
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
@@ -761,7 +763,7 @@ def on_touch(deck, evt, value):
 
 # ---- main -----------------------------------------------------------------
 def main():
-    global _sessions, _active_id, _activity, _blink, _last_input, _asleep, _reply_set
+    global _sessions, _active_id, _activity, _blink, _last_input, _asleep, _reply_set, _reply_set_locked
     decks = DeviceManager().enumerate()
     plus = next((d for d in decks if "+" in d.deck_type()), None)
     if not plus:
@@ -809,8 +811,10 @@ def main():
             # touchscreen replies land on it without manually hunting with knob 1.
             # Skip if the current session also needs a choice, or a menu is open.
             choice_id = next((sid for sid, (_, need) in act.items() if need), None)
-            if choice_id and _reply_set != 0:        # auto-switch to arrow-nav set
-                _reply_set = 0
+            if not choice_id:
+                _reply_set_locked = False            # choices cleared → release lock
+            elif _reply_set != 0 and not _reply_set_locked:
+                _reply_set = 0                        # auto-switch to arrow-nav set
                 log("reply set -> select (choice needed)")
             with _lock:
                 _sessions = new; _activity = act
