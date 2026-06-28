@@ -24,7 +24,8 @@ import os, re, sys, json, time, math, signal, shutil, subprocess, threading, log
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.ImageHelpers import PILHelper
 from StreamDeck.Devices.StreamDeck import DialEventType, TouchscreenEventType
-from PIL import ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
+import ghibli_scenes as ghibli
 
 AD = os.path.expanduser("~/.local/bin/agent-deck")
 NEW_SESSION_DIR = os.path.expanduser("~")
@@ -131,6 +132,12 @@ INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
 # to ~/.local/state if resume-continuity ever matters.
 _anim_phase = 0.0
 _frame_cache = {}          # session id -> last native frame bytes (skip dup push)
+# Cinema mode: the full 4x2 key grid + touchscreen become ONE continuous canvas
+# playing an 8-bit Ghibli battle scene (Laputa Siege at Golden Hour). Sessions
+# needing input "break through" the canvas with a Ghibli-accent wash + pulsing
+# border instead of replacing the tile entirely, so the epic scene is never
+# interrupted. Toggle via key 7 long-press when on the board with no menu open.
+_cinema_mode = True
 # Auto-suggest dismissal: "Next" clears the input gate (stop blinking, drop
 # from focus queue) WITHOUT sending keys to the agent. Time-based: holds until
 # the agent goes busy again (spinner detected → rearm) or stops needing input.
@@ -884,11 +891,75 @@ def paint_board(deck):
     _frame_cache.clear()
     animate_active_keys(deck)
 
+def _overlay_title(draw, img, title):
+    """Small session title in the bottom-left corner with a dark drop-shadow on
+    all four sides so it reads against any scene background without a backing
+    rectangle (classic pixel-art text technique — no alpha needed for JPEG)."""
+    f = ImageFont.truetype(FONT_B, 13)
+    txt = title[:11]
+    x, y = 4, img.height - 18
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        draw.text((x + dx, y + dy), txt, font=f, fill=(0, 0, 0))
+    draw.text((x, y), txt, font=f, fill=(255, 230, 180))
+
+def _overlay_status_dot(draw, img, status):
+    """Tiny 6x6 status indicator in the top-right corner. Color-coded:
+    green=running, amber=waiting, red=error, slate=stopped, dim=idle."""
+    dot_colors = {"running": (40, 120, 50), "starting": (40, 80, 160),
+                  "waiting": (180, 130, 30), "error": (160, 40, 40),
+                  "stopped": (50, 50, 60), "idle": (60, 65, 75),
+                  "queued": (40, 80, 160)}
+    c = dot_colors.get(status, (60, 65, 75))
+    draw.rectangle([img.width - 8, 2, img.width - 2, 8], fill=c)
+
+def _animate_cinema(deck):
+    """Cinema mode: render the full 8-key grid as one continuous 8-bit Ghibli
+    battle scene. Keys needing input break through with an accent wash + pulsing
+    border. Session titles are overlaid with drop-shadows. The scene is never
+    interrupted — alerts wash OVER it, not INSTEAD of it."""
+    # Render the full scene canvas once, slice into 8 tiles.
+    scene = ghibli.render_scene(_anim_phase)
+    canvas = ghibli.scale_to_canvas(scene)
+    tiles = ghibli.slice_tiles(canvas)
+    with _lock:
+        sess = list(_sessions[:deck.key_count()]); active = _active_id
+    for i in range(deck.key_count()):
+        tile = tiles[i].copy()                       # mutable per-key copy
+        d = ImageDraw.Draw(tile)
+        if i < len(sess):
+            s = sess[i]
+            label, needs, _rec = _activity.get(s["id"], (s.get("status", "idle"), False, None))
+            urg = _urgency.get(s["id"], "menu") if needs else None
+            st = s.get("status", "idle")
+            _overlay_title(d, tile, s.get("title", "?"))
+            _overlay_status_dot(d, tile, st)
+            if needs:
+                # Break-through: Ghibli accent wash over the scene tile + a
+                # pulsing border in the accent color. The scene shows through
+                # underneath — the alert rides on top of the battle, not over it.
+                accent = GHIBLI["meadow"] if urg in ("menu", "urgent") else GHIBLI["rose"]
+                period = 1.6 if urg in ("menu", "urgent") else 3.0
+                pulse = _ease_sine(_anim_phase / period)
+                wash = Image.new("RGB", tile.size, accent)
+                tile = Image.blend(tile, wash, pulse * 0.35)
+                d = ImageDraw.Draw(tile)
+                border_c = _lerp_color(accent, (255, 255, 255), pulse * 0.4)
+                d.rectangle([1, 1, tile.width - 2, tile.height - 2],
+                            outline=border_c, width=3)
+            if s["id"] == active:
+                d = ImageDraw.Draw(tile)
+                d.rectangle([0, 0, tile.width - 1, tile.height - 1],
+                            outline=(255, 255, 255), width=2)
+        # Empty slots: pure scene tile, no overlay — the battle plays through.
+        frame = PILHelper.to_native_key_format(deck, tile)
+        deck.set_key_image(i, frame)
+
 def animate_active_keys(deck):
-    """Render every key each tick (idle shimmer, running spinner, pulse all need
-    per-frame updates). Static keys — stopped sessions, empty "+" slots — produce
-    byte-identical frames across ticks, so _frame_cache dedupes them and we skip
-    the HID push. This is what makes the 20fps loop affordable on the wire."""
+    """Render every key each tick. In cinema mode the full grid is one continuous
+    8-bit Ghibli scene; otherwise per-key state animations (pulse/spinner/shimmer)."""
+    if _cinema_mode and _ui_mode == "board":
+        _animate_cinema(deck)
+        return
     with _lock:
         sess = list(_sessions[:deck.key_count()]); active = _active_id
     for i in range(deck.key_count()):
@@ -925,24 +996,42 @@ def render_touchscreen(deck):
         d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" % _what,
                font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
     else:
+        # Board mode: Ghibli panorama banner (cinema) or flat dark (non-cinema).
+        if _cinema_mode:
+            banner = ghibli.render_touchscreen_banner(_anim_phase)
+            img.paste(banner, (0, 0))
+            d = ImageDraw.Draw(img)
+            txt_c = (255, 230, 180)
+        else:
+            txt_c = (95, 140, 180)
         s = active_session()
         if s:
             st = s.get("status", "idle")
-            d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (40, 42, 50)))
+            if not _cinema_mode:
+                d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (40, 42, 50)))
             head = "▶ {}  ·  {}".format(s.get("title", "?"), st)
         else:
-            head = "▶ no session selected"
-        d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
+            head = "▶ Laputa Siege  ·  cinema" if _cinema_mode else "▶ no session selected"
+        # Drop-shadow text when on the banner (JPEG has no alpha; 4-direction
+        # shadow makes any text readable over the scene without a backing rect).
+        if _cinema_mode:
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                d.text((16 + dx, 6 + dy), head, font=ImageFont.truetype(FONT_B, 24), fill=(0, 0, 0))
+        d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=txt_c)
         setname, zones = REPLY_SETS[_reply_set]
-        d.text((img.width - 12, 8), "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
-               font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(70, 78, 92))
-        # Recommended choice: blink the zone Claude Code's ❯ cursor marks
+        setinfo = "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS))
+        if _cinema_mode:
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                d.text((img.width - 12 + dx, 8 + dy), setinfo,
+                       font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
+        d.text((img.width - 12, 8), setinfo,
+               font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=txt_c)
+        # Recommended choice: the zone Claude Code's ❯ cursor marks
         # (1/2/3 for numbered menus, "Go" for auto-suggest). decoupled from the
         # "Next" label override below so menus still light their number.
         rec_zone = None
         if _reply_set == 0 and s is not None:
             rec_zone = _activity.get(s["id"], (None, False, None))[2]
-        suggest = _reply_set == 0 and active_is_suggest()
         zw = img.width / 4
         for i, (label, _) in enumerate(zones):
             # Zone 2 is always "Next" on the select set: dismiss the active
@@ -962,7 +1051,11 @@ def render_touchscreen(deck):
                                   (x0 + 2, 46, x0 + zw - 2, img.height - 1))
                 lbl_fill = (25, 20, 25)             # dark text on lit sweep
             else:
-                lbl_fill = (205, 210, 220)
+                lbl_fill = txt_c
+            if _cinema_mode:
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    d.text((x0 + zw / 2 + dx, 70 + dy), label,
+                           font=ImageFont.truetype(FONT_B, 26), anchor="mm", fill=(0, 0, 0))
             d.text((x0 + zw / 2, 70), label, font=ImageFont.truetype(FONT_B, 26),
                    anchor="mm", fill=lbl_fill)
     native = PILHelper.to_native_touchscreen_format(deck, img)
