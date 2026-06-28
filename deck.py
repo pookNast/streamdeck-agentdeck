@@ -199,10 +199,13 @@ def fetch_sessions():
     except Exception:
         return []
     data = data if isinstance(data, list) else data.get("items", data.get("sessions", []))
-    # Static layout: sort by creation order only. Blinking + auto-focus draws
-    # attention to sessions needing input; physical position stays stable so the
-    # user develops muscle memory for which key is which session.
-    data.sort(key=lambda s: s.get("created_at", ""))
+    # Fixed layout matching the user's Konsole tab order. Unlisted sessions
+    # go to the end (sorted by creation time among themselves).
+    SESSION_ORDER = ["claude-glm", "glm-2", "claude-2", "claude-glm (2)",
+                     "claude", "local-2"]
+    order = {t: i for i, t in enumerate(SESSION_ORDER)}
+    data.sort(key=lambda s: (order.get(s.get("title", ""), len(SESSION_ORDER)),
+                             s.get("created_at", "")))
     return data
 
 def tmux_send(sess, keys):
