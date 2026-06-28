@@ -72,11 +72,11 @@ CANCEL_KEY = 7             # last key cancels any open menu
 REPLY_SETS = [
     ("select", [("1", ["Up", "Enter"]),
                 ("2", ["Down", "Enter"]),
-                ("3", ["Down", "Down", "Enter"]),
-                ("Esc", ["Escape"])]),
-    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]), ("", None), ("", None)]),
+                ("S-Tab", ["BTab"]),
+                ("Voice", ["!voice-glm.sh"])]),
+    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]), ("S-Tab", ["BTab"]), ("Voice", ["!voice-glm.sh"])]),
     ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
-                ("3", ["3", "Enter"]), ("Esc", ["Escape"])]),
+                ("S-Tab", ["BTab"]), ("Voice", ["!voice-glm.sh"])]),
 ]
 
 STATE_COLOR = {"waiting": (235, 150, 25), "running": (38, 140, 60),
@@ -346,6 +346,10 @@ def act_reply(slot):
     label, keys = REPLY_SETS[_reply_set][1][slot]
     if not keys:
         return                                  # blank slot
+    if keys[0].startswith("!"):                 # shell command, not tmux keys
+        cmd = keys[0][1:]
+        _run(["bash", "-lc", cmd])
+        log("zone '%s' -> %s", label, cmd); return
     log("reply '%s' -> %s", label, s.get("title")); tmux_send(s, keys)
 
 def _attach_cmd(sid):
