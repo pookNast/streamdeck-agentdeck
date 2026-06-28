@@ -465,8 +465,15 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
               text_fill=(255, 255, 255)):
     img = _key_img(deck, bg)
     d = ImageDraw.Draw(img)
-    f = ImageFont.truetype(FONT_B, size)
-    lines = _multiline(d, text, f, img.width - 8)
+    max_w = img.width - 8
+    # Auto-shrink font until the longest line fits the key — long unbreakable
+    # tokens like "claude-glm" would otherwise overflow at the default size.
+    while size >= 11:
+        f = ImageFont.truetype(FONT_B, size)
+        lines = _multiline(d, text, f, max_w)
+        if max((d.textlength(ln, font=f) for ln in lines), default=0) <= max_w:
+            break
+        size -= 1
     y = (img.height - len(lines) * (size + 2)) / 2 - (8 if sub else 0)
     for ln in lines:
         d.text((img.width / 2, y), ln, font=f, anchor="ma", fill=text_fill); y += size + 2
