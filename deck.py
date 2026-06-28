@@ -246,14 +246,17 @@ def session_activity(sess):
         return (st, False)
     r = _run(["tmux", "capture-pane", "-p", "-t", t, "-S", "-20"], timeout=5)
     pane = (r.stdout if r else "") or ""
-    if st == "waiting":
-        # Any 'waiting' session needs user input — numbered menu OR text prompt.
-        # CHOICE_RE just refines the label; text-input prompts still blink.
-        return ("choose…" if CHOICE_RE.search(pane) else "input…", True)
+    # Spinner present = agent is actively working, regardless of what agent-deck
+    # reports as the status (it often flickers between running/waiting while a
+    # Bash command or sub-task runs). Never blink a spinning pane.
     m = SPIN_RE.search(pane)
     if m:
         el = ELAPSED_RE.search(pane)
         return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False)
+    if st == "waiting":
+        # No spinner + agent-deck says waiting = genuinely waiting for user
+        # input (numbered menu or text prompt). CHOICE_RE refines the label.
+        return ("choose…" if CHOICE_RE.search(pane) else "input…", True)
     # Shell-tool idle without a spinner: detect opencode 'waiting for input'
     # state via its distinctive footer marker ([oc] in status bar). For oc
     # sessions, no spinner means the agent finished its turn and is waiting
