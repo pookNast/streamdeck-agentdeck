@@ -73,10 +73,11 @@ REPLY_SETS = [
     ("select", [("1", ["Up", "Enter"]),
                 ("2", ["Down", "Enter"]),
                 ("S-Tab", ["BTab"]),
-                ("Voice", ["!voice-glm.sh"])]),
-    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]), ("S-Tab", ["BTab"]), ("Voice", ["!voice-glm.sh"])]),
+                ("Voice", ["!ssh %s voice-glm.sh" % SSH_HOST])]),
+    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]), ("S-Tab", ["BTab"]),
+                ("Voice", ["!ssh %s voice-glm.sh" % SSH_HOST])]),
     ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
-                ("S-Tab", ["BTab"]), ("Voice", ["!voice-glm.sh"])]),
+                ("S-Tab", ["BTab"]), ("Voice", ["!ssh %s voice-glm.sh" % SSH_HOST])]),
 ]
 
 STATE_COLOR = {"waiting": (235, 150, 25), "running": (38, 140, 60),
