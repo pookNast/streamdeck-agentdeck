@@ -465,21 +465,33 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
               text_fill=(255, 255, 255)):
     img = _key_img(deck, bg)
     d = ImageDraw.Draw(img)
-    max_w = img.width - 8
-    # Auto-shrink font until the longest line fits the key — long unbreakable
-    # tokens like "claude-glm" would otherwise overflow at the default size.
+    PAD = 10                                   # clearance each side (clears border)
+    max_w = img.width - PAD * 2
+    # Auto-shrink title font until the longest line fits the key.
     while size >= 11:
         f = ImageFont.truetype(FONT_B, size)
         lines = _multiline(d, text, f, max_w)
         if max((d.textlength(ln, font=f) for ln in lines), default=0) <= max_w:
             break
         size -= 1
-    y = (img.height - len(lines) * (size + 2)) / 2 - (8 if sub else 0)
-    for ln in lines:
-        d.text((img.width / 2, y), ln, font=f, anchor="ma", fill=text_fill); y += size + 2
+    # Auto-shrink sub font so the activity label fits too.
+    sub_size = 15; sf = None
     if sub:
-        d.text((img.width / 2, img.height - 18), sub, font=ImageFont.truetype(FONT_R, 15),
-               anchor="ma", fill=text_fill)
+        while sub_size >= 10:
+            sf = ImageFont.truetype(FONT_R, sub_size)
+            if d.textlength(sub, font=sf) <= max_w:
+                break
+            sub_size -= 1
+    # Center the title + sub block vertically as a group (not pinned to bottom).
+    lh = size + 2
+    gap = 3
+    sub_h = (sub_size + gap) if sub else 0
+    block_h = len(lines) * lh + sub_h
+    y = (img.height - block_h) / 2
+    for ln in lines:
+        d.text((img.width / 2, y), ln, font=f, anchor="ma", fill=text_fill); y += lh
+    if sub:
+        d.text((img.width / 2, y + gap), sub, font=sf, anchor="ma", fill=text_fill)
     if border:
         d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=border_w)
     return PILHelper.to_native_key_format(deck, img)
