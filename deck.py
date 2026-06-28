@@ -72,12 +72,13 @@ CANCEL_KEY = 7             # last key cancels any open menu
 REPLY_SETS = [
     ("select", [("1", ["Up", "Enter"]),
                 ("2", ["Down", "Enter"]),
+                ("3", ["Down", "Down", "Enter"]),
+                ("Esc", ["Escape"])]),
+    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]),
                 ("S-Tab", ["BTab"]),
-                ("Voice", ["!ssh %s voice-glm.sh" % SSH_HOST])]),
-    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]), ("S-Tab", ["BTab"]),
-                ("Voice", ["!ssh %s voice-glm.sh" % SSH_HOST])]),
+                ("Voice", ["!voice"])]),
     ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
-                ("S-Tab", ["BTab"]), ("Voice", ["!ssh %s voice-glm.sh" % SSH_HOST])]),
+                ("3", ["3", "Enter"]), ("Esc", ["Escape"])]),
 ]
 
 STATE_COLOR = {"waiting": (235, 150, 25), "running": (38, 140, 60),
@@ -199,6 +200,35 @@ def tmux_send(sess, keys):
         log("no tmux_session for %s", sess.get("title")); return
     _run(["tmux", "send-keys", "-t", t, *keys], timeout=8)
     log("send-keys -> %s : %s", t, " ".join(keys))
+
+def tmux_send_text(sess, text):
+    """Send literal text (no key interpretation) into the session's tmux pane."""
+    t = sess.get("tmux_session")
+    if not t:
+        log("no tmux_session for %s", sess.get("title")); return
+    _run(["tmux", "send-keys", "-t", t, "-l", text], timeout=8)
+    log("send-text -> %s : %d chars", t, len(text))
+
+def _voice_toggle(sess):
+    """Voice dictation via batkave (mic is there). First press starts recording;
+    second press stops, transcribes on batkave, and injects the result into the
+    session via tmux send-keys -l (no Enter, so the user reviews before submit)."""
+    ssh = ["ssh", "-o", "ConnectTimeout=5", SSH_HOST]
+    # Are we currently recording? (PID file exists on batkave)
+    r = _run(ssh + ["test -f /tmp/voice-glm-rec.pid"], timeout=8)
+    if r and r.returncode != 0:
+        # Not recording — start
+        _run(ssh + ["~/.local/bin/voice-glm.sh"], timeout=10)
+        log("voice: recording started on %s", SSH_HOST); return
+    # Recording — stop + transcribe (konsole-send will fail harmlessly on batkave;
+    # the transcript is written before that call)
+    _run(ssh + ["~/.local/bin/voice-glm.sh"], timeout=90)
+    r = _run(ssh + ["cat /tmp/voice-glm-transcript.txt"], timeout=8)
+    text = (r.stdout.strip() if r else "")
+    if text:
+        tmux_send_text(sess, text)
+    else:
+        log("voice: empty transcript")
 
 def session_activity(sess):
     """Scrape the session's pane -> (label, needs_choice). label is the live
@@ -347,7 +377,9 @@ def act_reply(slot):
     label, keys = REPLY_SETS[_reply_set][1][slot]
     if not keys:
         return                                  # blank slot
-    if keys[0].startswith("!"):                 # shell command, not tmux keys
+    if keys[0] == "!voice":                     # voice dictation toggle
+        _bg(_voice_toggle, s); return
+    if keys[0].startswith("!"):                 # other shell command
         cmd = keys[0][1:]
         _run(["bash", "-lc", cmd])
         log("zone '%s' -> %s", label, cmd); return
