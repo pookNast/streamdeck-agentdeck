@@ -12,8 +12,8 @@ Spawning is a two-step on-key picker:
                    ->  session spawns in that placement, board returns.
 
   TOUCH (4 zones) -> send to ACTIVE session: [ 1 ] [ 2 ] [ 3 ] [ Esc ]
-  DIALS  D0 turn select | push attach · D1 push +new · D2 push restart
-         D3 turn brightness | push stop
+  DIALS  D0 turn select | push reply-1 · D1 turn reply-set | push reply-2
+         D2 push focus terminal (manual typing) · D3 turn brightness | push Esc
 
 Config = the TOOLS / PLACEMENTS / REPLY_ZONES lists below. ponytail: state in
 module globals + a lock, no config file — upgrade: external file only if these
@@ -358,6 +358,21 @@ def open_existing(s, mode):
     """(Re)open an existing session in the chosen placement (window/tab/split)."""
     place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"])
 
+def focus_terminal(s):
+    """Raise and focus the session's konsole window for manual typing.
+    Opens a new window if none exists yet."""
+    if not s:
+        return
+    with _lock:
+        pid = _win_map.get(s["id"])
+    wins = _windows_of_pid(pid)
+    if wins:
+        _xrun(["wmctrl", "-i", "-a", wins[0]])
+        log("focus terminal for %s", s.get("title"))
+    else:
+        place_konsole(_attach_cmd(s["id"]), "window", sid=s["id"])
+        log("open terminal for %s", s.get("title"))
+
 def toggle_or_place(deck, s):
     """If this session's konsole window is alive: minimize it when visible,
     restore+raise when minimized. If it has NO window yet, open the placement
@@ -652,7 +667,12 @@ def on_dial(deck, dial, event, value):
             deck.set_brightness(_brightness)
         # dial 2 (knob 3) scroll: reserved for now
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
-        _bg(act_reply, dial)        # push knob N -> send reply slot N to active session
+        if dial == 2:                                   # knob 3 push: focus terminal
+            s = active_session()
+            if s:
+                _bg(focus_terminal, s)
+        else:
+            _bg(act_reply, dial)    # push knob N -> send reply slot N to active session
 
 def on_touch(deck, evt, value):
     if _wake_and_note(deck):
@@ -665,7 +685,7 @@ def on_touch(deck, evt, value):
 
 # ---- main -----------------------------------------------------------------
 def main():
-    global _sessions, _active_id, _activity, _blink, _last_input, _asleep
+    global _sessions, _active_id, _activity, _blink, _last_input, _asleep, _reply_set
     decks = DeviceManager().enumerate()
     plus = next((d for d in decks if "+" in d.deck_type()), None)
     if not plus:
@@ -713,6 +733,9 @@ def main():
             # touchscreen replies land on it without manually hunting with knob 1.
             # Skip if the current session also needs a choice, or a menu is open.
             choice_id = next((sid for sid, (_, need) in act.items() if need), None)
+            if choice_id and _reply_set != 0:        # auto-switch to arrow-nav set
+                _reply_set = 0
+                log("reply set -> select (choice needed)")
             with _lock:
                 _sessions = new; _activity = act
                 if _active_id not in [s["id"] for s in new]:
