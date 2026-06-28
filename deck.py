@@ -81,13 +81,13 @@ REPLY_SETS = [
                 ("3", ["3", "Enter"]), ("Esc", ["Escape"])]),
 ]
 
-STATE_COLOR = {"waiting": (235, 150, 25), "running": (38, 140, 60),
-               "idle": (58, 64, 78), "starting": (40, 90, 165),
-               "queued": (40, 90, 165), "error": (175, 40, 40),
-               "stopped": (44, 44, 52)}
-EMPTY_COLOR = (22, 24, 30)
-MENU_COLOR = (32, 52, 70)
-CANCEL_COLOR = (120, 35, 35)
+STATE_COLOR = {"waiting": (140, 90, 15), "running": (24, 88, 38),
+               "idle": (32, 36, 44), "starting": (24, 56, 100),
+               "queued": (24, 56, 100), "error": (105, 24, 24),
+               "stopped": (26, 26, 32)}
+EMPTY_COLOR = (14, 15, 20)
+MENU_COLOR = (20, 32, 44)
+CANCEL_COLOR = (72, 22, 22)
 STATE_RANK = {"waiting": 0, "error": 1, "running": 2, "starting": 3,
               "queued": 4, "idle": 5, "stopped": 6}
 
@@ -107,12 +107,22 @@ _win_map = {}              # session id -> konsole process pid we opened for it
 _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 _manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
 MANUAL_GRACE = 2.0         # seconds the deck respects manual selection before resuming auto
-_activity = {}             # session id -> (label, needs_choice) from pane parsing
+_activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
 _urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
 INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
 _blink = False             # fast animation phase for menu + urgent keys
-_blink_slow = False        # slow animation phase (toggles every other tick) for text-input keys
+_blink_slow = False        # slow animation phase for text-input keys
+# Auto-suggest dismissal: "Next" clears the input gate (stop blinking, drop
+# from focus queue) WITHOUT sending keys to the agent. Time-based: holds until
+# the agent goes busy again (spinner detected → rearm) or stops needing input.
+# Content-fingerprint matching was too fragile — Claude Code's status footer
+# ("· 1 shell · ← for agents") drifts every refresh, clearing the dismiss at
+# once. Sticky-suggest bridges agent-deck's running↔waiting flicker so the
+# "Next" label and a safe slot-2 press survive the noise.
+_dismissed = {}            # session id -> monotonic dismiss timestamp
+_suggest_sticky = {}       # session id -> monotonic timestamp of last "suggest…" label
+DISMISS_TIMEOUT = 300.0    # safety max before a dismissed session auto-rearms
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
 
@@ -178,6 +188,13 @@ def maybe_remediate(sessions):
 SPIN_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓]\s+([A-Za-z][\w-]+?)…")
 ELAPSED_RE = re.compile(r"\b(\d+m\s?\d+s|\d+m|\d+s)\b")
 CHOICE_RE = re.compile(r"❯\s*\d+\.|Do you want to proceed|\b1\.\s+Yes\b")
+# Recommended choice cursor: "❯ 2." — the option Claude Code highlights as the
+# default. Group 1 is the option number (1-3 maps to touchscreen zones 0-2).
+RECO_RE = re.compile(r"❯\s*(\d+)\.")
+# Bare text-input prompt: "❯" at the start of a line (Claude Code's input
+# cursor). Matched on the pane footer only, so it reflects the LIVE prompt and
+# not a stale one in scrollback.
+PROMPT_RE = re.compile(r"(?m)^\s*❯")
 # Completion marker: "✻ Crunched for 1m 4s" / "◎ Sautéed for 1m 12s" — agent
 # finished its turn and is at a bookmark/idle point (NOT asking a question).
 DONE_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓◎]\s+\S.*\bfor\b\s+\d+[ms]")
@@ -259,10 +276,12 @@ def _voice_toggle(sess):
         log("voice: empty transcript")
 
 def session_activity(sess):
-    """Scrape the session's pane -> (label, needs_choice). label is the live
-    action (e.g. 'Vibing 8m23s' while thinking, 'choose…' at a prompt) else the
-    agent-deck status. agent-deck can't track shell-tool activity (oc-start,
-    plain shells), so also scrape idle shells for spinner/prompt evidence."""
+    """Scrape the session's pane -> (label, needs_choice, rec_zone). label is
+    the live action (e.g. 'Vibing 8m23s' while thinking, 'choose…' at a prompt)
+    else the agent-deck status. needs_choice=True means blink for user input.
+    rec_zone is the touchscreen zone index (0-2) Claude Code's ❯ cursor marks as
+    the recommended pick in a numbered menu, else None. agent-deck can't track
+    shell-tool activity (oc-start, plain shells), so also scrape idle shells."""
     st = sess.get("status", "idle")
     t = sess.get("tmux_session")
     tool = sess.get("tool", "")
@@ -271,25 +290,54 @@ def session_activity(sess):
     scrape = st in ("running", "starting", "waiting") or (
         st == "idle" and tool == "shell" and bool(t))
     if not t or not scrape:
-        return (st, False)
+        return (st, False, None)
     r = _run(["tmux", "capture-pane", "-p", "-t", t, "-S", "-20"], timeout=5)
     pane = (r.stdout if r else "") or ""
-    # Spinner present = agent is actively working, regardless of what agent-deck
-    # reports as the status (it often flickers between running/waiting while a
-    # Bash command or sub-task runs). Never blink a spinning pane.
+    # The footer = the live state (last 10 lines). Checking it here instead of
+    # the full 20-line scrollback means stale completion markers / old menus
+    # higher up can't mask the prompt that's actually on screen right now.
+    footer = "\n".join(pane.splitlines()[-10:])
+    # Spinner anywhere in the pane = agent is actively working, regardless of
+    # what agent-deck reports (it flickers running↔waiting mid-turn). Never
+    # blink a spinning pane. A spinner also means any prior "Next" dismissal is
+    # stale (the agent acted) → rearm so the next prompt blinks normally.
+    # (Safe to scan the full pane: a completed turn's marker has no trailing
+    # '…', so SPIN_RE won't false-match it.)
     m = SPIN_RE.search(pane)
     if m:
+        _dismissed.pop(sess.get("id"), None)
         el = ELAPSED_RE.search(pane)
-        return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False)
-    # Completion marker ("✻ Crunched for 1m 4s") = agent finished its turn and
-    # is at an idle bookmark (NOT asking a question). Don't blink — this is the
-    # normal between-turns state of an interactive CLI.
-    if DONE_RE.search(pane):
-        return ("idle", False)
-    if st == "waiting":
-        # No spinner + agent-deck says waiting = genuinely waiting for user
-        # input (numbered menu or text prompt). CHOICE_RE refines the label.
-        return ("choose…" if CHOICE_RE.search(pane) else "input…", True)
+        return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False, None)
+    # Pane-driven prompt detection. agent-deck's status is NOT trusted here —
+    # it reports "running" for Claude Code sessions sitting at an idle ❯ prompt,
+    # which would otherwise fall through to "thinking" and hide the prompt from
+    # the board entirely (the cause of "Next" not registering on claude-2).
+    # Order matters: menu → completion → bare prompt.
+    if CHOICE_RE.search(footer):
+        # Numbered permission menu ("Do you want to proceed? ❯ 1. Yes"). Find
+        # which option the ❯ cursor highlights. Zone 2 is now "Next" (dismiss),
+        # not option "3", so only options 1-2 map to blinking zones 0-1.
+        rec = None
+        matches = list(RECO_RE.finditer(footer))
+        if matches:
+            n = int(matches[-1].group(1))
+            if 1 <= n <= 2:
+                rec = n - 1
+        return ("choose…", True, rec)
+    if PROMPT_RE.search(footer):
+        # Bare ❯ text prompt — auto-suggest ghost text or free-text input. A
+        # live ❯ prompt is checked BEFORE the completion marker because Claude
+        # Code shows "✻ Cooked for 2m" directly above the ❯ after every turn;
+        # if DONE_RE ran first it would mask the prompt and report "idle", so
+        # sessions waiting at an auto-suggest never blinked. The "Go" zone
+        # (Tab + 0.5s + Enter) accepts the suggestion; "Next" dismisses the
+        # gate. Label "suggest…" → slow blink.
+        return ("suggest…", True, 3)
+    if DONE_RE.search(footer):
+        # Recent completion marker with NO ❯ prompt below (e.g. raw output
+        # pane, or a TUI that hasn't repainted its prompt yet) → between-turns
+        # idle, don't blink.
+        return ("idle", False, None)
     # Shell-tool idle without a spinner: detect when opencode is ASKING a
     # question (not merely done with its turn). Heuristics, in order:
     #   - ◎ ... for <elapsed>  = just-finished completion marker → idle, no blink
@@ -297,13 +345,13 @@ def session_activity(sess):
     # The [oc] footer alone is NOT enough — it's present in every oc state.
     if st == "idle" and tool == "shell" and re.search(r"\[oc\]\s+\d+:", pane):
         if re.search(r"◎\s+\S.*\bfor\b\s+\d+[ms]", pane):
-            return ("idle", False)            # turn done, awaiting next instruction
+            return ("idle", False, None)        # turn done, awaiting next instruction
         if "?" in pane:
-            return ("input…", True)           # agent asked a question → blink
-        return ("idle", False)                # plain oc prompt, no question
+            return ("input…", True, None)       # agent asked a question → blink
+        return ("idle", False, None)            # plain oc prompt, no question
     # Shell-tool idle that doesn't match a spinner is genuinely idle (prompt
     # visible). Other active states without a spinner show as 'thinking'.
-    return ("thinking" if st in ("running", "starting") else st, False)
+    return ("thinking" if st in ("running", "starting") else st, False, None)
 
 # --- konsole control via D-Bus: tab/split happen INSIDE the focused window ----
 def _dbus_env():
@@ -427,10 +475,43 @@ def active_session():
     with _lock:
         return next((s for s in _sessions if s.get("id") == _active_id), None)
 
+def active_is_suggest():
+    """True if the active session is at a free-text / auto-suggest prompt
+    (label "suggest…"), OR was within the last few seconds — agent-deck flickers
+    status running↔waiting, which momentarily flips the label off "suggest…".
+    The sticky window keeps the "Next" label and a safe slot-2 press alive
+    across that flicker. A definitive numbered-menu label is NOT overridden."""
+    s = active_session()
+    if not s:
+        return False
+    sid = s["id"]
+    lbl = _activity.get(sid, (None, False, None))[0]
+    if lbl == "suggest…":
+        return True
+    if lbl != "choose…":                       # don't override a real menu
+        ts = _suggest_sticky.get(sid)
+        if ts and (time.monotonic() - ts) < 5.0:
+            return True
+    return False
+
+def dismiss_session(sess):
+    """Mark a session's current prompt as dismissed: stop blinking it, drop it
+    from the focus queue, WITHOUT sending keys to the agent. Rearms when the
+    agent next goes busy (spinner) or stops needing input, or after DISMISS_TIMEOUT."""
+    sid = sess.get("id")
+    _dismissed[sid] = time.monotonic()
+    _needed_since.pop(sid, None)
+    log("dismissed input gate for %s", sess.get("title"))
+
 def act_reply(slot):
     s = active_session()
     if not s:
         log("reply: no active session"); return
+    # Zone 2 is always "Next" on the select set: dismiss the active session's
+    # input gate (stop blinking, yield focus) WITHOUT sending keys to the agent.
+    # Applies to numbered menus AND auto-suggest prompts — "read it, move on".
+    if slot == 2 and _reply_set == 0:
+        dismiss_session(s); return
     label, keys = REPLY_SETS[_reply_set][1][slot]
     if not keys:
         return                                  # blank slot
@@ -586,7 +667,7 @@ def _key_img(deck, bg):
     return img
 
 def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
-              text_fill=(255, 255, 255)):
+              text_fill=(205, 210, 220)):
     img = _key_img(deck, bg)
     d = ImageDraw.Draw(img)
     PAD = 10                                   # clearance each side (clears border)
@@ -622,7 +703,7 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
 
 def _render_session(deck, s, is_active):
     st = s.get("status", "idle")
-    label, needs = _activity.get(s["id"], (st, False))
+    label, needs, _rec = _activity.get(s["id"], (st, False, None))
     title, sub = s.get("title", "?"), str(label)[:13]
     if needs:                                   # choice needed -> blink BACKGROUND only
         # ponytail: no thick border on blink — it hid the active-session cursor
@@ -631,12 +712,12 @@ def _render_session(deck, s, is_active):
         urg = _urgency.get(s["id"], "menu")
         phase = _blink_slow if urg == "patient" else _blink
         if phase:
-            bg, fill = (255, 200, 60), (15, 15, 15)
+            bg, fill = (190, 145, 40), (15, 15, 15)
         else:
-            bg, fill = (70, 45, 0), (255, 255, 255)
-        border = (255, 255, 255) if is_active else None   # keep cursor visible
+            bg, fill = (38, 24, 0), (205, 210, 220)
+        border = (180, 185, 195) if is_active else None   # keep cursor visible
         return _centered(deck, bg, title, sub=sub, text_fill=fill, border=border)
-    border = (255, 255, 255) if is_active else None
+    border = (180, 185, 195) if is_active else None
     return _centered(deck, STATE_COLOR.get(st, (50, 50, 58)), title, sub=sub, border=border)
 
 def paint_board(deck):
@@ -671,34 +752,53 @@ def _key_native_blank(deck):
 def render_touchscreen(deck):
     img = PILHelper.create_touchscreen_image(deck)
     d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, img.width, img.height], fill=(12, 14, 22))
+    d.rectangle([0, 0, img.width, img.height], fill=(6, 7, 12))
     if _ui_mode == "tool":
         d.text((16, 30), "pick agent for new session  ·  Cancel = key 8",
-               font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
+               font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
     elif _ui_mode == "place":
         _what = (_pending_tool[0] if _pending_tool
                  else _pending_session.get("title", "session") if _pending_session else "")
         d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" % _what,
-               font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
+               font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
     else:
         s = active_session()
         if s:
             st = s.get("status", "idle")
-            d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (60, 60, 60)))
+            d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (40, 42, 50)))
             head = "▶ {}  ·  {}".format(s.get("title", "?"), st)
         else:
             head = "▶ no session selected"
-        d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=(150, 210, 255))
+        d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
         setname, zones = REPLY_SETS[_reply_set]
         d.text((img.width - 12, 8), "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
-               font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(120, 130, 150))
+               font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(70, 78, 92))
+        # Recommended choice: blink the zone Claude Code's ❯ cursor marks
+        # (1/2/3 for numbered menus, "Go" for auto-suggest). decoupled from the
+        # "Next" label override below so menus still light their number.
+        rec_zone = None
+        if _reply_set == 0 and s is not None:
+            rec_zone = _activity.get(s["id"], (None, False, None))[2]
+        suggest = _reply_set == 0 and active_is_suggest()
         zw = img.width / 4
         for i, (label, _) in enumerate(zones):
+            # Zone 2 is always "Next" on the select set: dismiss the active
+            # session's input gate (stop blinking, move on) without sending
+            # keys. Works for both numbered menus and auto-suggest prompts.
+            if _reply_set == 0 and i == 2:
+                label = "Next"
             x0 = i * zw
             if i:
-                d.line([(x0, 44), (x0, img.height)], fill=(40, 44, 56), width=2)
+                d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
+            # Highlight the recommended zone in sync with the fast blink phase.
+            if i == rec_zone and _blink:
+                d.rectangle([x0 + 1, 45, x0 + zw - 1, img.height],
+                            fill=(180, 130, 0))     # amber pad (dim)
+                lbl_fill = (15, 15, 20)             # dark text on lit pad
+            else:
+                lbl_fill = (205, 210, 220)
             d.text((x0 + zw / 2, 70), label, font=ImageFont.truetype(FONT_B, 26),
-                   anchor="mm", fill="white")
+                   anchor="mm", fill=lbl_fill)
     native = PILHelper.to_native_touchscreen_format(deck, img)
     deck.set_touchscreen_image(native, 0, 0, img.width, img.height)
 
@@ -780,12 +880,11 @@ def on_dial(deck, dial, event, value):
             deck.set_brightness(_brightness)
         # dial 2 (knob 3) scroll: reserved for now
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
-        if dial == 2:                                   # knob 3 push: focus terminal
-            s = active_session()
-            if s:
-                _bg(focus_terminal, s)
-        else:
-            _bg(act_reply, dial)    # push knob N -> send reply slot N to active session
+        # Knob N push = reply slot N. Knob 3 (dial 2) is "Next" on the select
+        # set (dismiss the gate); on other reply sets it sends that slot's keys.
+        # ponytail: focus-terminal that lived on dial 2 was dropped so knob 3
+        # always matches its "Next" label — upgrade: long-press dial 2 if needed.
+        _bg(act_reply, dial)
 
 def on_touch(deck, evt, value):
     if _wake_and_note(deck):
@@ -825,7 +924,7 @@ def main():
 
     # tick fast for the choice-needed border animation; do the expensive
     # fetch + pane scrape only every Nth tick.
-    ANIM = 0.45
+    ANIM = 0.5
     per_refresh = max(1, round(REFRESH_SECS / ANIM))
     tick = 0
     while not stop.wait(ANIM):
@@ -837,30 +936,58 @@ def main():
         if _asleep:
             continue
         tick += 1
-        _blink = not _blink
-        _blink_slow = (tick % 2 == 0)             # slow phase: toggles every other tick
+        # Blink cadence (anti-seizure): fast = ~1s on / 1s off, slow = ~2s on /
+        # 2s off. Derived from tick count so the two phases never beat against
+        # each other. At ANIM=0.5: fast toggles every 2 ticks (1.0s), slow every
+        # 4 ticks (2.0s). The previous _blink_slow=(tick%2==0) was a bug — it
+        # toggled every tick, making "slow" blink identical to fast.
+        _blink      = ((tick // 2) % 2 == 0)
+        _blink_slow = ((tick // 4) % 2 == 0)
         do_refresh = (tick % per_refresh == 0)
         if do_refresh:
             new = fetch_sessions()
             act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
             maybe_remediate(new)                    # auto-restart errored sessions
             now = time.monotonic()
+            # Apply "Next" dismissals: a session dismissed via the "Next" zone
+            # stops blinking (need forced False) until the agent next goes busy
+            # (spinner clears the dismissal inside session_activity), stops
+            # needing input, or DISMISS_TIMEOUT elapses. Time-based, not content
+            # based — the pane footer drifts every refresh and would clear a
+            # fingerprint match instantly.
+            for sid in list(act.keys()):
+                lbl, need, rec = act[sid]
+                ts = _dismissed.get(sid)
+                if ts and (not need or now - ts > DISMISS_TIMEOUT):
+                    _dismissed.pop(sid, None)
+                elif ts and need:
+                    act[sid] = (lbl, False, None)
+            # Refresh sticky-suggest timestamps so active_is_suggest() bridges
+            # the agent-deck running↔waiting status flicker (5s window).
+            for sid, (lbl, _n, _r) in act.items():
+                if lbl == "suggest…":
+                    _suggest_sticky[sid] = now
             # Track when sessions first started needing input (for 10s slow-blink).
-            for sid, (label, need) in act.items():
+            for sid, (label, need, _r) in act.items():
                 if need:
                     _needed_since.setdefault(sid, now)
                 else:
                     _needed_since.pop(sid, None)
             # Classify urgency:
             #   "menu"    = numbered choice → fast blink, top focus priority
+            #   "suggest" = auto-suggest/text prompt → slow blink immediately
+            #               (differentiates from fast-blink menus; the "Go"
+            #               zone blinks as the recommended accept action)
             #   "urgent"  = text input < 10s → fast blink, secondary focus
             #   "patient" = text input > 10s → slow blink, lowest focus priority
             urg = {}
-            for sid, (label, need) in act.items():
+            for sid, (label, need, _r) in act.items():
                 if not need:
                     continue
                 if label == "choose…":
                     urg[sid] = "menu"
+                elif label == "suggest…":
+                    urg[sid] = "patient"
                 elif (now - _needed_since.get(sid, now)) < INPUT_TIMEOUT:
                     urg[sid] = "urgent"
                 else:
@@ -894,6 +1021,10 @@ def main():
                 repaint(plus)               # full board (current blink phase)
             else:
                 blink_animating(plus)       # only choice-needed keys -> blinking border
+                # Re-render the touchscreen between full refreshes so the
+                # recommended-choice zone blinks at the fast tick cadence
+                # (blink_animating only redraws keys, not the touchscreen).
+                render_touchscreen(plus)
         except Exception as e:
             log("repaint error: %s", e)
     try:
