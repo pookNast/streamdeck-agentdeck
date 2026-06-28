@@ -19,7 +19,7 @@ Config = the TOOLS / PLACEMENTS / REPLY_ZONES lists below. ponytail: state in
 module globals + a lock, no config file — upgrade: external file only if these
 must change without a restart.
 """
-import os, re, sys, json, time, signal, shutil, subprocess, threading, logging
+import os, re, sys, json, time, math, signal, shutil, subprocess, threading, logging
 
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.ImageHelpers import PILHelper
@@ -88,6 +88,17 @@ STATE_COLOR = {"waiting": (140, 90, 15), "running": (24, 88, 38),
 EMPTY_COLOR = (14, 15, 20)
 MENU_COLOR = (20, 32, 44)
 CANCEL_COLOR = (72, 22, 22)
+# Ghibli accent palette — used ONLY for animation layers (pulse/spinner/shimmer/
+# sweep). Base STATE_COLOR stays cool dark per the "Ghibli accents on dark base"
+# decision. Hex from HueHive Ghibli Palette + icolorpalette Studio Ghibli sets.
+GHIBLI = {
+    "meadow": (227, 193, 111),   # Golden Meadow   — urgent/menu pulse
+    "rose":   (255, 158, 170),   # Spirited Rose   — suggest pulse + rec sweep
+    "forest": (106, 130, 82),    # Enchanted Forest — running spinner
+    "wind":   (210, 227, 239),   # Whispering Wind — queued shimmer
+    "cloud":  (186, 199, 212),   # Castle Cloud    — idle shimmer (subtle)
+    "coral":  (248, 131, 121),   # Muted Coral     — error pulse
+}
 STATE_RANK = {"waiting": 0, "error": 1, "running": 2, "starting": 3,
               "queued": 4, "idle": 5, "stopped": 6}
 
@@ -111,8 +122,15 @@ _activity = {}             # session id -> (label, needs_choice, rec_zone) from 
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
 _urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
 INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
-_blink = False             # fast animation phase for menu + urgent keys
-_blink_slow = False        # slow animation phase for text-input keys
+# Animation: replaces the old _blink/_blink_slow booleans. _anim_phase is a
+# monotonic seconds accumulator incremented by ANIM each render tick; each
+# renderer derives its own 0..1 cycle phase from it, so all animations coexist
+# without beating. _frame_cache skips re-pushing identical native frames so the
+# 20fps loop doesn't flood HID for static slots (stopped/empty keys).
+# ponytail: in-memory phase accumulator, no persist on SIGTERM — upgrade: save
+# to ~/.local/state if resume-continuity ever matters.
+_anim_phase = 0.0
+_frame_cache = {}          # session id -> last native frame bytes (skip dup push)
 # Auto-suggest dismissal: "Next" clears the input gate (stop blinking, drop
 # from focus queue) WITHOUT sending keys to the agent. Time-based: holds until
 # the agent goes busy again (spinner detected → rearm) or stops needing input.
@@ -198,6 +216,16 @@ PROMPT_RE = re.compile(r"(?m)^\s*❯")
 # Completion marker: "✻ Crunched for 1m 4s" / "◎ Sautéed for 1m 12s" — agent
 # finished its turn and is at a bookmark/idle point (NOT asking a question).
 DONE_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓◎]\s+\S.*\bfor\b\s+\d+[ms]")
+# Plain numbered prompt with NO ❯ cursor — non-shell agents and CLI subprompts
+# that ask for a 1/2/3 choice without Claude Code's TUI chrome. The previous
+# bare "line ends with : or ?" heuristic over-matched on agent prose (numbered
+# lists + colons in normal explanations stole focus from sessions with real
+# input demands). Tightened: the LAST non-empty line must START with a prompt
+# keyword AND end with a prompt symbol, and a recent DONE_RE completion marker
+# suppresses the whole branch (checked after DONE_RE in session_activity).
+NUMBERED_RE = re.compile(r"(?m)^\s*[1-9]\.\s+\S")
+PROMPT_KW_RE = re.compile(
+    r"(?i)^\s*(?:choose|select|enter|press|pick|option|input|reply|answer|your (?:choice|selection))\b[^:?\n]{0,40}[:?]\s*$")
 
 # ---- plumbing -------------------------------------------------------------
 def _run(cmd, timeout=30):
@@ -338,6 +366,15 @@ def session_activity(sess):
         # pane, or a TUI that hasn't repainted its prompt yet) → between-turns
         # idle, don't blink.
         return ("idle", False, None)
+    # Plain numbered prompt with no ❯ cursor (no spinner, no menu, no bare ❯,
+    # no recent completion). Run AFTER DONE_RE so a finished turn's numbered
+    # output (e.g. "1. did X  2. did Y  ◎ for 1m") can't trigger a false input
+    # demand. The last non-empty line must start with a prompt keyword and end
+    # with : or ?, AND numbered items must be present — this is what keeps
+    # agent prose from stealing focus from sessions with real prompts.
+    tail = [ln for ln in footer.splitlines() if ln.strip()]
+    if (tail and NUMBERED_RE.search(footer) and PROMPT_KW_RE.match(tail[-1])):
+        return ("input…", True, None)
     # Shell-tool idle without a spinner: detect when opencode is ASKING a
     # question (not merely done with its turn). Heuristics, in order:
     #   - ◎ ... for <elapsed>  = just-finished completion marker → idle, no blink
@@ -666,10 +703,11 @@ def _key_img(deck, bg):
     ImageDraw.Draw(img).rectangle([0, 0, img.width, img.height], fill=bg)
     return img
 
-def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
-              text_fill=(205, 210, 220)):
-    img = _key_img(deck, bg)
-    d = ImageDraw.Draw(img)
+def _render_text(d, img, text, sub=None, text_fill=(205, 210, 220), size=20):
+    """Lay out title + optional sub onto an existing image, vertically centered
+    as a group. Auto-shrinks both fonts until they fit. Factored out of
+    _centered so the animated-key path can overlay text on a dynamic background
+    without re-implementing the layout."""
     PAD = 10                                   # clearance each side (clears border)
     max_w = img.width - PAD * 2
     # Auto-shrink title font until the longest line fits the key.
@@ -687,7 +725,6 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
             if d.textlength(sub, font=sf) <= max_w:
                 break
             sub_size -= 1
-    # Center the title + sub block vertically as a group (not pinned to bottom).
     lh = size + 2
     gap = 3
     sub_h = (sub_size + gap) if sub else 0
@@ -697,45 +734,161 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
         d.text((img.width / 2, y), ln, font=f, anchor="ma", fill=text_fill); y += lh
     if sub:
         d.text((img.width / 2, y + gap), sub, font=sf, anchor="ma", fill=text_fill)
+
+def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
+              text_fill=(205, 210, 220)):
+    img = _key_img(deck, bg)
+    d = ImageDraw.Draw(img)
+    _render_text(d, img, text, sub=sub, text_fill=text_fill, size=size)
     if border:
         d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=border_w)
     return PILHelper.to_native_key_format(deck, img)
+
+# ---- animation renderers (Ghibli accents) ---------------------------------
+# Each takes the PIL draw context, a 0..1 phase, an accent color, and the dark
+# base color. They mutate the image in place. Renderers are pure: same phase +
+# colors -> same pixels, so _frame_cache can dedupe unchanged frames.
+def _ease_sine(t):
+    """0..1 -> 0..1 smooth sine easing (slow at the extremes, fast in the middle)."""
+    return (math.sin(2.0 * math.pi * (t % 1.0)) + 1.0) / 2.0
+
+def _lerp_color(a, b, t):
+    """Linear RGB blend. t in 0..1. No alpha; we composite onto a known base."""
+    t = max(0.0, min(1.0, t))
+    return (int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t))
+
+def _anim_pulse(draw, img, phase, color, base, amp=0.5):
+    """Breathing background: bg eases between base and accent. amp is the peak
+    blend strength (0.5 = strong, 0.03 = barely-there idle glow)."""
+    draw.rectangle([0, 0, img.width, img.height],
+                   fill=_lerp_color(base, color, _ease_sine(phase) * amp))
+
+def _anim_spinner(draw, img, phase, color, base):
+    """Rotating arc around the key border. phase 0..1 = one full revolution.
+    A 90° arc with a tapering tail reads as a spinner even at small sizes."""
+    w, h = img.size
+    draw.rectangle([0, 0, w, h], fill=base)
+    # Draw a soft halo ring (3 concentric arcs of decreasing intensity) for a
+    # comet-tail effect rather than a flat stroke.
+    for ring, inset in ((1.0, 6), (0.55, 12), (0.25, 18)):
+        c = _lerp_color(base, color, ring)
+        start = int(360 * phase)
+        draw.arc([inset, inset, w - inset, h - inset],
+                 start=start, end=start + 100, fill=c, width=max(2, int(10 - ring * 6)))
+
+def _anim_shimmer(draw, img, phase, color, base, amp=0.03):
+    """Diagonal light band sweeping across the key. amp = peak intensity.
+    Idle uses amp=0.03 (subtle Castle Cloud wave); queued uses ~0.18."""
+    w, h = img.size
+    draw.rectangle([0, 0, w, h], fill=base)
+    # Band center sweeps left -> right; width is 40% of the key.
+    cx = (phase % 1.0) * (w + 80) - 40
+    bw = w * 0.4
+    # Approximate the band as 5 vertical slabs of decreasing intensity off the
+    # center. Cheaper than a true gradient and reads the same at key resolution.
+    for i, frac in enumerate((0.05, 0.15, amp, 0.15, 0.05)):
+        x = int(cx - bw / 2 + (i - 2) * bw / 5)
+        if -bw < x < w + bw:
+            slab = [x, 0, x + int(bw / 5) + 1, h]
+            draw.rectangle(slab, fill=_lerp_color(base, color, frac))
+
+def _anim_sweep_rects(draw, phase, color, base, rect):
+    """Concentric rectangles expanding outward from rect's center. Used for the
+    touchscreen recommended-zone highlight (replaces hard on/off blink)."""
+    x0, y0, x1, y1 = rect
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    # Three expanding rings; phase drives both radius and intensity so the
+    # outermost ring fades as a new one is born — a continuous pulse.
+    for k in range(3):
+        p = (phase + k / 3.0) % 1.0
+        scale = 0.4 + p * 0.6
+        alpha = (1.0 - p) * 0.7
+        hw = (x1 - x0) * scale / 2
+        hh = (y1 - y0) * scale / 2
+        draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh],
+                       fill=_lerp_color(base, color, alpha))
 
 def _render_session(deck, s, is_active):
     st = s.get("status", "idle")
     label, needs, _rec = _activity.get(s["id"], (st, False, None))
     title, sub = s.get("title", "?"), str(label)[:13]
-    if needs:                                   # choice needed -> blink BACKGROUND only
-        # ponytail: no thick border on blink — it hid the active-session cursor
-        # when knob 1 moved the selector. Background flash (amber↔dark) is enough.
-        # Urgency drives blink speed: "menu"/"urgent" = fast, "patient" = slow.
-        urg = _urgency.get(s["id"], "menu")
-        phase = _blink_slow if urg == "patient" else _blink
-        if phase:
-            bg, fill = (190, 145, 40), (15, 15, 15)
-        else:
-            bg, fill = (38, 24, 0), (205, 210, 220)
-        border = (180, 185, 195) if is_active else None   # keep cursor visible
-        return _centered(deck, bg, title, sub=sub, text_fill=fill, border=border)
-    border = (180, 185, 195) if is_active else None
-    return _centered(deck, STATE_COLOR.get(st, (50, 50, 58)), title, sub=sub, border=border)
+    base = STATE_COLOR.get(st, (50, 50, 58))
+    urg = _urgency.get(s["id"], "menu") if needs else None
+    # Period scaling: each renderer takes phase in "cycles", so dividing
+    # _anim_phase by the period (sec) gives one full cycle per period.
+    # Periods were chosen for seizure safety (all >= 1.0s) and to layer
+    # without beating (no two periods share a common multiple under 6s).
+    P = _anim_phase  # seconds, monotonic
+    if needs and urg in ("menu", "urgent"):
+        # Numbered menu / urgent text: Golden Meadow breathing, 1.6s cycle.
+        img = _key_img(deck, base)
+        d = ImageDraw.Draw(img)
+        _anim_pulse(d, img, P / 1.6, GHIBLI["meadow"], base, amp=0.55)
+        text_fill = _lerp_color((220, 225, 235), (25, 20, 10), _ease_sine(P / 1.6) * 0.5)
+    elif needs and urg == "patient":
+        # Auto-suggest / patient text: Spirited Rose breathing, slower (3.0s).
+        img = _key_img(deck, base)
+        d = ImageDraw.Draw(img)
+        _anim_pulse(d, img, P / 3.0, GHIBLI["rose"], base, amp=0.40)
+        text_fill = (220, 225, 235)
+    elif st == "error":
+        # Calm alarm: Muted Coral pulse, 1.0s. Slower than a strobe by 3x.
+        img = _key_img(deck, base)
+        d = ImageDraw.Draw(img)
+        _anim_pulse(d, img, P / 1.0, GHIBLI["coral"], base, amp=0.45)
+        text_fill = (220, 225, 235)
+    elif st in ("running", "starting") or label == "thinking":
+        # Working: Enchanted Forest spinner arc rotating around the border.
+        img = _key_img(deck, base)
+        d = ImageDraw.Draw(img)
+        _anim_spinner(d, img, P / 1.2, GHIBLI["forest"], base)
+        text_fill = (220, 225, 235)
+    elif st == "queued":
+        # Queued: Whispering Wind shimmer, slow diagonal sweep (5.0s).
+        img = _key_img(deck, base)
+        d = ImageDraw.Draw(img)
+        _anim_shimmer(d, img, P / 5.0, GHIBLI["wind"], base, amp=0.18)
+        text_fill = (220, 225, 235)
+    elif st == "idle":
+        # Idle: barely-there Castle Cloud shimmer (3% wave, 8s). Never fully
+        # still per user preference — feels alive without distracting.
+        img = _key_img(deck, base)
+        d = ImageDraw.Draw(img)
+        _anim_shimmer(d, img, P / 8.0, GHIBLI["cloud"], base, amp=0.03)
+        text_fill = (205, 210, 220)
+    else:
+        # stopped / unknown: static, no animation, cache-friendly.
+        border = (180, 185, 195) if is_active else None
+        return _centered(deck, base, title, sub=sub, border=border)
+    _render_text(d, img, title, sub=sub, text_fill=text_fill)
+    if is_active:
+        d.rectangle([1, 1, img.width - 2, img.height - 2], outline=(180, 185, 195), width=4)
+    return PILHelper.to_native_key_format(deck, img)
 
 def paint_board(deck):
+    # Clear the frame cache so every key is force-pushed once (used after a
+    # mode switch, menu close, or other context change where stale dedup would
+    # suppress a needed redraw).
+    _frame_cache.clear()
+    animate_active_keys(deck)
+
+def animate_active_keys(deck):
+    """Render every key each tick (idle shimmer, running spinner, pulse all need
+    per-frame updates). Static keys — stopped sessions, empty "+" slots — produce
+    byte-identical frames across ticks, so _frame_cache dedupes them and we skip
+    the HID push. This is what makes the 20fps loop affordable on the wire."""
     with _lock:
         sess = list(_sessions[:deck.key_count()]); active = _active_id
     for i in range(deck.key_count()):
         if i < len(sess):
-            deck.set_key_image(i, _render_session(deck, sess[i], sess[i]["id"] == active))
+            frame = _render_session(deck, sess[i], sess[i]["id"] == active)
         else:
-            deck.set_key_image(i, _centered(deck, EMPTY_COLOR, "+", size=40, sub="new"))
-
-def blink_animating(deck):
-    """Redraw only the keys whose session needs a choice, so their border blinks."""
-    with _lock:
-        sess = list(_sessions[:deck.key_count()]); active = _active_id
-    for i, s in enumerate(sess):
-        if _activity.get(s["id"], (None, False))[1]:
-            deck.set_key_image(i, _render_session(deck, s, s["id"] == active))
+            frame = _centered(deck, EMPTY_COLOR, "+", size=40, sub="new")
+        if _frame_cache.get(i) != frame:
+            _frame_cache[i] = frame
+            deck.set_key_image(i, frame)
 
 def paint_menu(deck, items):
     for i in range(deck.key_count()):
@@ -790,11 +943,14 @@ def render_touchscreen(deck):
             x0 = i * zw
             if i:
                 d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
-            # Highlight the recommended zone in sync with the fast blink phase.
-            if i == rec_zone and _blink:
-                d.rectangle([x0 + 1, 45, x0 + zw - 1, img.height],
-                            fill=(180, 130, 0))     # amber pad (dim)
-                lbl_fill = (15, 15, 20)             # dark text on lit pad
+            # Recommended zone: concentric Spirited Rose sweep instead of a hard
+            # blink. Pulses continuously in sync with the matching key's meadow
+            # pulse (1.6s period), so eye + key read as one cue.
+            if i == rec_zone:
+                _anim_sweep_rects(d, _anim_phase / 1.6, GHIBLI["rose"],
+                                  (12, 13, 18),
+                                  (x0 + 2, 46, x0 + zw - 2, img.height - 1))
+                lbl_fill = (25, 20, 25)             # dark text on lit sweep
             else:
                 lbl_fill = (205, 210, 220)
             d.text((x0 + zw / 2, 70), label, font=ImageFont.truetype(FONT_B, 26),
@@ -897,7 +1053,7 @@ def on_touch(deck, evt, value):
 
 # ---- main -----------------------------------------------------------------
 def main():
-    global _sessions, _active_id, _activity, _blink, _blink_slow, _last_input, _asleep
+    global _sessions, _active_id, _activity, _anim_phase, _last_input, _asleep
     global _reply_set, _manual_until, _needed_since, _urgency
     decks = DeviceManager().enumerate()
     plus = next((d for d in decks if "+" in d.deck_type()), None)
@@ -922,11 +1078,17 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # tick fast for the choice-needed border animation; do the expensive
-    # fetch + pane scrape only every Nth tick.
-    ANIM = 0.5
-    per_refresh = max(1, round(REFRESH_SECS / ANIM))
+    # Cadence split: ANIM is the render tick (20 fps for smooth motion);
+    # per_refresh keeps the expensive fetch + pane scrape on the slow 2s cadence.
+    # The 20fps loop only reads cached state (_sessions/_activity/_urgency) and
+    # redraws — animate_active_keys dedupes via _frame_cache so static keys
+    # don't flood the HID bus with identical frames.
+    # ponytail: single render thread, no GPU/OpenGL — upgrade: glfw framebuffer
+    # if we ever exceed 8 keys at 30fps.
+    ANIM = 0.05
+    per_refresh = max(1, round(REFRESH_SECS / ANIM))   # 40 ticks per state poll
     tick = 0
+    global _anim_phase
     while not stop.wait(ANIM):
         # idle sleep: blank the OLEDs after SLEEP_SECS with no input; a callback
         # (key/dial/touch) wakes it back up via _wake_and_note().
@@ -936,13 +1098,7 @@ def main():
         if _asleep:
             continue
         tick += 1
-        # Blink cadence (anti-seizure): fast = ~1s on / 1s off, slow = ~2s on /
-        # 2s off. Derived from tick count so the two phases never beat against
-        # each other. At ANIM=0.5: fast toggles every 2 ticks (1.0s), slow every
-        # 4 ticks (2.0s). The previous _blink_slow=(tick%2==0) was a bug — it
-        # toggled every tick, making "slow" blink identical to fast.
-        _blink      = ((tick // 2) % 2 == 0)
-        _blink_slow = ((tick // 4) % 2 == 0)
+        _anim_phase += ANIM                              # seconds, monotonic
         do_refresh = (tick % per_refresh == 0)
         if do_refresh:
             new = fetch_sessions()
@@ -984,7 +1140,7 @@ def main():
             for sid, (label, need, _r) in act.items():
                 if not need:
                     continue
-                if label == "choose…":
+                if label in ("choose…", "input…"):
                     urg[sid] = "menu"
                 elif label == "suggest…":
                     urg[sid] = "patient"
@@ -1014,17 +1170,16 @@ def main():
             if _ui_mode != "board" and time.monotonic() > _menu_deadline:
                 close_menu()
         try:
-            if _ui_mode != "board":
-                if do_refresh:
-                    repaint(plus)
-            elif do_refresh:
-                repaint(plus)               # full board (current blink phase)
-            else:
-                blink_animating(plus)       # only choice-needed keys -> blinking border
-                # Re-render the touchscreen between full refreshes so the
-                # recommended-choice zone blinks at the fast tick cadence
-                # (blink_animating only redraws keys, not the touchscreen).
+            if _ui_mode == "board":
+                # 20fps render of every key + touchscreen. animate_active_keys
+                # dedupes static frames via _frame_cache so the wire cost stays
+                # bounded even though we render all 8 keys every tick.
+                animate_active_keys(plus)
                 render_touchscreen(plus)
+            elif do_refresh:
+                # Menus are static between interactions — only repaint on the
+                # slow cadence (or when a callback forces it via repaint()).
+                repaint(plus)
         except Exception as e:
             log("repaint error: %s", e)
     try:
