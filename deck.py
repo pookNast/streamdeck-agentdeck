@@ -352,15 +352,25 @@ def session_activity(sess):
             if 1 <= n <= 2:
                 rec = n - 1
         return ("choose…", True, rec)
-    if PROMPT_RE.search(footer):
-        # Bare ❯ text prompt — auto-suggest ghost text or free-text input. A
-        # live ❯ prompt is checked BEFORE the completion marker because Claude
-        # Code shows "✻ Cooked for 2m" directly above the ❯ after every turn;
-        # if DONE_RE ran first it would mask the prompt and report "idle", so
-        # sessions waiting at an auto-suggest never blinked. The "Go" zone
-        # (Tab + 0.5s + Enter) accepts the suggestion; "Next" dismisses the
-        # gate. Label "suggest…" → slow blink.
-        return ("suggest…", True, 3)
+    # Find the LAST ❯ in the footer — only the live prompt matters. Scrollback
+    # ❯ lines (old commands like "❯ /clear", previous turns) sit ABOVE the live
+    # prompt and would false-trigger on .search() (first match). Also require
+    # non-whitespace text after the live ❯: an EMPTY ❯ (user idle, nothing
+    # typed, no auto-suggest ghost) is NOT an input demand — it's just "waiting
+    # for a new task". glm-2 sits at an empty ❯ and was stealing focus from
+    # claude-2 / claude-glm(2) which have real ❯ <text> prompts.
+    prompt_matches = list(PROMPT_RE.finditer(footer))
+    if prompt_matches:
+        after = footer[prompt_matches[-1].end():].split("\n", 1)[0].strip()
+        if after:
+            # Bare ❯ text prompt with content — auto-suggest ghost text or
+            # free-text input. Checked BEFORE DONE_RE because Claude Code shows
+            # "✻ Cooked for 2m" directly above the ❯ after every turn; if
+            # DONE_RE ran first it would mask the live prompt. "Go" zone accepts
+            # the suggestion; "Next" dismisses the gate.
+            return ("suggest…", True, 3)
+        # Empty live ❯ → session is idle, waiting for a new task. Fall through
+        # to DONE_RE / idle so it does NOT enter the auto-focus queue.
     if DONE_RE.search(footer):
         # Recent completion marker with NO ❯ prompt below (e.g. raw output
         # pane, or a TUI that hasn't repainted its prompt yet) → between-turns
