@@ -108,6 +108,61 @@ _blink = False             # animation phase for the choice-needed border
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
 
+# Auto-remediation: when a session is in `error` state, verify the tool's
+# prerequisites are met on the live environment and restart it. Cooldown per
+# session prevents a restart loop; the slate clears when the session recovers,
+# so a *new* error later gets a fresh attempt.
+RESTART_COOLDOWN = 60      # seconds between auto-restart attempts for one session
+_auto_restart_at = {}      # session id -> monotonic time the next retry is allowed
+
+# Per-tool readiness probe (runs via the same SSH host the tool itself uses).
+# Return 0 = environment is ready (restart is worth attempting).
+# ponytail: hardcoded probes — upgrade: derive from tool command when it grows.
+TOOL_READY = {
+    "glm":    'bash -lc "test -f /opt/claude-glm/secrets && . /opt/claude-glm/secrets && test -n \\"$ZAI_API_KEY\\""',
+    "local":  'bash -lc "curl -sf --max-time 3 http://localhost:11434/health >/dev/null 2>&1 || pgrep -x ollama >/dev/null 2>&1"',
+    "claude": 'bash -lc "which claude >/dev/null 2>&1"',
+    "gpt":    'bash -lc "which claude >/dev/null 2>&1"',
+}
+
+def _tool_label_for(sess):
+    """Map a session to its tool label by stripping dedup suffixes from the title
+    (e.g. 'glm-2' -> 'glm'). Falls back to the raw title."""
+    t = sess.get("title", "")
+    return re.sub(r'-\d+$', '', t) if re.search(r'-\d+$', t) else t
+
+def _env_ready(label):
+    """True if the tool's prerequisites are met on the live environment."""
+    probe = TOOL_READY.get(label)
+    if not probe:
+        return True                       # unknown tool — don't block a restart
+    host_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=4 %s %s" % (SSH_HOST, probe)
+    r = _run(["bash", "-c", host_cmd], timeout=10)
+    ok = bool(r and r.returncode == 0)
+    if not ok:
+        log("env check FAILED for '%s' — skipping auto-restart", label)
+    return ok
+
+def maybe_remediate(sessions):
+    """Auto-restart sessions stuck in error state, gated by an environment probe
+    and a per-session cooldown."""
+    now = time.monotonic()
+    for s in sessions:
+        if s.get("status") != "error":
+            if s["id"] in _auto_restart_at:
+                del _auto_restart_at[s["id"]]   # recovered — reset the slate
+            continue
+        sid = s["id"]
+        if now < _auto_restart_at.get(sid, 0):
+            continue                               # still in cooldown
+        label = _tool_label_for(s)
+        if not _env_ready(label):
+            _auto_restart_at[sid] = now + RESTART_COOLDOWN
+            continue
+        log("auto-restart errored '%s' (sid %s)", label, sid[:8])
+        _run([AD, "session", "restart", sid], timeout=20)
+        _auto_restart_at[sid] = now + RESTART_COOLDOWN
+
 # Claude TUI scraping: working spinner ("✻ Vibing… (8m 23s)") and the arrow-nav
 # permission menus ("❯ 1. Yes" / "Do you want to proceed?").
 SPIN_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*]\s+([A-Za-z][\w-]+?)…")
@@ -326,13 +381,26 @@ def toggle_or_place(deck, s):
         open_menu("place")
         repaint(deck)
 
+def _unique_title(label, sessions):
+    """Append -2, -3, … so multiple sessions of the same tool can coexist. agent-deck's
+    own dedup didn't fire reliably under -title-lock, so we disambiguate up front."""
+    titles = {s.get("title", "") for s in sessions}
+    if label not in titles:
+        return label
+    n = 2
+    while "%s-%d" % (label, n) in titles:
+        n += 1
+    return "%s-%d" % (label, n)
+
 def spawn(tool, mode):
     label, cmd = tool
-    log("spawn '%s' (%s) as %s in %s", label, cmd, mode, NEW_SESSION_DIR)
-    # -t names the session after the tool; -title-lock keeps Claude's session-name
-    # sync from overriding it back to the folder name (e.g. "pooknast").
+    with _lock:
+        title = _unique_title(label, _sessions)
+    log("spawn '%s' as '%s' (%s) in %s", label, title, cmd, NEW_SESSION_DIR)
+    # -t names the session; -title-lock keeps Claude's session-name sync from
+    # overriding it back to the folder name (e.g. "pooknast").
     r = _run([AD, "launch", NEW_SESSION_DIR, "-cmd", cmd,
-              "-t", label, "-title-lock", "--json"], timeout=40)
+              "-t", title, "-title-lock", "--json"], timeout=40)
     if not (r and r.returncode == 0):
         log("spawn failed: %s", (r.stderr.strip()[:140] if r else "no result")); return
     try:
@@ -411,12 +479,15 @@ def _render_session(deck, s, is_active):
     st = s.get("status", "idle")
     label, needs = _activity.get(s["id"], (st, False))
     title, sub = s.get("title", "?"), str(label)[:13]
-    if needs:                                   # choice needed -> blink the WHOLE key
+    if needs:                                   # choice needed -> blink BACKGROUND only
+        # ponytail: no thick border on blink — it hid the active-session cursor
+        # when knob 1 moved the selector. Background flash (amber↔dark) is enough.
         if _blink:
-            return _centered(deck, (255, 200, 60), title, sub=sub, text_fill=(15, 15, 15),
-                             border=(255, 255, 255), border_w=7)
-        return _centered(deck, (70, 45, 0), title, sub=sub,
-                         border=(130, 95, 0), border_w=7)
+            bg, fill = (255, 200, 60), (15, 15, 15)
+        else:
+            bg, fill = (70, 45, 0), (255, 255, 255)
+        border = (255, 255, 255) if is_active else None   # keep cursor visible
+        return _centered(deck, bg, title, sub=sub, text_fill=fill, border=border)
     border = (255, 255, 255) if is_active else None
     return _centered(deck, STATE_COLOR.get(st, (50, 50, 58)), title, sub=sub, border=border)
 
@@ -616,6 +687,7 @@ def main():
         if do_refresh:
             new = fetch_sessions()
             act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
+            maybe_remediate(new)                    # auto-restart errored sessions
             with _lock:
                 _sessions = new; _activity = act
                 if _active_id not in [s["id"] for s in new]:
