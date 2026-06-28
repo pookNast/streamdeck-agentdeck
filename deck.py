@@ -359,26 +359,34 @@ def open_existing(s, mode):
     place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"])
 
 def focus_terminal(s):
-    """Raise and focus the session's konsole window for manual typing.
-    Searches deck-tracked windows first, then falls back to title search.
-    Opens a new window (attach-only, no restart) only if none is found."""
+    """Raise the konsole window showing the active session for manual typing.
+    Never opens a duplicate: if the session's tmux already has a client (it's
+    visible somewhere), only raise the window — don't attach a new terminal."""
     if not s:
         return
-    sid = s["id"]; title = s.get("title", "")
+    sid = s["id"]; title = s.get("title", ""); t = s.get("tmux_session")
+    # Does this session already have a live terminal? (prevents mirror duplicates)
+    has_client = False
+    if t:
+        r = _run(["tmux", "list-clients", "-t", t], timeout=4)
+        has_client = bool(r and r.stdout.strip())
+    # Find an existing window: deck-tracked first, then title search
     with _lock:
         pid = _win_map.get(sid)
     wins = _windows_of_pid(pid)
-    if not wins and title:                      # fallback: search by window title
+    if not wins and title:
         candidates = _xrun(["xdotool", "search", "--name", title]).split()
         konsole = _konsole_windows()
         wins = [w for w in candidates if w in konsole]
     if wins:
         _xrun(["wmctrl", "-i", "-a", wins[0]])
         log("focus terminal for %s", title)
-    else:
-        # attach only — don't `session start` (that restarts a running agent)
+    elif not has_client:
+        # truly no terminal — open one (attach-only, never restart)
         place_konsole("%s session attach %s" % (AD, sid), "window", sid=sid)
         log("open terminal for %s", title)
+    else:
+        log("session %s already visible (has client) — not opening a duplicate", title)
 
 def toggle_or_place(deck, s):
     """If this session's konsole window is alive: minimize it when visible,
