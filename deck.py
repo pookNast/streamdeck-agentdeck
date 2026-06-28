@@ -690,10 +690,19 @@ def main():
             new = fetch_sessions()
             act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
             maybe_remediate(new)                    # auto-restart errored sessions
+            # Auto-select the first flashing (choice-needed) session so the
+            # touchscreen replies land on it without manually hunting with knob 1.
+            # Skip if the current session also needs a choice, or a menu is open.
+            choice_id = next((sid for sid, (_, need) in act.items() if need), None)
             with _lock:
                 _sessions = new; _activity = act
                 if _active_id not in [s["id"] for s in new]:
                     _active_id = new[0]["id"] if new else None
+                if (choice_id and _ui_mode == "board"
+                        and not act.get(_active_id, (None, False))[1]
+                        and _active_id != choice_id):
+                    _active_id = choice_id
+                    log("auto-select flashing session %s", choice_id[:8])
             if _ui_mode != "board" and time.monotonic() > _menu_deadline:
                 close_menu()
         try:
