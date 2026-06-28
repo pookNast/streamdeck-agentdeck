@@ -178,6 +178,9 @@ def maybe_remediate(sessions):
 SPIN_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓]\s+([A-Za-z][\w-]+?)…")
 ELAPSED_RE = re.compile(r"\b(\d+m\s?\d+s|\d+m|\d+s)\b")
 CHOICE_RE = re.compile(r"❯\s*\d+\.|Do you want to proceed|\b1\.\s+Yes\b")
+# Completion marker: "✻ Crunched for 1m 4s" / "◎ Sautéed for 1m 12s" — agent
+# finished its turn and is at a bookmark/idle point (NOT asking a question).
+DONE_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓◎]\s+\S.*\bfor\b\s+\d+[ms]")
 
 # ---- plumbing -------------------------------------------------------------
 def _run(cmd, timeout=30):
@@ -275,6 +278,11 @@ def session_activity(sess):
     if m:
         el = ELAPSED_RE.search(pane)
         return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False)
+    # Completion marker ("✻ Crunched for 1m 4s") = agent finished its turn and
+    # is at an idle bookmark (NOT asking a question). Don't blink — this is the
+    # normal between-turns state of an interactive CLI.
+    if DONE_RE.search(pane):
+        return ("idle", False)
     if st == "waiting":
         # No spinner + agent-deck says waiting = genuinely waiting for user
         # input (numbered menu or text prompt). CHOICE_RE refines the label.
