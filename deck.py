@@ -74,7 +74,7 @@ REPLY_SETS = [
                 ("2", ["Down", "Enter"]),
                 ("3", ["Down", "Down", "Enter"]),
                 ("Esc", ["Escape"])]),
-    ("keys",   [("Enter", ["C-j"]), ("Space", ["Space"]),
+    ("keys",   [("Enter", ["Tab", "~1.0", "Enter"]), ("Space", ["Space"]),
                 ("S-Tab", ["BTab"]),
                 ("Voice", ["!voice"])]),
     ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
@@ -197,11 +197,25 @@ def fetch_sessions():
     return data
 
 def tmux_send(sess, keys):
+    """Send tmux key tokens to the session's pane. Supports a pause token
+    "~N" (sleep N seconds) between key chunks — needed for sequences like
+    Tab-then-Enter where the TUI needs time to register the auto-fill."""
     t = sess.get("tmux_session")
     if not t:
         log("no tmux_session for %s", sess.get("title")); return
-    _run(["tmux", "send-keys", "-t", t, *keys], timeout=8)
-    log("send-keys -> %s : %s", t, " ".join(keys))
+    chunk = []
+    for k in keys:
+        if k.startswith("~"):
+            if chunk:
+                _run(["tmux", "send-keys", "-t", t, *chunk], timeout=8)
+                log("send-keys -> %s : %s", t, " ".join(chunk))
+                chunk = []
+            time.sleep(float(k[1:]))
+        else:
+            chunk.append(k)
+    if chunk:
+        _run(["tmux", "send-keys", "-t", t, *chunk], timeout=8)
+        log("send-keys -> %s : %s", t, " ".join(chunk))
 
 def tmux_send_text(sess, text):
     """Send literal text (no key interpretation) into the session's tmux pane."""
@@ -681,8 +695,9 @@ def repaint(deck):
 def _wake_and_note(deck):
     """Record input time; if the display is asleep, wake it and report True so the
     caller consumes this event (the waking press/turn just wakes, no action)."""
-    global _last_input, _asleep
+    global _last_input, _asleep, _manual_until
     _last_input = time.monotonic()
+    _manual_until = time.monotonic() + MANUAL_GRACE  # any interaction → hold session/reply-set
     if _asleep:
         _asleep = False
         deck.set_brightness(_brightness)
@@ -737,10 +752,8 @@ def on_dial(deck, dial, event, value):
             return
         if dial == 0:                                   # knob 1: select session
             select_delta(1 if value > 0 else -1); repaint(deck)
-            _manual_until = time.monotonic() + MANUAL_GRACE
         elif dial == 1:                                 # knob 2: cycle reply set
             _reply_set = (_reply_set + (1 if value > 0 else -1)) % len(REPLY_SETS)
-            _manual_until = time.monotonic() + MANUAL_GRACE
             log("reply set -> %d (manual)", _reply_set); repaint(deck)
         elif dial == 3:                                 # knob 4: brightness
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
