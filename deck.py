@@ -240,8 +240,10 @@ def session_activity(sess):
         return (st, False)
     r = _run(["tmux", "capture-pane", "-p", "-t", t, "-S", "-20"], timeout=5)
     pane = (r.stdout if r else "") or ""
-    if st == "waiting" and CHOICE_RE.search(pane):
-        return ("choose…", True)
+    if st == "waiting":
+        # Any 'waiting' session needs user input — numbered menu OR text prompt.
+        # CHOICE_RE just refines the label; text-input prompts still blink.
+        return ("choose…" if CHOICE_RE.search(pane) else "input…", True)
     m = SPIN_RE.search(pane)
     if m:
         el = ELAPSED_RE.search(pane)
