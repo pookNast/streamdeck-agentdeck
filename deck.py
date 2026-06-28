@@ -74,7 +74,7 @@ REPLY_SETS = [
                 ("2", ["Down", "Enter"]),
                 ("3", ["Down", "Down", "Enter"]),
                 ("Esc", ["Escape"])]),
-    ("keys",   [("Enter", ["Enter"]), ("Space", ["Space"]),
+    ("keys",   [("Enter", ["C-j"]), ("Space", ["Space"]),
                 ("S-Tab", ["BTab"]),
                 ("Voice", ["!voice"])]),
     ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
