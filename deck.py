@@ -891,16 +891,36 @@ def paint_board(deck):
     _frame_cache.clear()
     animate_active_keys(deck)
 
-def _overlay_title(draw, img, title):
+def _overlay_title(draw, img, title, thinking=False):
     """Small session title in the bottom-left corner with a dark drop-shadow on
     all four sides so it reads against any scene background without a backing
-    rectangle (classic pixel-art text technique — no alpha needed for JPEG)."""
+    rectangle (classic pixel-art text technique — no alpha needed for JPEG).
+    When `thinking=True` the title is shifted up one row to leave room for the
+    real-time activity spinner below it (see _overlay_activity)."""
     f = ImageFont.truetype(FONT_B, 13)
     txt = title[:11]
-    x, y = 4, img.height - 18
+    y = img.height - 34 if thinking else img.height - 18
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-        draw.text((x + dx, y + dy), txt, font=f, fill=(0, 0, 0))
-    draw.text((x, y), txt, font=f, fill=(255, 230, 180))
+        draw.text((4 + dx, y + dy), txt, font=f, fill=(0, 0, 0))
+    draw.text((4, y), txt, font=f, fill=(255, 230, 180))
+
+def _overlay_activity(draw, img, phase):
+    """Real-time CLI activity indicator below the session title — a mini
+    Enchanted-Forest arc spinner (1.2s rotation, matching the per-key spinner
+    cadence). Drop-shadow pixels on four sides keep it legible over any scene
+    background. Drawn AFTER _overlay_title(thinking=True) so it sits beneath
+    the shifted title row."""
+    cx, cy = 12, img.height - 11
+    r = 6
+    color = GHIBLI["forest"]
+    p = (phase / 1.2) % 1.0
+    start = int(p * 360)
+    end = start + 270
+    bbox = [cx - r, cy - r, cx + r, cy + r]
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        draw.arc([bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy],
+                 start, end, fill=(0, 0, 0), width=2)
+    draw.arc(bbox, start, end, fill=color, width=2)
 
 def _overlay_status_dot(draw, img, status):
     """Tiny 6x6 status indicator in the top-right corner. Color-coded:
@@ -931,25 +951,39 @@ def _animate_cinema(deck):
             label, needs, _rec = _activity.get(s["id"], (s.get("status", "idle"), False, None))
             urg = _urgency.get(s["id"], "menu") if needs else None
             st = s.get("status", "idle")
-            _overlay_title(d, tile, s.get("title", "?"))
-            _overlay_status_dot(d, tile, st)
+            thinking = (label == "thinking" or st in ("running", "starting"))
+            # 1) Break-through wash for needy keys — applied BEFORE overlays so
+            #    the title + spinner stay crisp on top of the washed tile.
             if needs:
-                # Break-through: Ghibli accent wash over the scene tile + a
-                # pulsing border in the accent color. The scene shows through
-                # underneath — the alert rides on top of the battle, not over it.
                 accent = GHIBLI["meadow"] if urg in ("menu", "urgent") else GHIBLI["rose"]
                 period = 1.6 if urg in ("menu", "urgent") else 3.0
                 pulse = _ease_sine(_anim_phase / period)
                 wash = Image.new("RGB", tile.size, accent)
                 tile = Image.blend(tile, wash, pulse * 0.35)
                 d = ImageDraw.Draw(tile)
-                border_c = _lerp_color(accent, (255, 255, 255), pulse * 0.4)
-                d.rectangle([1, 1, tile.width - 2, tile.height - 2],
+            # 2) Per-key overlays on top of (possibly washed) scene tile.
+            _overlay_title(d, tile, s.get("title", "?"), thinking=thinking)
+            _overlay_status_dot(d, tile, st)
+            if thinking:
+                # Real-time CLI activity indicator under the session title —
+                # mini Enchanted-Forest arc spinner (1.2s rotation).
+                _overlay_activity(d, tile, _anim_phase)
+            # 3) Needy accent border — breathes between darkened-accent and
+            #    full accent ONLY (gold/pink). Never lerps toward white, so the
+            #    white active-selector border below stays visually unique.
+            if needs:
+                border_c = _lerp_color((20, 20, 28), accent, 0.65 + pulse * 0.35)
+                d.rectangle([2, 2, tile.width - 3, tile.height - 3],
                             outline=border_c, width=3)
+            # 4) Active session selector — unmistakable double border drawn
+            #    LAST so it dominates every other element. Outer thick pure-
+            #    white frame + inner dark hairline. This is the ONLY white
+            #    border on the deck; accent borders never reach white.
             if s["id"] == active:
-                d = ImageDraw.Draw(tile)
                 d.rectangle([0, 0, tile.width - 1, tile.height - 1],
-                            outline=(255, 255, 255), width=2)
+                            outline=(255, 255, 255), width=4)
+                d.rectangle([3, 3, tile.width - 4, tile.height - 4],
+                            outline=(0, 0, 0), width=1)
         # Empty slots: pure scene tile, no overlay — the battle plays through.
         frame = PILHelper.to_native_key_format(deck, tile)
         deck.set_key_image(i, frame)

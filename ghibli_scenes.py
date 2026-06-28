@@ -135,6 +135,74 @@ def _pixel_circle_blend(px, cx, cy, r, color, blend, w, h):
 
 
 # ---- scene renderer --------------------------------------------------------
+def _draw_godzilla(draw, phase):
+    """Godzilla emerges from behind the mountains roughly every 45 seconds,
+    walks the horizon right→left, charges atomic breath (glowing dorsal plates
+    + cyan beam shooting up at Laputa), then sinks back. Classic kaiju cameo
+    layered into the Laputa siege. Deterministic — no per-frame RNG."""
+    cycle = 45.0
+    appear = 7.0
+    t = phase % cycle
+    if t > appear:
+        return
+    # Rise in (first 1s) / sink out (last 1s): body emerges from mountains.
+    if t < 1.0:
+        y_off = int((1 - _ease(t)) * 10)
+    elif t > appear - 1.0:
+        y_off = int((1 - _ease(appear - t)) * 10)
+    else:
+        y_off = 0
+    # Walk right→left across the horizon
+    walk_t = t / appear
+    cx = int(SCENE_W - 16 - walk_t * (SCENE_W - 32))
+    base_y = HORIZON_Y + 3 + y_off
+    body = (38, 48, 44)         # charcoal-green hide
+    belly = (55, 66, 58)        # lighter chest
+    plate = (74, 96, 78)        # dorsal plates (resting)
+    glow = (122, 216, 255)      # atomic cyan (charged)
+    eye = (255, 205, 85)        # predator amber
+    # Breath window: 1.6s–4.0s, flickers in 0.125s beats for crackle
+    breath_t = t - 1.6
+    breathing = (0 < breath_t < 2.4) and (int(breath_t * 8) % 3 != 0)
+    plate_color = glow if breathing else plate
+
+    # Tail (curves up-left from body)
+    draw.rectangle([cx - 13, base_y - 5, cx - 8, base_y - 3], fill=body)
+    draw.rectangle([cx - 17, base_y - 4, cx - 13, base_y - 3], fill=body)
+    # Body bulk
+    draw.rectangle([cx - 8, base_y - 11, cx + 5, base_y - 3], fill=body)
+    # Belly highlight
+    draw.rectangle([cx - 5, base_y - 7, cx + 3, base_y - 4], fill=belly)
+    # Head (right side)
+    draw.rectangle([cx + 5, base_y - 13, cx + 10, base_y - 9], fill=body)
+    # Jaw — open during breath, closed otherwise
+    if breathing:
+        draw.rectangle([cx + 10, base_y - 12, cx + 12, base_y - 10], fill=body)
+        draw.point((cx + 11, base_y - 11), fill=glow)
+    else:
+        draw.rectangle([cx + 10, base_y - 12, cx + 12, base_y - 11], fill=body)
+    # Eye
+    draw.point((cx + 8, base_y - 12), fill=glow if breathing else eye)
+    # Tiny arm
+    draw.rectangle([cx + 1, base_y - 6, cx + 3, base_y - 2], fill=body)
+    # Stout legs
+    draw.rectangle([cx - 6, base_y - 3, cx - 3, base_y], fill=body)
+    draw.rectangle([cx + 2, base_y - 3, cx + 5, base_y], fill=body)
+    # Dorsal plates along the back (3-4px tall, glow during charge)
+    for px_off, ph in [(-5, 3), (-2, 4), (1, 4), (4, 3), (6, 2)]:
+        draw.rectangle([cx + px_off, base_y - 13 - ph, cx + px_off + 2, base_y - 11],
+                       fill=plate_color)
+    # Atomic breath beam — shoots up from jaw toward the floating fortress
+    if breathing:
+        bx = cx + 12
+        by = base_y - 11
+        for y in range(by, by - 18, -1):
+            if 0 <= y < SCENE_H:
+                draw.point((bx, y), fill=glow)
+                if bx + 1 < SCENE_W:
+                    draw.point((bx + 1, y), fill=(70, 150, 190))
+
+
 def render_scene(phase):
     """Render one frame of the Laputa siege scene at 120x60.
     `phase` = monotonic seconds. Returns PIL.Image RGB."""
@@ -239,6 +307,12 @@ def render_scene(phase):
     # --- Layer 7: mid mountains (parallax medium-fast) ---
     _triangular_ridge(draw, HORIZON_Y + 3, amplitude=6, period=18,
                       offset=phase * 1.2, color=PAL["mtn_mid"], w=SCENE_W)
+
+    # --- Layer 7.5: Godzilla (periodic kaiju cameo) ---
+    # Emerges from behind the mid-mountains every 45s, walks the horizon left,
+    # charges atomic breath (cyan dorsal plates + upward beam at Laputa), then
+    # sinks back. A kaiju siege against the floating fortress.
+    _draw_godzilla(draw, phase)
 
     # --- Layer 8: lightning bolt (periodic jagged strike) ---
     # Strikes every ~4s. Deterministic timing via floor(phase/4) seed.
