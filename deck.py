@@ -147,6 +147,7 @@ _cinema_mode = True
 # "Next" label and a safe slot-2 press survive the noise.
 _dismissed = {}            # session id -> monotonic dismiss timestamp
 _suggest_sticky = {}       # session id -> monotonic timestamp of last "suggest…" label
+_pruned = {}               # session id -> monotonic timestamp (suppress re-prune noise)
 DISMISS_TIMEOUT = 300.0    # safety max before a dismissed session auto-rearms
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
@@ -254,46 +255,71 @@ def fetch_sessions():
     # Fixed layout matching the user's Konsole tab order. Unlisted sessions
     # go to the end (sorted by creation time among themselves).
     SESSION_ORDER = ["claude-glm", "glm-2", "claude-2", "claude-glm (2)",
-                     "claude", "local-2"]
+                     "claude", "local-2", "glm"]
     order = {t: i for i, t in enumerate(SESSION_ORDER)}
     data.sort(key=lambda s: (order.get(s.get("title", ""), len(SESSION_ORDER)),
                              s.get("created_at", "")))
     return data
 
 def _prune_dead(sessions):
-    """Remove sessions whose tmux backend has died (user closed the Konsole
-    tab, typed /exit, killed the process). agent-deck's `list --json` keeps
-    showing them with stale status because it doesn't poll tmux liveness.
-
-    One `tmux list-sessions` call batches the check — O(1) regardless of
-    session count. Dead sessions are stopped via `agent-deck session stop`
-    so agent-deck's internal state matches reality, and per-session state
-    dicts are cleaned up to prevent ghost entries from lingering in the
-    focus queue or dismissal map."""
-    tmux_sess = [(s, s.get("tmux_session")) for s in sessions
-                 if s.get("tmux_session")]
+    """Remove sessions whose backend has died. Two signals:
+      1. tmux session gone entirely (user killed it)
+      2. SSH-tunnel session whose remote process exited — the pane fell back
+         from 'ssh' to 'bash' (shows 'Connection to ... closed' on screen).
+    agent-deck's list keeps showing dead sessions with stale status.
+    One batched `tmux list-panes -a` call checks all sessions at once."""
+    tmux_sess = {s.get("tmux_session"): s for s in sessions
+                 if s.get("tmux_session")}
     if not tmux_sess:
         return sessions
-    r = _run(["tmux", "list-sessions", "-F", "#{session_name}"], timeout=5)
+    r = _run(["tmux", "list-panes", "-a", "-F",
+              "#{session_name}\t#{pane_current_command}\t#{pane_dead}"],
+             timeout=5)
     if not r or r.returncode != 0:
-        # tmux server not running or errored — can't determine liveness; keep all
-        return sessions
-    alive = set(r.stdout.split())
+        return sessions                        # tmux server down — can't check
+    pane_info = {}                             # session_name -> (cmd, pane_dead)
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            pane_info[parts[0]] = (parts[1], parts[2])
     dead_ids = set()
-    for s, tname in tmux_sess:
-        if tname not in alive:
-            log("prune dead session '%s' (tmux '%s' gone)",
-                s.get("title"), tname)
-            dead_ids.add(s["id"])
+    now = time.monotonic()
+    for tname, s in tmux_sess.items():
+        sid = s["id"]
+        # Skip sessions we already pruned recently (agent-deck's remove may
+        # take a couple of poll cycles to clear from list --json).
+        if sid in _pruned:
+            dead_ids.add(sid)
+            continue
+        if tname not in pane_info:
+            dead_ids.add(sid)
+            log("prune dead '%s' (tmux '%s' gone)", s.get("title"), tname)
+            continue
+        cmd, pane_dead = pane_info[tname]
+        is_ssh = s.get("command", "").lstrip().startswith("ssh")
+        # SSH-tunnel session dies when pane falls back from 'ssh' to anything
+        # else (usually 'bash') — catches 'Connection to ... closed'.
+        if is_ssh and (pane_dead == "1" or cmd != "ssh"):
+            dead_ids.add(sid)
+            log("prune dead '%s' (SSH closed, pane now %s/%s)",
+                s.get("title"), cmd, pane_dead)
     if not dead_ids:
         return sessions
     for sid in dead_ids:
-        _run([AD, "session", "stop", sid], timeout=10)
+        if sid not in _pruned:
+            _run([AD, "session", "stop", sid], timeout=10)
+            _run([AD, "session", "remove", sid, "--force"], timeout=10)
+            _pruned[sid] = now
+            log("prune: stop+remove %s", sid[:8])
         _activity.pop(sid, None)
         _urgency.pop(sid, None)
         _needed_since.pop(sid, None)
         _dismissed.pop(sid, None)
         _suggest_sticky.pop(sid, None)
+    # Expire stale prune cache entries (session could be re-created with same id)
+    for sid in list(_pruned):
+        if sid not in {s["id"] for s in sessions} and now - _pruned[sid] > 60:
+            del _pruned[sid]
     return [s for s in sessions if s["id"] not in dead_ids]
 
 def tmux_send(sess, keys):
@@ -404,8 +430,13 @@ def session_activity(sess):
     # claude-2 / claude-glm(2) which have real ❯ <text> prompts.
     prompt_matches = list(PROMPT_RE.finditer(footer))
     if prompt_matches:
-        after = footer[prompt_matches[-1].end():].split("\n", 1)[0].strip()
-        if after:
+        after_line = footer[prompt_matches[-1].end():].split("\n", 1)[0]
+        # Real auto-suggest / ghost text is IMMEDIATELY after ❯ (column 1-4).
+        # The Knurl duck ASCII art sits at column ~100 — all whitespace between
+        # the cursor and the art. Only treat near-text as input demand. Without
+        # this, the duck art false-triggers "suggest…" and locks the session
+        # in the focus queue permanently, blocking other sessions.
+        if after_line[:5].strip():
             # Bare ❯ text prompt with content — auto-suggest ghost text or
             # free-text input. Checked BEFORE DONE_RE because Claude Code shows
             # "✻ Cooked for 2m" directly above the ❯ after every turn; if
