@@ -260,6 +260,42 @@ def fetch_sessions():
                              s.get("created_at", "")))
     return data
 
+def _prune_dead(sessions):
+    """Remove sessions whose tmux backend has died (user closed the Konsole
+    tab, typed /exit, killed the process). agent-deck's `list --json` keeps
+    showing them with stale status because it doesn't poll tmux liveness.
+
+    One `tmux list-sessions` call batches the check — O(1) regardless of
+    session count. Dead sessions are stopped via `agent-deck session stop`
+    so agent-deck's internal state matches reality, and per-session state
+    dicts are cleaned up to prevent ghost entries from lingering in the
+    focus queue or dismissal map."""
+    tmux_sess = [(s, s.get("tmux_session")) for s in sessions
+                 if s.get("tmux_session")]
+    if not tmux_sess:
+        return sessions
+    r = _run(["tmux", "list-sessions", "-F", "#{session_name}"], timeout=5)
+    if not r or r.returncode != 0:
+        # tmux server not running or errored — can't determine liveness; keep all
+        return sessions
+    alive = set(r.stdout.split())
+    dead_ids = set()
+    for s, tname in tmux_sess:
+        if tname not in alive:
+            log("prune dead session '%s' (tmux '%s' gone)",
+                s.get("title"), tname)
+            dead_ids.add(s["id"])
+    if not dead_ids:
+        return sessions
+    for sid in dead_ids:
+        _run([AD, "session", "stop", sid], timeout=10)
+        _activity.pop(sid, None)
+        _urgency.pop(sid, None)
+        _needed_since.pop(sid, None)
+        _dismissed.pop(sid, None)
+        _suggest_sticky.pop(sid, None)
+    return [s for s in sessions if s["id"] not in dead_ids]
+
 def tmux_send(sess, keys):
     """Send tmux key tokens to the session's pane. Supports a pause token
     "~N" (sleep N seconds) between key chunks — needed for sequences like
@@ -1263,7 +1299,7 @@ def main():
         _anim_phase += ANIM                              # seconds, monotonic
         do_refresh = (tick % per_refresh == 0)
         if do_refresh:
-            new = fetch_sessions()
+            new = _prune_dead(fetch_sessions())
             act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
             maybe_remediate(new)                    # auto-restart errored sessions
             now = time.monotonic()
