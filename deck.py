@@ -102,6 +102,7 @@ GHIBLI = {
 }
 STATE_RANK = {"waiting": 0, "error": 1, "running": 2, "starting": 3,
               "queued": 4, "idle": 5, "stopped": 6}
+URG_RANK = {"menu": 0, "urgent": 1, "patient": 2}   # lower rank = higher focus priority
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -632,7 +633,7 @@ def act_reply(slot):
     # input gate (stop blinking, yield focus) WITHOUT sending keys to the agent.
     # Applies to numbered menus AND auto-suggest prompts — "read it, move on".
     if slot == 2 and _reply_set == 0:
-        dismiss_session(s); return
+        dismiss_session(s); _advance_focus(s["id"]); return
     label, keys = REPLY_SETS[_reply_set][1][slot]
     if not keys:
         return                                  # blank slot
@@ -643,6 +644,7 @@ def act_reply(slot):
         _run(["bash", "-lc", cmd])
         log("zone '%s' -> %s", label, cmd); return
     log("reply '%s' -> %s", label, s.get("title")); tmux_send(s, keys)
+    _advance_focus(s["id"])          # zero-lag: snap selector to next needy session
 
 def _attach_cmd(sid):
     # start-if-needed then attach: `start` revives a stopped/killed session (so a
@@ -756,6 +758,31 @@ def select_delta(n):
         ids = [s["id"] for s in _sessions]
         i = ids.index(_active_id) if _active_id in ids else 0
         _active_id = ids[(i + n) % len(ids)]
+
+def _advance_focus(exclude_sid=None):
+    """Snap the selector to the top-priority needy session NOW, excluding the one
+    just replied/dismissed so focus advances to the NEXT in the queue without
+    waiting for the 2s poll (which is also blocked by MANUAL_GRACE during active
+    use). Event-driven — only called on an explicit reply/dismiss — so it can't
+    reintroduce the equal-priority jitter the periodic loop avoids.
+    ponytail: reads cached _activity/_urgency under _lock — upgrade: trigger a
+    fresh scrape too if a brand-new need must be caught faster than REFRESH_SECS."""
+    with _lock:
+        needy = [sid for sid, (_lbl, need, _rec) in _activity.items()
+                 if need and sid != exclude_sid]
+        if not needy:
+            return
+        needy.sort(key=lambda sid: URG_RANK.get(_urgency.get(sid), 99))
+        choice = needy[0]
+        cur = _active_id
+        cur_rank = (URG_RANK.get(_urgency.get(cur), 99)
+                    if _activity.get(cur, (None, False))[1] else 99)
+        # Advance when the current session was just handled (exclude_sid) OR a
+        # strictly higher-priority need exists. Equal rank never yanks (no jitter).
+        if cur == exclude_sid or URG_RANK.get(_urgency.get(choice), 99) < cur_rank:
+            if choice != cur:
+                _active_id = choice
+                log("advance focus -> %s", choice[:8])
 
 # ---- menu state -----------------------------------------------------------
 def open_menu(mode):
@@ -1384,7 +1411,6 @@ def main():
             # Equal-priority competitors do NOT yank focus (avoids jitter when
             # two menus appear in the same poll). Lower rank number = higher
             # priority. The selector snaps on the next 20fps frame (~50ms).
-            URG_RANK = {"menu": 0, "urgent": 1, "patient": 2}
             focus_order = sorted(
                 [sid for sid in act if act[sid][1]],
                 key=lambda sid: URG_RANK.get(urg.get(sid), 99),
