@@ -1172,9 +1172,9 @@ def on_key(deck, key, pressed):
         if s["id"] == active:
             _bg(toggle_or_place, deck, s)
         else:
+            # State-only: main 20fps loop renders the new selector next tick.
             with _lock:
                 _active_id = s["id"]
-            repaint(deck)
     else:
         open_menu("tool"); repaint(deck)
 
@@ -1186,10 +1186,13 @@ def on_dial(deck, dial, event, value):
         if _ui_mode != "board":
             return
         if dial == 0:                                   # knob 1: select session
-            select_delta(1 if value > 0 else -1); repaint(deck)
+            # State-only update: the 20fps main loop renders the new selector
+            # within ~50ms. Calling repaint() here would race the main render
+            # thread (both pushing frames concurrently → glitch/flicker).
+            select_delta(1 if value > 0 else -1)
         elif dial == 1:                                 # knob 2: cycle reply set
             _reply_set = (_reply_set + (1 if value > 0 else -1)) % len(REPLY_SETS)
-            log("reply set -> %d (manual)", _reply_set); repaint(deck)
+            log("reply set -> %d (manual)", _reply_set)
         elif dial == 3:                                 # knob 4: brightness
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
