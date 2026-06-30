@@ -29,6 +29,7 @@ import ghibli_scenes as ghibli
 
 AD = os.path.expanduser("~/.local/bin/agent-deck")
 NEW_SESSION_DIR = os.path.expanduser("~")
+_WIN_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/windows.json")
 FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_R = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 if not os.path.exists(FONT_R):
@@ -117,6 +118,24 @@ _pending_tool = None       # (label, command) chosen in the tool menu -> spawn n
 _pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
 _win_map = {}              # session id -> konsole process pid we opened for it
+
+def _save_win_map():
+    try:
+        os.makedirs(os.path.dirname(_WIN_MAP_PATH), exist_ok=True)
+        with open(_WIN_MAP_PATH, "w") as f:
+            json.dump(_win_map, f)
+    except Exception as e:
+        logging.warning("win_map save failed: %s", e)
+
+def _load_win_map():
+    try:
+        with open(_WIN_MAP_PATH) as f:
+            _win_map.update(json.load(f))
+        logging.info("win_map loaded: %d entries", len(_win_map))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning("win_map load failed: %s", e)
 _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 _manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
 MANUAL_GRACE = 2.0         # seconds the deck respects manual selection before resuming auto
@@ -300,7 +319,11 @@ def _prune_dead(sessions):
         is_ssh = s.get("command", "").lstrip().startswith("ssh")
         # SSH-tunnel session dies when pane falls back from 'ssh' to anything
         # else (usually 'bash') — catches 'Connection to ... closed'.
-        if is_ssh and (pane_dead == "1" or cmd != "ssh"):
+        # Whitelist tool executable names: pane_current_command can show the
+        # deep foreground (e.g. 'claude') on some tmux/kernel combinations even
+        # while the outer ssh is alive — don't false-positive those as dead.
+        _ALIVE_CMDS = frozenset(["ssh"] + [t[0] for t in TOOLS])
+        if is_ssh and (pane_dead == "1" or cmd not in _ALIVE_CMDS):
             dead_ids.add(sid)
             log("prune dead '%s' (SSH closed, pane now %s/%s)",
                 s.get("title"), cmd, pane_dead)
@@ -543,6 +566,33 @@ def _tmux_client_count():
     r = _run(["tmux", "list-clients"], timeout=4)
     return len(r.stdout.splitlines()) if (r and r.returncode == 0) else 0
 
+def _clients_on(tmux):
+    """Set of tmux client names attached to session `tmux` (empty if tmux is None
+    or unreachable). Per-session, unlike _tmux_client_count's global total — so a
+    placement can prove IT bound the right session, not just any session. This is
+    the precise signal that kills the mirrored-split false positive.
+    Lists ALL clients with their session name and filters in Python: tmux 3.4's
+    `list-clients -t <session>` returns empty even for attached sessions."""
+    if not tmux:
+        return set()
+    r = _run(["tmux", "list-clients", "-F", "#{session_name}\t#{client_name}"], timeout=4)
+    if not (r and r.returncode == 0):
+        return set()
+    out = set()
+    for ln in r.stdout.splitlines():
+        parts = ln.split("\t", 1)
+        if len(parts) == 2 and parts[0] == tmux:
+            out.add(parts[1])
+    return out
+
+def _close_session(svc, ksid):
+    """Close a konsole session by sending `exit` to its shell. Konsole exposes no
+    D-Bus close method, so this is the clean way to tear down an orphan split pane
+    before falling back to a fresh window (so it can't linger as a mirror)."""
+    # ponytail: sendText exit — no D-Bus closeSession exists; upgrade: none
+    if ksid:
+        _qdbus(svc, "/Sessions/%s" % ksid, "org.kde.konsole.Session.sendText", "exit\n")
+
 def _xrun(args, timeout=5):
     try:
         return subprocess.check_output(args, env=_dbus_env(), text=True, timeout=timeout)
@@ -584,13 +634,16 @@ def _new_window(cmd, sid=None):
                 pid = _xrun(["xdotool", "getwindowpid", wid]).strip()
                 with _lock:
                     _win_map[sid] = pid
+                    _save_win_map()
                 log("opened+tracked konsole pid %s (win %s) for session %s",
                     pid, wid, sid[:8]); return
     log("opened new konsole window")
 
-def place_konsole(cmd, mode, sid=None):
+def place_konsole(cmd, mode, sid=None, tmux=None):
     """cmd runs in the chosen placement. window -> fresh konsole (tracked by sid);
-    tab/split -> inside the focused konsole window via D-Bus (falls back to a window)."""
+    tab/split -> inside the focused konsole window via D-Bus (falls back to a window).
+    `tmux` is this session's tmux_session name — when known, split placement verifies
+    a client binds THAT exact session (not a global count), killing mirror false positives."""
     if not _dbus_env().get("DISPLAY"):
         log("no DISPLAY; cannot open terminal"); return
     if mode == "window":
@@ -609,11 +662,18 @@ def place_konsole(cmd, mode, sid=None):
     # split: create a new pane (a NEW konsole session) and run cmd in it.
     # Poll for the genuinely-new session id (a fixed sleep raced the shell), and
     # NEVER fall back to currentSession — that re-ran the attach in the existing
-    # (claude) pane, which is exactly what produced the mirrored-session bug.
-    # Verify a tmux client actually attached; if it doesn't hold, open a window.
+    # (claude) pane, producing the mirrored-session bug (fixed in 02a7cc9).
+    #
+    # 02a7cc9's verify checked the GLOBAL tmux client count, which false-positives:
+    # Konsole split-view can spawn a pane that binds a client for an instant then
+    # dies (or mirrors session 1) — the global total had already risen, so it
+    # logged "(attached)" while the user saw session 1 mirrored. Now we require a
+    # NEW client on THIS session's tmux that HOLDS ~0.8s with the pane still alive;
+    # anything else closes the orphan pane and opens a clean window. No silent mirror.
     action = "split-view-left-right" if mode == "split-right" else "split-view-top-bottom"
     before = set(_session_list(svc))
-    clients0 = _tmux_client_count()
+    c0 = _clients_on(tmux)                       # per-session clients before split
+    g0 = _tmux_client_count()                    # global fallback when tmux name unknown
     _qdbus(svc, "/konsole/MainWindow_1", "org.kde.KMainWindow.activateAction", action)
     ksid = None
     for _ in range(20):                          # up to ~2s for the new session to appear
@@ -625,11 +685,24 @@ def place_konsole(cmd, mode, sid=None):
         log("split spawned no new session; opening window"); _new_window(cmd, sid=sid); return
     time.sleep(0.3)                              # let the new pane's shell settle before runCommand
     _run_in_session(svc, ksid, cmd)
-    for _ in range(15):                          # confirm the attach bound a client (~1.5s)
+
+    def _bound():
+        if tmux:
+            return bool(_clients_on(tmux) - c0)  # a NEW client on THIS session
+        return _tmux_client_count() > g0         # fallback: any new client (less precise)
+
+    for _ in range(25):                          # up to ~2.5s for the client to bind
         time.sleep(0.1)
-        if _tmux_client_count() > clients0:
-            log("split %s in %s session %s (attached)", mode, svc, ksid); return
-    log("split attach didn't hold (session %s); opening window", ksid); _new_window(cmd, sid=sid)
+        if _bound():
+            break
+    else:
+        log("split didn't bind %s; opening window", tmux or (sid[:8] if sid else "session"))
+        _close_session(svc, ksid); _new_window(cmd, sid=sid); return
+    time.sleep(0.8)                              # hold gate: must still be bound 0.8s later
+    if _bound() and ksid in _session_list(svc):
+        log("split %s in %s session %s (held on %s)", mode, svc, ksid, tmux or "tmux"); return
+    log("split didn't hold for %s; closing pane %s, opening window", tmux or (sid[:8] if sid else "session"), ksid)
+    _close_session(svc, ksid); _new_window(cmd, sid=sid)
 
 # ---- actions --------------------------------------------------------------
 def _bg(fn, *a):
@@ -696,7 +769,7 @@ def _attach_cmd(sid):
 
 def open_existing(s, mode):
     """(Re)open an existing session in the chosen placement (window/tab/split)."""
-    place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"])
+    place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"], tmux=s.get("tmux_session"))
 
 def focus_terminal(s):
     """Raise the konsole window showing the active session for manual typing.
@@ -708,8 +781,7 @@ def focus_terminal(s):
     # Does this session already have a live terminal? (prevents mirror duplicates)
     has_client = False
     if t:
-        r = _run(["tmux", "list-clients", "-t", t], timeout=4)
-        has_client = bool(r and r.stdout.strip())
+        has_client = bool(_clients_on(t))
     # Find an existing window: deck-tracked first, then title search
     with _lock:
         pid = _win_map.get(sid)
@@ -776,11 +848,13 @@ def spawn(tool, mode):
     if not (r and r.returncode == 0):
         log("spawn failed: %s", (r.stderr.strip()[:140] if r else "no result")); return
     try:
-        sid = json.loads(r.stdout).get("id")
+        info = json.loads(r.stdout)
+        sid = info.get("id")
+        tmux_name = info.get("tmux_session")
     except Exception as e:
         log("spawn parse error: %s", e); return
     if sid:
-        place_konsole(_attach_cmd(sid), mode, sid=sid)
+        place_konsole(_attach_cmd(sid), mode, sid=sid, tmux=tmux_name)
 
 def act_restart():
     s = active_session()
@@ -1353,15 +1427,33 @@ def on_touch(deck, evt, value):
 def main():
     global _sessions, _active_id, _activity, _anim_phase, _last_input, _asleep
     global _reply_set, _manual_until, _needed_since, _urgency
-    decks = DeviceManager().enumerate()
-    plus = next((d for d in decks if "+" in d.deck_type()), None)
+    # Retry HID enumeration+open with backoff (device may not be ready at boot).
+    # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
+    # settled the HID node yet; this keeps the process alive instead.
+    _plus = None
+    for _attempt in range(30):
+        try:
+            decks = DeviceManager().enumerate()
+            _plus = next((d for d in decks if "+" in d.deck_type()), None)
+            if _plus:
+                _plus.open()
+                break
+        except Exception as _e:
+            log("HID open attempt %d failed: %s", _attempt + 1, _e)
+        if _attempt >= 29:
+            log("HID open failed after 30 attempts; giving up"); sys.exit(1)
+        _wait = min(2 ** _attempt, 30)
+        log("retrying HID in %ds", _wait)
+        time.sleep(_wait)
+    plus = _plus
     if not plus:
-        log("no Stream Deck Plus (found %s)", [d.deck_type() for d in decks]); sys.exit(1)
-    plus.open(); plus.reset(); plus.set_brightness(_brightness)
+        log("no Stream Deck Plus found"); sys.exit(1)
+    plus.reset(); plus.set_brightness(_brightness)
     plus.set_key_callback(on_key)
     plus.set_dial_callback(on_dial)
     plus.set_touchscreen_callback(on_touch)
 
+    _load_win_map()
     _sessions = fetch_sessions()
     _active_id = _sessions[0]["id"] if _sessions else None
     _activity = {s["id"]: session_activity(s) for s in _sessions[:plus.key_count()]}
