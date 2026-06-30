@@ -207,6 +207,7 @@ INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
 # to ~/.local/state if resume-continuity ever matters.
 _anim_phase = 0.0
 _frame_cache = {}          # session id -> last native frame bytes (skip dup push)
+_touch_frame_cache = None  # last native touchscreen frame bytes (skip dup push)
 # Cinema mode: the full 4x2 key grid + touchscreen become ONE continuous canvas
 # playing an 8-bit Ghibli battle scene (Laputa Siege at Golden Hour). Sessions
 # needing input "break through" the canvas with a Ghibli-accent wash + pulsing
@@ -1276,7 +1277,9 @@ def paint_board(deck):
     # Clear the frame cache so every key is force-pushed once (used after a
     # mode switch, menu close, or other context change where stale dedup would
     # suppress a needed redraw).
+    global _touch_frame_cache
     _frame_cache.clear()
+    _touch_frame_cache = None
     animate_active_keys(deck)
 
 def _overlay_title(draw, img, title, thinking=False):
@@ -1503,6 +1506,18 @@ def render_touchscreen(deck):
             d.text((x0 + zw / 2, 70), label, font=ImageFont.truetype(FONT_B, 26),
                    anchor="mm", fill=lbl_fill)
     native = PILHelper.to_native_touchscreen_format(deck, img)
+    # Dedup like animate_active_keys does per-key: the touchscreen image is far
+    # bigger than a key icon, so pushing it unconditionally every 20fps tick
+    # (most of which are unchanged) keeps the USB HID pipe busy with redundant
+    # writes. That queues up ahead of the tick that actually carries the new
+    # session name after an auto-focus switch, which is why the key border
+    # snapped instantly but the name lagged behind it by up to one render tick
+    # (or worse under contention). Skipping unchanged frames clears the queue
+    # so the real change gets sent with nothing ahead of it.
+    global _touch_frame_cache
+    if native == _touch_frame_cache:
+        return
+    _touch_frame_cache = native
     deck.set_touchscreen_image(native, 0, 0, img.width, img.height)
 
 def repaint(deck):
