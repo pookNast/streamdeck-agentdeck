@@ -168,6 +168,8 @@ _cinema_mode = True
 _dismissed = {}            # session id -> monotonic dismiss timestamp
 _suggest_sticky = {}       # session id -> monotonic timestamp of last "suggest…" label
 _pruned = {}               # session id -> monotonic timestamp (suppress re-prune noise)
+_win_miss = {}             # session id -> consecutive confirmed-empty window polls
+_WIN_MISS_THRESHOLD = 2    # confirmed misses needed before a window-close prune fires
 DISMISS_TIMEOUT = 300.0    # safety max before a dismissed session auto-rearms
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
@@ -336,12 +338,27 @@ def _prune_dead(sessions):
             continue
         with _lock:
             konsole_pid = _win_map.get(sid)
-        if konsole_pid and not _windows_of_pid(konsole_pid):
-            dead_ids.add(sid)
-            with _lock:
-                _win_map.pop(sid, None)
-            _save_win_map()
-            log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
+        if not konsole_pid:
+            continue
+        wins = _windows_of_pid(konsole_pid)
+        if wins is None:
+            # Query failed (e.g. transient X BadWindow error) — unknown state,
+            # NOT evidence the window closed. Leave the miss counter as-is so a
+            # genuine close isn't masked by one flaky poll in the middle of it.
+            continue
+        if wins:
+            _win_miss.pop(sid, None)
+            continue
+        misses = _win_miss.get(sid, 0) + 1
+        _win_miss[sid] = misses
+        if misses < _WIN_MISS_THRESHOLD:
+            continue
+        dead_ids.add(sid)
+        _win_miss.pop(sid, None)
+        with _lock:
+            _win_map.pop(sid, None)
+        _save_win_map()
+        log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
     if not dead_ids:
         return sessions
     for sid in dead_ids:
@@ -631,14 +648,30 @@ def _xrun(args, timeout=5):
 def _konsole_windows():
     return set(_xrun(["xdotool", "search", "--class", "konsole"]).split())
 
+def _xrun_checked(args, timeout=5):
+    """Like _xrun but reports whether the query itself succeeded, distinct from
+    succeeding-with-no-output. Needed because xdotool can crash mid-query on a
+    transient X protocol error (e.g. BadWindow on a window torn down by the WM
+    while being enumerated) — that failure must not look identical to 'this
+    window genuinely doesn't exist'."""
+    try:
+        r = subprocess.run(args, env=_dbus_env(), capture_output=True, text=True, timeout=timeout)
+        return (True, r.stdout) if r.returncode == 0 else (False, "")
+    except Exception:
+        return (False, "")
+
 def _windows_of_pid(pid):
-    """Live konsole window id(s) belonging to konsole process `pid`. Empty if the
-    process is gone — so a closed window (or a reused X id) resolves to nothing."""
+    """Live konsole window id(s) belonging to konsole process `pid`. None if a
+    query failed (unknown — callers must not treat this as 'closed'). Empty
+    list only when both queries succeeded and genuinely found nothing."""
     if not pid:
         return []
-    res = _xrun(["xdotool", "search", "--pid", str(pid)]).split()
-    konsole = _konsole_windows()
-    return [w for w in res if w in konsole]
+    ok1, res = _xrun_checked(["xdotool", "search", "--pid", str(pid)])
+    ok2, kons = _xrun_checked(["xdotool", "search", "--class", "konsole"])
+    if not (ok1 and ok2):
+        return None
+    konsole = set(kons.split())
+    return [w for w in res.split() if w in konsole]
 
 def _window_visible(wid):
     return wid in _xrun(["xdotool", "search", "--onlyvisible", "--class", "konsole"]).split()
