@@ -30,6 +30,7 @@ import ghibli_scenes as ghibli
 AD = os.path.expanduser("~/.local/bin/agent-deck")
 NEW_SESSION_DIR = os.path.expanduser("~")
 _WIN_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/windows.json")
+_PANE_ORDER_PATH = os.path.expanduser("~/.cache/agentdeck/pane_order.json")
 FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_R = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 if not os.path.exists(FONT_R):
@@ -118,6 +119,13 @@ _pending_tool = None       # (label, command) chosen in the tool menu -> spawn n
 _pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
 _win_map = {}              # session id -> konsole process pid we opened for it
+# pid (str) -> [sid, ...] in the order each was placed into that konsole window —
+# dict key order is window-open order, list order is top-to-bottom (split) /
+# left-to-right (tab) placement order. We control all placement, so insertion
+# order IS visual order: tabs only ever append rightward, splits only ever
+# split-down. This drives the Stream Deck's session button ordering so it
+# mirrors what's actually on screen instead of a stale hand-maintained list.
+_pane_order = {}
 
 def _save_win_map():
     try:
@@ -136,6 +144,53 @@ def _load_win_map():
         pass
     except Exception as e:
         logging.warning("win_map load failed: %s", e)
+
+def _save_pane_order():
+    try:
+        os.makedirs(os.path.dirname(_PANE_ORDER_PATH), exist_ok=True)
+        with open(_PANE_ORDER_PATH, "w") as f:
+            json.dump(_pane_order, f)
+    except Exception as e:
+        logging.warning("pane_order save failed: %s", e)
+
+def _load_pane_order():
+    try:
+        with open(_PANE_ORDER_PATH) as f:
+            _pane_order.update(json.load(f))
+        logging.info("pane_order loaded: %d windows", len(_pane_order))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning("pane_order load failed: %s", e)
+
+def _record_pane(pid, sid):
+    """Note that session `sid` now lives in konsole window `pid`, at the end
+    of that window's placement order (i.e. visually last/bottom-most so far).
+    Moves `sid` out of any other window's list first, so a session that got
+    reopened elsewhere doesn't appear in two places."""
+    pid = str(pid)
+    with _lock:
+        for p, sids in list(_pane_order.items()):
+            if sid in sids and p != pid:
+                sids.remove(sid)
+                if not sids:
+                    del _pane_order[p]
+        lst = _pane_order.setdefault(pid, [])
+        if sid not in lst:
+            lst.append(sid)
+        _save_pane_order()
+
+def _forget_pane(sid):
+    with _lock:
+        changed = False
+        for p, sids in list(_pane_order.items()):
+            if sid in sids:
+                sids.remove(sid)
+                changed = True
+                if not sids:
+                    del _pane_order[p]
+        if changed:
+            _save_pane_order()
 _reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
 _manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
 MANUAL_GRACE = 2.0         # seconds the deck respects manual selection before resuming auto
@@ -274,13 +329,19 @@ def fetch_sessions():
     except Exception:
         return []
     data = data if isinstance(data, list) else data.get("items", data.get("sessions", []))
-    # Fixed layout matching the user's Konsole tab order. Unlisted sessions
-    # go to the end (sorted by creation time among themselves).
-    SESSION_ORDER = ["claude-glm", "glm-2", "claude-2", "claude-glm (2)",
-                     "claude", "local-2", "glm"]
-    order = {t: i for i, t in enumerate(SESSION_ORDER)}
-    data.sort(key=lambda s: (order.get(s.get("title", ""), len(SESSION_ORDER)),
-                             s.get("created_at", "")))
+    # Stream Deck button order mirrors actual on-screen Konsole layout:
+    # left-to-right = window-open order, and within a window, top-to-bottom
+    # (split) / left-to-right (tab) = placement order, both tracked live in
+    # _pane_order as we place each session (see _record_pane). Sessions with
+    # no recorded placement yet (e.g. just spawned, window not resolved)
+    # sort to the end by creation time.
+    with _lock:
+        win_index = {pid: i for i, pid in enumerate(_pane_order.keys())}
+        pane_rank = {sid: (win_index[pid], j)
+                     for pid, sids in _pane_order.items()
+                     for j, sid in enumerate(sids)}
+    unranked = (len(win_index), 0)
+    data.sort(key=lambda s: (pane_rank.get(s.get("id"), unranked), s.get("created_at", "")))
     return data
 
 def _prune_dead(sessions):
@@ -372,6 +433,7 @@ def _prune_dead(sessions):
         _needed_since.pop(sid, None)
         _dismissed.pop(sid, None)
         _suggest_sticky.pop(sid, None)
+        _forget_pane(sid)
     # Expire stale prune cache entries (session could be re-created with same id)
     for sid in list(_pruned):
         if sid not in {s["id"] for s in sessions} and now - _pruned[sid] > 60:
@@ -700,6 +762,7 @@ def _new_window(cmd, sid=None):
                 with _lock:
                     _win_map[sid] = pid
                     _save_win_map()
+                _record_pane(pid, sid)
                 log("opened+tracked konsole pid %s (win %s) for session %s",
                     pid, wid, sid[:8]); return
     log("opened new konsole window")
@@ -722,11 +785,16 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
         log("no konsole running for %s; opening new window", mode)
         _new_window(cmd, sid=sid); return
     if mode == "tab":
-        sid = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.newSession")
-        if sid:
-            _run_in_session(svc, sid, cmd); log("tab in %s session %s", svc, sid)
+        ksid = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.newSession")
+        if ksid:
+            _run_in_session(svc, ksid, cmd); log("tab in %s session %s", svc, ksid)
+            if sid:
+                pid = svc.rsplit("-", 1)[-1]
+                with _lock:
+                    _win_map[sid] = pid; _save_win_map()
+                _record_pane(pid, sid)
         else:
-            _new_window(cmd)
+            _new_window(cmd, sid=sid)
         return
     # split: fire the split action, then run cmd in the VISIBLE focused split pane.
     #
@@ -803,7 +871,13 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
         _close_session(svc, ksid); _new_window(cmd, sid=sid); return
     time.sleep(0.8)                              # hold gate: must still be bound 0.8s later
     if _bound() and ksid in _session_list(svc):
-        log("split %s in %s session %s (held on %s)", mode, svc, ksid, tmux or "tmux"); return
+        log("split %s in %s session %s (held on %s)", mode, svc, ksid, tmux or "tmux")
+        if sid:
+            pid = svc.rsplit("-", 1)[-1]
+            with _lock:
+                _win_map[sid] = pid; _save_win_map()
+            _record_pane(pid, sid)
+        return
     log("split didn't hold for %s; closing pane %s, opening window",
         tmux or (sid[:8] if sid else "session"), ksid)
     _close_session(svc, ksid); _new_window(cmd, sid=sid)
@@ -1558,6 +1632,7 @@ def main():
     plus.set_touchscreen_callback(on_touch)
 
     _load_win_map()
+    _load_pane_order()
     _sessions = fetch_sessions()
     _active_id = _sessions[0]["id"] if _sessions else None
     _activity = {s["id"]: session_activity(s) for s in _sessions[:plus.key_count()]}
