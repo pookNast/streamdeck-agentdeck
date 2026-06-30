@@ -659,31 +659,53 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
         else:
             _new_window(cmd)
         return
-    # split: create a new pane (a NEW konsole session) and run cmd in it.
-    # Poll for the genuinely-new session id (a fixed sleep raced the shell), and
-    # NEVER fall back to currentSession — that re-ran the attach in the existing
-    # (claude) pane, producing the mirrored-session bug (fixed in 02a7cc9).
+    # split: fire the split action, then run cmd in the VISIBLE focused split pane.
     #
-    # 02a7cc9's verify checked the GLOBAL tmux client count, which false-positives:
-    # Konsole split-view can spawn a pane that binds a client for an instant then
-    # dies (or mirrors session 1) — the global total had already risen, so it
-    # logged "(attached)" while the user saw session 1 mirrored. Now we require a
-    # NEW client on THIS session's tmux that HOLDS ~0.8s with the pane still alive;
-    # anything else closes the orphan pane and opens a clean window. No silent mirror.
+    # History of bugs in this path:
+    #  - 02a7cc9: fixed "never fall back to currentSession" (mirror via fallback)
+    #  - 565ed88: added session-list detection + per-session tmux verify
+    #  - THIS FIX: 565ed88 was still mirroring because `sessionList` returns a
+    #    background D-Bus session (session 2) that Konsole creates as a ghost entry,
+    #    NOT the visible split pane. The visible pane keeps showing session 1 (claude).
+    #    Root cause: `split-view-top-bottom` puts the new pane in focus (currentSession
+    #    changes) but the session that receives `runCommand` was the ghost session,
+    #    not the focused one. Fix: use currentSession() AFTER split to target the
+    #    focused visible pane. Ignore sessionList ghosts.
     action = "split-view-left-right" if mode == "split-right" else "split-view-top-bottom"
     before = set(_session_list(svc))
+    before_current = _qdbus(svc, "/Windows/1",
+                            "org.kde.konsole.Window.currentSession").strip()
     c0 = _clients_on(tmux)                       # per-session clients before split
     g0 = _tmux_client_count()                    # global fallback when tmux name unknown
     _qdbus(svc, "/konsole/MainWindow_1", "org.kde.KMainWindow.activateAction", action)
+
+    # Wait for currentSession() to change — that signals the split pane got focus.
+    # Only accept a session that is genuinely NEW (not already in `before`).
+    # sessionList ghosts (background D-Bus sessions the visible pane never shows)
+    # are excluded because the split action only focuses VISIBLE panes.
     ksid = None
-    for _ in range(20):                          # up to ~2s for the new session to appear
+    for _ in range(25):                          # up to ~2.5s
         time.sleep(0.1)
+        after_current = _qdbus(svc, "/Windows/1",
+                               "org.kde.konsole.Window.currentSession").strip()
+        if after_current and after_current != before_current and after_current not in before:
+            ksid = after_current
+            log("split: focused pane is session %s (currentSession changed)", ksid)
+            break
+
+    if not ksid:
+        # currentSession didn't move to a new session.  Two sub-cases:
+        # (a) split created no new session at all (duplicate view) — open window
+        # (b) Konsole version keeps focus on original pane after split — try sessionList
         fresh = set(_session_list(svc)) - before
         if fresh:
-            ksid = sorted(fresh)[0]; break
-    if not ksid:
-        log("split spawned no new session; opening window"); _new_window(cmd, sid=sid); return
-    time.sleep(0.3)                              # let the new pane's shell settle before runCommand
+            ksid = sorted(fresh)[0]
+            log("split: currentSession unchanged; using sessionList session %s", ksid)
+        else:
+            log("split spawned no new session; opening window")
+            _new_window(cmd, sid=sid); return
+
+    time.sleep(0.3)                              # let the new pane's shell settle
     _run_in_session(svc, ksid, cmd)
 
     def _bound():
@@ -701,7 +723,8 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
     time.sleep(0.8)                              # hold gate: must still be bound 0.8s later
     if _bound() and ksid in _session_list(svc):
         log("split %s in %s session %s (held on %s)", mode, svc, ksid, tmux or "tmux"); return
-    log("split didn't hold for %s; closing pane %s, opening window", tmux or (sid[:8] if sid else "session"), ksid)
+    log("split didn't hold for %s; closing pane %s, opening window",
+        tmux or (sid[:8] if sid else "session"), ksid)
     _close_session(svc, ksid); _new_window(cmd, sid=sid)
 
 # ---- actions --------------------------------------------------------------
