@@ -411,17 +411,21 @@ def session_activity(sess):
     # which would otherwise fall through to "thinking" and hide the prompt from
     # the board entirely (the cause of "Next" not registering on claude-2).
     # Order matters: menu → completion → bare prompt.
-    if CHOICE_RE.search(footer):
-        # Numbered permission menu ("Do you want to proceed? ❯ 1. Yes"). Find
-        # which option the ❯ cursor highlights. Zone 2 is now "Next" (dismiss),
-        # not option "3", so only options 1-2 map to blinking zones 0-1.
-        rec = None
-        matches = list(RECO_RE.finditer(footer))
-        if matches:
-            n = int(matches[-1].group(1))
-            if 1 <= n <= 2:
-                rec = n - 1
-        return ("choose…", True, rec)
+    # Numbered permission menu ("Do you want to proceed? ❯ 1. Yes"). Claude Code
+    # renders a multi-line task-list widget BELOW the menu, which pushes the ❯
+    # cursor outside the 10-line footer — so glm-2 (which shows its todo list)
+    # was never recognized as needing input. Scan the FULL pane for the LAST menu
+    # cursor (RECO_RE = "❯ N."), not just the footer. Stale (already-answered)
+    # menus are suppressed: if a completion marker (DONE_RE) or a newer prompt
+    # (PROMPT_RE) appears below the cursor, the agent already moved on. Only the
+    # task-widget / help chrome sits below a LIVE menu, and those match neither.
+    menu_hits = list(RECO_RE.finditer(pane))
+    if menu_hits:
+        below = pane[menu_hits[-1].end():]
+        if not (DONE_RE.search(below) or PROMPT_RE.search(below)):
+            n = int(menu_hits[-1].group(1))
+            rec = (n - 1) if 1 <= n <= 2 else None
+            return ("choose…", True, rec)
     # Find the LAST ❯ in the footer — only the live prompt matters. Scrollback
     # ❯ lines (old commands like "❯ /clear", previous turns) sit ABOVE the live
     # prompt and would false-trigger on .search() (first match). Also require
@@ -507,6 +511,23 @@ def _focused_konsole():
         pass
     return None
 
+def _any_konsole():
+    """A konsole service to reuse when none is focused. Prefers the service of a
+    VISIBLE konsole window, else the first registered service. Returns None only
+    when no konsole is running at all. Used as the split/tab fallback so a press
+    while focus is elsewhere lands inside an existing window instead of spawning
+    a new one."""
+    svcs = _konsole_services()
+    if not svcs:
+        return None
+    if shutil.which("xdotool"):
+        for w in _xrun(["xdotool", "search", "--onlyvisible", "--class", "konsole"]).split():
+            pid = _xrun(["xdotool", "getwindowpid", w]).strip()
+            svc = "org.kde.konsole-%s" % pid
+            if svc in svcs:
+                return svc
+    return svcs[0]
+
 def _session_list(svc):
     return [x for x in _qdbus(svc, "/Windows/1",
                               "org.kde.konsole.Window.sessionList").split() if x.strip()]
@@ -566,9 +587,9 @@ def place_konsole(cmd, mode, sid=None):
         log("no DISPLAY; cannot open terminal"); return
     if mode == "window":
         _new_window(cmd, sid=sid); return
-    svc = _focused_konsole()
+    svc = _focused_konsole() or _any_konsole()
     if not svc:
-        log("no focused konsole for %s; opening new window", mode)
+        log("no konsole running for %s; opening new window", mode)
         _new_window(cmd, sid=sid); return
     if mode == "tab":
         sid = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.newSession")
