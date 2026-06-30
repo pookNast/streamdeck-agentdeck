@@ -1062,6 +1062,7 @@ def _advance_focus(exclude_sid=None):
     reintroduce the equal-priority jitter the periodic loop avoids.
     ponytail: reads cached _activity/_urgency under _lock — upgrade: trigger a
     fresh scrape too if a brand-new need must be caught faster than REFRESH_SECS."""
+    global _active_id
     with _lock:
         needy = [sid for sid, (_lbl, need, _rec) in _activity.items()
                  if need and sid != exclude_sid]
