@@ -772,6 +772,18 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
             _new_window(cmd, sid=sid); return
 
     time.sleep(0.3)                              # let the new pane's shell settle
+    # Re-verify focus is STILL on ksid right before injecting. currentSession()
+    # was read up to ~0.3s ago; if real input focus regressed back to the
+    # original pane in that window (observed: command text landing in the
+    # OLD session's prompt instead of the new one), runCommand would inject
+    # into whatever Konsole actually considers focused now, not the stale
+    # ksid we captured earlier. Abort to a safe fresh window rather than risk
+    # typing the attach command into someone else's live session.
+    refocus = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.currentSession").strip()
+    if refocus != ksid:
+        log("split: focus drifted from %s to %s before inject; closing pane, opening window",
+            ksid, refocus or "?")
+        _close_session(svc, ksid); _new_window(cmd, sid=sid); return
     _run_in_session(svc, ksid, cmd)
 
     def _bound():
