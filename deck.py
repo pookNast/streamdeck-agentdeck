@@ -678,13 +678,16 @@ def _window_visible(wid):
 
 def _new_window(cmd, sid=None):
     env = _dbus_env()
+    # stderr inherited (not DEVNULL): Konsole/Qt D-Bus warnings need to land in
+    # `journalctl -u streamdeck-agentdeck` instead of vanishing, so the next
+    # on-screen warning is diagnosable without a human transcribing a popup.
     if not shutil.which("konsole"):
         subprocess.Popen(["xterm", "-e", "bash", "-lc", "%s; exec bash" % cmd], env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL)
         log("opened new xterm window"); return
     before = _konsole_windows()
     subprocess.Popen(["konsole", "-e", "bash", "-lc", "%s; exec bash" % cmd], env=env,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     stdout=subprocess.DEVNULL)
     # track the konsole PROCESS pid (not the reusable X window id) so a later tap
     # can re-resolve the window — survives X id reuse, detects a real close.
     if sid and shutil.which("xdotool"):
