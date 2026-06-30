@@ -535,6 +535,14 @@ def _session_list(svc):
 def _run_in_session(svc, sid, cmd):
     _qdbus(svc, "/Sessions/%s" % sid, "org.kde.konsole.Session.runCommand", cmd)
 
+def _tmux_client_count():
+    """Total attached tmux clients across all sessions. Used to confirm a split
+    pane's `agent-deck session attach` actually bound a terminal."""
+    # ponytail: global count, not per-session — fine for sequential interactive
+    # placement; upgrade: match the specific tmux_session if concurrent splits race
+    r = _run(["tmux", "list-clients"], timeout=4)
+    return len(r.stdout.splitlines()) if (r and r.returncode == 0) else 0
+
 def _xrun(args, timeout=5):
     try:
         return subprocess.check_output(args, env=_dbus_env(), text=True, timeout=timeout)
@@ -598,17 +606,30 @@ def place_konsole(cmd, mode, sid=None):
         else:
             _new_window(cmd)
         return
-    # split: create a new pane (new session) and run cmd in it
+    # split: create a new pane (a NEW konsole session) and run cmd in it.
+    # Poll for the genuinely-new session id (a fixed sleep raced the shell), and
+    # NEVER fall back to currentSession — that re-ran the attach in the existing
+    # (claude) pane, which is exactly what produced the mirrored-session bug.
+    # Verify a tmux client actually attached; if it doesn't hold, open a window.
     action = "split-view-left-right" if mode == "split-right" else "split-view-top-bottom"
     before = set(_session_list(svc))
+    clients0 = _tmux_client_count()
     _qdbus(svc, "/konsole/MainWindow_1", "org.kde.KMainWindow.activateAction", action)
-    time.sleep(0.4)
-    new = list(set(_session_list(svc)) - before)
-    sid = new[0] if new else _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.currentSession")
-    if sid:
-        _run_in_session(svc, sid, cmd); log("split %s in %s session %s", mode, svc, sid)
-    else:
-        _new_window(cmd)
+    ksid = None
+    for _ in range(20):                          # up to ~2s for the new session to appear
+        time.sleep(0.1)
+        fresh = set(_session_list(svc)) - before
+        if fresh:
+            ksid = sorted(fresh)[0]; break
+    if not ksid:
+        log("split spawned no new session; opening window"); _new_window(cmd, sid=sid); return
+    time.sleep(0.3)                              # let the new pane's shell settle before runCommand
+    _run_in_session(svc, ksid, cmd)
+    for _ in range(15):                          # confirm the attach bound a client (~1.5s)
+        time.sleep(0.1)
+        if _tmux_client_count() > clients0:
+            log("split %s in %s session %s (attached)", mode, svc, ksid); return
+    log("split attach didn't hold (session %s); opening window", ksid); _new_window(cmd, sid=sid)
 
 # ---- actions --------------------------------------------------------------
 def _bg(fn, *a):

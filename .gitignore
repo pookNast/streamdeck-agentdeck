@@ -4,3 +4,7 @@ secrets
 .config/
 __pycache__/
 *.pyc
+
+# runtime / local-session state
+logs/
+.claude/
