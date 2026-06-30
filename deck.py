@@ -327,6 +327,21 @@ def _prune_dead(sessions):
             dead_ids.add(sid)
             log("prune dead '%s' (SSH closed, pane now %s/%s)",
                 s.get("title"), cmd, pane_dead)
+    # Third signal: tracked Konsole window was closed (user closed the terminal).
+    # When the Konsole PID in _win_map has no X windows left, the terminal is gone.
+    # We stop+remove the session so it clears off the Stream Deck immediately.
+    for s in sessions:
+        sid = s["id"]
+        if sid in dead_ids or sid in _pruned:
+            continue
+        with _lock:
+            konsole_pid = _win_map.get(sid)
+        if konsole_pid and not _windows_of_pid(konsole_pid):
+            dead_ids.add(sid)
+            with _lock:
+                _win_map.pop(sid, None)
+            _save_win_map()
+            log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
     if not dead_ids:
         return sessions
     for sid in dead_ids:
@@ -534,6 +549,20 @@ def _focused_konsole():
         pass
     return None
 
+def _agentdeck_konsole():
+    """Return the Konsole D-Bus service that hosts tracked agent-deck sessions
+    (i.e. one of the PIDs in _win_map still has an X window open).
+    Preferred over _focused_konsole() for splits so we land in the right window
+    even when the user has their own terminals in focus."""
+    with _lock:
+        pids = list(_win_map.values())
+    svcs = set(_konsole_services())
+    for pid in pids:
+        svc = "org.kde.konsole-%s" % pid
+        if svc in svcs and _windows_of_pid(pid):
+            return svc
+    return None
+
 def _any_konsole():
     """A konsole service to reuse when none is focused. Prefers the service of a
     VISIBLE konsole window, else the first registered service. Returns None only
@@ -648,7 +677,11 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
         log("no DISPLAY; cannot open terminal"); return
     if mode == "window":
         _new_window(cmd, sid=sid); return
-    svc = _focused_konsole() or _any_konsole()
+    # For splits/tabs, prefer the Konsole that's already hosting agent-deck
+    # sessions (tracked in _win_map) over whatever happens to be focused.
+    # _focused_konsole() grabs the user's own terminal when it has focus,
+    # causing splits to land in the wrong window.
+    svc = _agentdeck_konsole() or _focused_konsole() or _any_konsole()
     if not svc:
         log("no konsole running for %s; opening new window", mode)
         _new_window(cmd, sid=sid); return
