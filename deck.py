@@ -929,16 +929,22 @@ def dismiss_session(sess):
     _needed_since.pop(sid, None)
     log("dismissed input gate for %s", sess.get("title"))
 
-def act_reply(slot):
+def act_reply(slot, reply_set=None):
+    """reply_set overrides which REPLY_SETS entry to use — the bottom-row keys
+    are pinned to 0 ("select"/"1 2 Next Go") regardless of what's currently
+    cycling on the touchscreen; touch/dial callers omit it and get whatever
+    the touchscreen is showing (the global _reply_set)."""
+    if reply_set is None:
+        reply_set = _reply_set
     s = active_session()
     if not s:
         log("reply: no active session"); return
     # Zone 2 is always "Next" on the select set: dismiss the active session's
     # input gate (stop blinking, yield focus) WITHOUT sending keys to the agent.
     # Applies to numbered menus AND auto-suggest prompts — "read it, move on".
-    if slot == 2 and _reply_set == 0:
+    if slot == 2 and reply_set == 0:
         dismiss_session(s); _advance_focus(s["id"]); return
-    label, keys = REPLY_SETS[_reply_set][1][slot]
+    label, keys = REPLY_SETS[reply_set][1][slot]
     if not keys:
         return                                  # blank slot
     if keys[0] == "!voice":                     # voice dictation toggle
@@ -1228,14 +1234,15 @@ def _anim_sweep_rects(draw, phase, color, base, rect):
                        fill=_lerp_color(base, color, alpha))
 
 def _render_reply_key(deck, zone, rec_zone):
-    """Non-cinema bottom-row key mirroring touchscreen reply zone `zone`
-    (0-3) — flat dark tile + label, Golden Meadow pulse when it's the
-    recommended zone. Cinema mode has its own variant, _render_reply_tile,
-    that overlays the same content on the Ghibli scene instead of a flat
-    background."""
-    _, zones = REPLY_SETS[_reply_set]
+    """Non-cinema bottom-row key mirroring reply zone `zone` (0-3) — flat dark
+    tile + label, Golden Meadow pulse when it's the recommended zone. Pinned
+    to REPLY_SETS[0] ("select"/"1 2 Next Go") regardless of what's cycling on
+    the touchscreen — the physical keys always answer menus. Cinema mode has
+    its own variant, _render_reply_tile, that overlays the same content on
+    the Ghibli scene instead of a flat background."""
+    _, zones = REPLY_SETS[0]
     label = zones[zone][0]
-    if _reply_set == 0 and zone == 2:
+    if zone == 2:
         label = "Next"
     img = _key_img(deck, MENU_COLOR)
     d = ImageDraw.Draw(img)
@@ -1404,14 +1411,14 @@ def _sync_page_to_active():
         _page = ids.index(_active_id) // PAGE_SIZE
 
 def _render_reply_tile(tile, zone, rec_zone):
-    """Bottom-row key mirroring touchscreen reply zone `zone` (0-3) — same
-    Ghibli scene tile as background, label + recommended-zone highlight
-    overlaid, so '1 2 Next Go' is available on the keys as well as the
-    touchscreen strip without losing the cinema look."""
-    _, zones = REPLY_SETS[_reply_set]
+    """Bottom-row key for reply zone `zone` (0-3) — same Ghibli scene tile as
+    background, label + recommended-zone highlight overlaid. Pinned to
+    REPLY_SETS[0] ("select"/"1 2 Next Go") regardless of what's cycling on
+    the touchscreen, so the physical keys always answer menus."""
+    _, zones = REPLY_SETS[0]
     label = zones[zone][0]
-    if _reply_set == 0 and zone == 2:
-        label = "Next"                      # matches the touchscreen's override
+    if zone == 2:
+        label = "Next"
     if zone == rec_zone:
         pulse = _ease_sine(_anim_phase / 1.6)
         wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
@@ -1438,8 +1445,10 @@ def _animate_cinema(deck):
         sess = list(_sessions[_page * PAGE_SIZE:(_page + 1) * PAGE_SIZE])
         active = _active_id
     s_act = active_session()
-    rec_zone = (_activity.get(active, (None, False, None))[2]
-                if _reply_set == 0 and s_act is not None else None)
+    # Not gated on _reply_set: the bottom-row keys always show the "select"
+    # set regardless of what the touchscreen is cycling through, so the
+    # recommended-zone highlight should always be eligible on the keys too.
+    rec_zone = _activity.get(active, (None, False, None))[2] if s_act is not None else None
     for i in range(deck.key_count()):
         tile = tiles[i].copy()                       # mutable per-key copy
         if i >= PAGE_SIZE:
@@ -1499,8 +1508,10 @@ def animate_active_keys(deck):
         sess = list(_sessions[_page * PAGE_SIZE:(_page + 1) * PAGE_SIZE])
         active = _active_id
     s_act = active_session()
-    rec_zone = (_activity.get(active, (None, False, None))[2]
-                if _reply_set == 0 and s_act is not None else None)
+    # Not gated on _reply_set: the bottom-row keys always show the "select"
+    # set regardless of what the touchscreen is cycling through, so the
+    # recommended-zone highlight should always be eligible on the keys too.
+    rec_zone = _activity.get(active, (None, False, None))[2] if s_act is not None else None
     for i in range(deck.key_count()):
         if i >= PAGE_SIZE:
             frame = _render_reply_key(deck, i - PAGE_SIZE, rec_zone)
@@ -1665,7 +1676,7 @@ def on_key(deck, key, pressed):
     # board mode. Top row (0-3) = paginated session picks; bottom row (4-7) =
     # always the 4 reply zones, mirroring the touchscreen strip.
     if key >= PAGE_SIZE:
-        _bg(act_reply, key - PAGE_SIZE); return
+        _bg(act_reply, key - PAGE_SIZE, reply_set=0); return
     with _lock:
         sess = list(_sessions[_page * PAGE_SIZE:(_page + 1) * PAGE_SIZE])
         active = _active_id
