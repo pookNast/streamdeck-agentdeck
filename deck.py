@@ -1763,7 +1763,15 @@ def main():
                 _sessions = new; _activity = act
                 if _active_id not in [s["id"] for s in new]:
                     _active_id = new[0]["id"] if new else None
-                if choice_id and _ui_mode == "board" and not manual:
+                # NOT gated on `manual`: manual is a single global 2s timer
+                # re-armed on every interaction anywhere on the board, so
+                # during active multi-session use (replies firing every few
+                # seconds) it never expires — that silently blocked this
+                # entire escalation, starving genuinely higher-priority needs
+                # (e.g. a live menu) indefinitely. The strict `choice_rank <
+                # cur_rank` inequality below is already the anti-jitter guard
+                # the comment describes; `manual` added nothing but the bug.
+                if choice_id and _ui_mode == "board":
                     cur_needs = act.get(_active_id, (None, False))[1]
                     cur_rank = URG_RANK.get(urg.get(_active_id), 99) if cur_needs else 99
                     choice_rank = URG_RANK.get(urg.get(choice_id), 99)
