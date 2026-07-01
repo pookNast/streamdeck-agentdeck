@@ -202,8 +202,6 @@ def _forget_pane(sid):
         if changed:
             _save_pane_order()
 _reply_set = 1             # index into REPLY_SETS (cycled by knob 2 scroll); default "keys" 2/3
-_manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
-MANUAL_GRACE = 2.0         # seconds the deck respects manual selection before resuming auto
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
 _urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
@@ -1073,9 +1071,9 @@ def select_delta(n):
 def _advance_focus(exclude_sid=None):
     """Snap the selector to the top-priority needy session NOW, excluding the one
     just replied/dismissed so focus advances to the NEXT in the queue without
-    waiting for the 2s poll (which is also blocked by MANUAL_GRACE during active
-    use). Event-driven — only called on an explicit reply/dismiss — so it can't
-    reintroduce the equal-priority jitter the periodic loop avoids.
+    waiting for the 2s poll. Event-driven — only called on an explicit
+    reply/dismiss — so it can't reintroduce the equal-priority jitter the
+    periodic loop avoids.
     ponytail: reads cached _activity/_urgency under _lock — upgrade: trigger a
     fresh scrape too if a brand-new need must be caught faster than REFRESH_SECS."""
     global _active_id
@@ -1639,9 +1637,8 @@ def repaint(deck):
 def _wake_and_note(deck):
     """Record input time; if the display is asleep, wake it and report True so the
     caller consumes this event (the waking press/turn just wakes, no action)."""
-    global _last_input, _asleep, _manual_until
+    global _last_input, _asleep
     _last_input = time.monotonic()
-    _manual_until = time.monotonic() + MANUAL_GRACE  # any interaction → hold session/reply-set
     if _asleep:
         _asleep = False
         deck.set_brightness(_brightness)
@@ -1710,7 +1707,7 @@ def on_key(deck, key, pressed):
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
-    global _brightness, _reply_set, _manual_until, _page
+    global _brightness, _reply_set, _page
     if event == DialEventType.TURN:
         if _ui_mode != "board":
             return
@@ -1748,7 +1745,7 @@ def on_touch(deck, evt, value):
 # ---- main -----------------------------------------------------------------
 def main():
     global _sessions, _active_id, _activity, _anim_phase, _last_input, _asleep
-    global _reply_set, _manual_until, _needed_since, _urgency
+    global _reply_set, _needed_since, _urgency
     # Retry HID enumeration+open with backoff (device may not be ready at boot).
     # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
     # settled the HID node yet; this keeps the process alive instead.
@@ -1873,10 +1870,13 @@ def main():
                 key=lambda sid: URG_RANK.get(urg.get(sid), 99),
             )
             choice_id = focus_order[0] if focus_order else None
-            manual = now < _manual_until
-            if choice_id and _reply_set != 0 and not manual:
-                _reply_set = 0                        # auto-switch to arrow-nav set
-                log("reply set -> select (choice needed)")
+            # NOT auto-switching the touchscreen to "select" here anymore: the
+            # bottom-row keys are permanently pinned to the select set (see
+            # act_reply's reply_set override), so menus are always answerable
+            # regardless of what the touchscreen shows. Auto-switching used to
+            # yank the touchscreen back to "select" on almost every poll (this
+            # board fields menu prompts constantly), which looked like it was
+            # mirroring the bottom row instead of staying on its own default.
             with _lock:
                 _sessions = new; _activity = act
                 if _active_id not in [s["id"] for s in new]:
