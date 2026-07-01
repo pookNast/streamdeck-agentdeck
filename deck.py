@@ -201,7 +201,7 @@ def _forget_pane(sid):
                     del _pane_order[p]
         if changed:
             _save_pane_order()
-_reply_set = 0             # index into REPLY_SETS (cycled by knob 2 scroll)
+_reply_set = 1             # index into REPLY_SETS (cycled by knob 2 scroll); default "keys" 2/3
 _manual_until = 0.0        # monotonic deadline; suppress auto-switch/select after user input
 MANUAL_GRACE = 2.0         # seconds the deck respects manual selection before resuming auto
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
