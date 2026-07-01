@@ -19,7 +19,7 @@ Config = the TOOLS / PLACEMENTS / REPLY_ZONES lists below. ponytail: state in
 module globals + a lock, no config file — upgrade: external file only if these
 must change without a restart.
 """
-import os, re, sys, json, time, math, signal, shutil, subprocess, threading, logging
+import os, re, sys, json, time, math, signal, shutil, subprocess, threading, logging, traceback
 
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.ImageHelpers import PILHelper
@@ -894,8 +894,8 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
     _close_session(svc, ksid); _new_window(cmd, sid=sid)
 
 # ---- actions --------------------------------------------------------------
-def _bg(fn, *a):
-    threading.Thread(target=fn, args=a, daemon=True).start()
+def _bg(fn, *a, **kw):
+    threading.Thread(target=fn, args=a, kwargs=kw, daemon=True).start()
 
 def active_session():
     with _lock:
@@ -1649,6 +1649,21 @@ def _wake_and_note(deck):
         return True
     return False
 
+def _safe_callback(fn):
+    """The StreamDeck library's internal read thread has no exception guard
+    around key/dial/touch callbacks — an uncaught exception silently kills
+    that thread forever. systemd still sees the (now input-dead) main process
+    as healthy, so nothing restarts it. One bad callback = total, invisible
+    input failure until someone notices and manually restarts. Log and
+    swallow instead of letting that thread die."""
+    def wrapped(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            log("! %s callback crashed:\n%s", fn.__name__, traceback.format_exc())
+    return wrapped
+
+@_safe_callback
 def on_key(deck, key, pressed):
     if not pressed:
         return
@@ -1691,6 +1706,7 @@ def on_key(deck, key, pressed):
     else:
         open_menu("tool"); repaint(deck)
 
+@_safe_callback
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
@@ -1719,6 +1735,7 @@ def on_dial(deck, dial, event, value):
         # always matches its "Next" label — upgrade: long-press dial 2 if needed.
         _bg(act_reply, dial)
 
+@_safe_callback
 def on_touch(deck, evt, value):
     if _wake_and_note(deck):
         return
