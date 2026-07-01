@@ -113,6 +113,16 @@ log = logging.getLogger("deck").info
 _lock = threading.Lock()
 _sessions = []
 _active_id = None
+# Top row (keys 0-3) shows a paginated 4-session window; bottom row (keys 4-7)
+# always mirrors the touchscreen's 4 reply zones (1/2/Next/Go). Knob 3 (dial 2)
+# turns pages. _page_synced_for is an edge-trigger: the page auto-jumps to
+# wherever _active_id lives the FIRST time it changes, then leaves the user
+# free to page away (e.g. to open a new session) without being fought back.
+PAGE_SIZE = 4
+MAX_PAGES = 3
+MAX_SESSIONS = PAGE_SIZE * MAX_PAGES   # 12
+_page = 0
+_page_synced_for = None
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
 _pending_tool = None       # (label, command) chosen in the tool menu -> spawn new
@@ -1217,6 +1227,26 @@ def _anim_sweep_rects(draw, phase, color, base, rect):
         draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh],
                        fill=_lerp_color(base, color, alpha))
 
+def _render_reply_key(deck, zone, rec_zone):
+    """Non-cinema bottom-row key mirroring touchscreen reply zone `zone`
+    (0-3) — flat dark tile + label, Golden Meadow pulse when it's the
+    recommended zone. Cinema mode has its own variant, _render_reply_tile,
+    that overlays the same content on the Ghibli scene instead of a flat
+    background."""
+    _, zones = REPLY_SETS[_reply_set]
+    label = zones[zone][0]
+    if _reply_set == 0 and zone == 2:
+        label = "Next"
+    img = _key_img(deck, MENU_COLOR)
+    d = ImageDraw.Draw(img)
+    if zone == rec_zone:
+        _anim_pulse(d, img, _anim_phase / 1.6, GHIBLI["meadow"], MENU_COLOR, amp=0.55)
+        text_fill = (25, 20, 10)
+    else:
+        text_fill = (205, 210, 220)
+    _render_text(d, img, label, text_fill=text_fill, size=28)
+    return PILHelper.to_native_key_format(deck, img)
+
 def _render_session(deck, s, is_active):
     st = s.get("status", "idle")
     label, needs, _rec = _activity.get(s["id"], (st, False, None))
@@ -1359,6 +1389,41 @@ def _overlay_status_dot(draw, img, status):
     c = dot_colors.get(status, (60, 65, 75))
     draw.rectangle([img.width - 8, 2, img.width - 2, 8], fill=c)
 
+def _sync_page_to_active():
+    """Jump the page to wherever _active_id currently lives, once per change.
+    Runs every render tick but is a no-op unless _active_id actually moved
+    since the last check, so a user who deliberately pages away (e.g. to open
+    a new session on another page) is never fought back to the active one."""
+    global _page, _page_synced_for
+    if _active_id == _page_synced_for:
+        return
+    _page_synced_for = _active_id
+    with _lock:
+        ids = [s["id"] for s in _sessions]
+    if _active_id in ids:
+        _page = ids.index(_active_id) // PAGE_SIZE
+
+def _render_reply_tile(tile, zone, rec_zone):
+    """Bottom-row key mirroring touchscreen reply zone `zone` (0-3) — same
+    Ghibli scene tile as background, label + recommended-zone highlight
+    overlaid, so '1 2 Next Go' is available on the keys as well as the
+    touchscreen strip without losing the cinema look."""
+    _, zones = REPLY_SETS[_reply_set]
+    label = zones[zone][0]
+    if _reply_set == 0 and zone == 2:
+        label = "Next"                      # matches the touchscreen's override
+    if zone == rec_zone:
+        pulse = _ease_sine(_anim_phase / 1.6)
+        wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
+        tile = Image.blend(tile, wash, 0.25 + pulse * 0.25)
+    d = ImageDraw.Draw(tile)
+    f = ImageFont.truetype(FONT_B, 26)
+    cx, cy = tile.width / 2, tile.height / 2
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        d.text((cx + dx, cy + dy), label, font=f, anchor="mm", fill=(0, 0, 0))
+    d.text((cx, cy), label, font=f, anchor="mm", fill=(255, 230, 180))
+    return tile
+
 def _animate_cinema(deck):
     """Cinema mode: render the full 8-key grid as one continuous 8-bit Ghibli
     battle scene. Keys needing input break through with an accent wash + pulsing
@@ -1368,10 +1433,21 @@ def _animate_cinema(deck):
     scene = ghibli.render_scene(_anim_phase)
     canvas = ghibli.scale_to_canvas(scene)
     tiles = ghibli.slice_tiles(canvas)
+    _sync_page_to_active()
     with _lock:
-        sess = list(_sessions[:deck.key_count()]); active = _active_id
+        sess = list(_sessions[_page * PAGE_SIZE:(_page + 1) * PAGE_SIZE])
+        active = _active_id
+    s_act = active_session()
+    rec_zone = (_activity.get(active, (None, False, None))[2]
+                if _reply_set == 0 and s_act is not None else None)
     for i in range(deck.key_count()):
         tile = tiles[i].copy()                       # mutable per-key copy
+        if i >= PAGE_SIZE:
+            # Bottom row: always the 4 reply zones (1/2/Next/Go), never
+            # sessions — mirrors the touchscreen strip on the physical keys.
+            tile = _render_reply_tile(tile, i - PAGE_SIZE, rec_zone)
+            deck.set_key_image(i, PILHelper.to_native_key_format(deck, tile))
+            continue
         d = ImageDraw.Draw(tile)
         if i < len(sess):
             s = sess[i]
@@ -1418,10 +1494,17 @@ def animate_active_keys(deck):
     if _cinema_mode and _ui_mode == "board":
         _animate_cinema(deck)
         return
+    _sync_page_to_active()
     with _lock:
-        sess = list(_sessions[:deck.key_count()]); active = _active_id
+        sess = list(_sessions[_page * PAGE_SIZE:(_page + 1) * PAGE_SIZE])
+        active = _active_id
+    s_act = active_session()
+    rec_zone = (_activity.get(active, (None, False, None))[2]
+                if _reply_set == 0 and s_act is not None else None)
     for i in range(deck.key_count()):
-        if i < len(sess):
+        if i >= PAGE_SIZE:
+            frame = _render_reply_key(deck, i - PAGE_SIZE, rec_zone)
+        elif i < len(sess):
             frame = _render_session(deck, sess[i], sess[i]["id"] == active)
         else:
             frame = _centered(deck, EMPTY_COLOR, "+", size=40, sub="new")
@@ -1477,7 +1560,8 @@ def render_touchscreen(deck):
                 d.text((16 + dx, 6 + dy), head, font=ImageFont.truetype(FONT_B, 24), fill=(0, 0, 0))
         d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=txt_c)
         setname, zones = REPLY_SETS[_reply_set]
-        setinfo = "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS))
+        setinfo = "%s %d/%d · pg %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS),
+                                            _page + 1, MAX_PAGES)
         if _cinema_mode:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 d.text((img.width - 12 + dx, 8 + dy), setinfo,
@@ -1578,9 +1662,13 @@ def on_key(deck, key, pressed):
             else:
                 close_menu()
         repaint(deck); return
-    # board mode
+    # board mode. Top row (0-3) = paginated session picks; bottom row (4-7) =
+    # always the 4 reply zones, mirroring the touchscreen strip.
+    if key >= PAGE_SIZE:
+        _bg(act_reply, key - PAGE_SIZE); return
     with _lock:
-        sess = list(_sessions[:deck.key_count()]); active = _active_id
+        sess = list(_sessions[_page * PAGE_SIZE:(_page + 1) * PAGE_SIZE])
+        active = _active_id
     if key < len(sess):
         s = sess[key]
         if s["id"] == active:
@@ -1595,7 +1683,7 @@ def on_key(deck, key, pressed):
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
-    global _brightness, _reply_set, _manual_until
+    global _brightness, _reply_set, _manual_until, _page
     if event == DialEventType.TURN:
         if _ui_mode != "board":
             return
@@ -1607,10 +1695,12 @@ def on_dial(deck, dial, event, value):
         elif dial == 1:                                 # knob 2: cycle reply set
             _reply_set = (_reply_set + (1 if value > 0 else -1)) % len(REPLY_SETS)
             log("reply set -> %d (manual)", _reply_set)
+        elif dial == 2:                                 # knob 3: page the top row
+            _page = (_page + (1 if value > 0 else -1)) % MAX_PAGES
+            log("page -> %d/%d (manual)", _page + 1, MAX_PAGES)
         elif dial == 3:                                 # knob 4: brightness
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
-        # dial 2 (knob 3) scroll: reserved for now
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
         # Knob N push = reply slot N. Knob 3 (dial 2) is "Next" on the select
         # set (dismiss the gate); on other reply sets it sends that slot's keys.
@@ -1661,7 +1751,7 @@ def main():
     _load_pane_order()
     _sessions = fetch_sessions()
     _active_id = _sessions[0]["id"] if _sessions else None
-    _activity = {s["id"]: session_activity(s) for s in _sessions[:plus.key_count()]}
+    _activity = {s["id"]: session_activity(s) for s in _sessions[:MAX_SESSIONS]}
     _last_input = time.monotonic()
     repaint(plus)
     log("session board ready: %d sessions, tools=%s", len(_sessions),
@@ -1697,7 +1787,7 @@ def main():
         do_refresh = (tick % per_refresh == 0)
         if do_refresh:
             new = _prune_dead(fetch_sessions())
-            act = {s["id"]: session_activity(s) for s in new[:plus.key_count()]}
+            act = {s["id"]: session_activity(s) for s in new[:MAX_SESSIONS]}
             maybe_remediate(new)                    # auto-restart errored sessions
             now = time.monotonic()
             # Apply "Next" dismissals: a session dismissed via the "Next" zone
