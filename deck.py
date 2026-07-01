@@ -1220,7 +1220,10 @@ def _anim_sweep_rects(draw, phase, color, base, rect):
 def _render_session(deck, s, is_active):
     st = s.get("status", "idle")
     label, needs, _rec = _activity.get(s["id"], (st, False, None))
-    title, sub = s.get("title", "?"), str(label)[:13]
+    # 13 chars used to clip "Wrangling 1m 20s" down to "Wrangling 1m" —
+    # dropping the seconds made the live elapsed time look frozen for up to
+    # a minute at a time. 18 comfortably fits spinner-word + "Xm Ys".
+    title, sub = s.get("title", "?"), str(label)[:18]
     base = STATE_COLOR.get(st, (50, 50, 58))
     urg = _urgency.get(s["id"], "menu") if needs else None
     # Period scaling: each renderer takes phase in "cycles", so dividing
@@ -1283,26 +1286,25 @@ def paint_board(deck):
     _touch_frame_cache = None
     animate_active_keys(deck)
 
-def _overlay_title(draw, img, title, thinking=False):
-    """Small session title in the bottom-left corner with a dark drop-shadow on
+def _overlay_title(draw, img, title):
+    """Session title pinned to the top-left corner with a dark drop-shadow on
     all four sides so it reads against any scene background without a backing
-    rectangle (classic pixel-art text technique — no alpha needed for JPEG).
-    When `thinking=True` the title is shifted up one row to leave room for the
-    real-time activity spinner below it (see _overlay_activity)."""
+    rectangle (classic pixel-art text technique — no alpha needed for JPEG)."""
     f = ImageFont.truetype(FONT_B, 13)
     txt = title[:11]
-    y = img.height - 34 if thinking else img.height - 18
+    y = 4
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         draw.text((4 + dx, y + dy), txt, font=f, fill=(0, 0, 0))
     draw.text((4, y), txt, font=f, fill=(255, 230, 180))
 
-def _overlay_activity(draw, img, phase):
-    """Real-time CLI activity indicator below the session title — a mini
+def _overlay_activity(draw, img, phase, label=None):
+    """Real-time CLI activity row just below the top-left title: a mini
     Enchanted-Forest arc spinner (1.2s rotation, matching the per-key spinner
-    cadence). Drop-shadow pixels on four sides keep it legible over any scene
-    background. Drawn AFTER _overlay_title(thinking=True) so it sits beneath
-    the shifted title row."""
-    cx, cy = 12, img.height - 11
+    cadence) followed by the live activity label (e.g. 'Wrangling 1m 20s') so
+    the actual elapsed time/action is visible, not just a static spinner icon.
+    Drop-shadow pixels on four sides keep both legible over any scene
+    background."""
+    cx, cy = 12, 22
     r = 6
     color = GHIBLI["forest"]
     p = (phase / 1.2) % 1.0
@@ -1313,6 +1315,13 @@ def _overlay_activity(draw, img, phase):
         draw.arc([bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy],
                  start, end, fill=(0, 0, 0), width=2)
     draw.arc(bbox, start, end, fill=color, width=2)
+    if label and label != "thinking":
+        f = ImageFont.truetype(FONT_R, 11)
+        txt = label[:16]
+        tx, ty = cx + r + 4, cy - 7
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            draw.text((tx + dx, ty + dy), txt, font=f, fill=(0, 0, 0))
+        draw.text((tx, ty), txt, font=f, fill=(230, 235, 240))
 
 def _draw_selector(draw, img):
     """Active session selector — bright white corner brackets (viewfinder style).
@@ -1380,12 +1389,13 @@ def _animate_cinema(deck):
                 tile = Image.blend(tile, wash, pulse * 0.35)
                 d = ImageDraw.Draw(tile)
             # 2) Per-key overlays on top of (possibly washed) scene tile.
-            _overlay_title(d, tile, s.get("title", "?"), thinking=thinking)
+            _overlay_title(d, tile, s.get("title", "?"))
             _overlay_status_dot(d, tile, st)
             if thinking:
-                # Real-time CLI activity indicator under the session title —
-                # mini Enchanted-Forest arc spinner (1.2s rotation).
-                _overlay_activity(d, tile, _anim_phase)
+                # Real-time CLI activity row under the session title — mini
+                # Enchanted-Forest arc spinner (1.2s rotation) + live label
+                # (elapsed time / current action), not just the icon alone.
+                _overlay_activity(d, tile, _anim_phase, label=str(label))
             # 3) Needy accent border — breathes between darkened-accent and
             #    full accent ONLY (gold/pink). Never lerps toward white, so the
             #    white active-selector border below stays visually unique.
