@@ -737,6 +737,17 @@ def _windows_of_pid(pid):
     list only when both queries succeeded and genuinely found nothing."""
     if not pid:
         return []
+    # If the konsole PROCESS itself is dead, the window is definitively gone.
+    # xdotool exits 1 for BOTH "no matches" AND "query failed" (can't-open-
+    # display, transient BadWindow) — same exit code, opposite meaning. So a
+    # dead pid's `search --pid` looks identical to a flaky poll, returns None,
+    # and `_prune_dead` skips it forever ("if wins is None: continue") — the
+    # stale-session-on-deck bug. os.kill(0) is authoritative and needs no X
+    # round-trip, resolving the ambiguity for the common dead-process case.
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return []                            # process gone -> window gone
     ok1, res = _xrun_checked(["xdotool", "search", "--pid", str(pid)])
     ok2, kons = _xrun_checked(["xdotool", "search", "--class", "konsole"])
     if not (ok1 and ok2):
