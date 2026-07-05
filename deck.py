@@ -12,8 +12,8 @@ Spawning is a two-step on-key picker:
                    ->  session spawns in that placement, board returns.
 
   TOUCH (4 zones) -> send to ACTIVE session: [ 1 ] [ 2 ] [ 3 ] [ Esc ]
-  DIALS  D0 turn select | push reply-1 · D1 turn reply-set | push reply-2
-         D2 push focus terminal (manual typing) · D3 turn brightness | push Esc
+  DIALS  D0 turn select · D1 turn reply-set · D2 turn page · D3 turn brightness
+         push on any dial = that reply slot (D2 push = "Next" on the select set)
 
 Config = the TOOLS / PLACEMENTS / REPLY_ZONES lists below. ponytail: state in
 module globals + a lock, no config file — upgrade: external file only if these
@@ -28,6 +28,11 @@ from PIL import Image, ImageDraw, ImageFont
 import ghibli_scenes as ghibli
 
 AD = os.path.expanduser("~/.local/bin/agent-deck")
+
+# Shared UI text colors (extracted from repeated per-call-site literals).
+TXT_DIM = (205, 210, 220)      # secondary / label text
+TXT_BRIGHT = (220, 225, 235)   # primary text
+TXT_BANNER = (255, 230, 180)   # banner / menu highlight text
 NEW_SESSION_DIR = os.path.expanduser("~")
 _WIN_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/windows.json")
 _PANE_ORDER_PATH = os.path.expanduser("~/.cache/agentdeck/pane_order.json")
@@ -229,6 +234,10 @@ _cinema_mode = True
 # ("· 1 shell · ← for agents") drifts every refresh, clearing the dismiss at
 # once. Sticky-suggest bridges agent-deck's running↔waiting flicker so the
 # "Next" label and a safe slot-2 press survive the noise.
+# ponytail: _dismissed/_suggest_sticky/_urgency/_needed_since/_auto_restart_at are
+# in-memory only (reset on service restart), unlike _win_map/_pane_order which
+# persist — acceptable: transient UI state; upgrade: persist like _win_map if
+# restart resets ever bite.
 _dismissed = {}            # session id -> monotonic dismiss timestamp
 _suggest_sticky = {}       # session id -> monotonic timestamp of last "suggest…" label
 _pruned = {}               # session id -> monotonic timestamp (suppress re-prune noise)
@@ -617,11 +626,7 @@ def _qdbus(*args, timeout=6):
         log("qdbus %s failed: %s", " ".join(args), e); return ""
 
 def _konsole_services():
-    try:
-        out = subprocess.check_output(["qdbus"], env=_dbus_env(), text=True, timeout=6)
-    except Exception:
-        return []
-    return re.findall(r"org\.kde\.konsole-\d+", out)
+    return re.findall(r"org\.kde\.konsole-\d+", _qdbus())
 
 def _focused_konsole():
     """D-Bus service of the konsole window the user is focused on, or None."""
@@ -703,18 +708,32 @@ def _clients_on(tmux):
     return out
 
 def _close_session(svc, ksid):
-    """Close a konsole session by sending `exit` to its shell. Konsole exposes no
-    D-Bus close method, so this is the clean way to tear down an orphan split pane
-    before falling back to a fresh window (so it can't linger as a mirror)."""
-    # ponytail: sendText exit — no D-Bus closeSession exists; upgrade: none
-    if ksid:
-        _qdbus(svc, "/Sessions/%s" % ksid, "org.kde.konsole.Session.sendText", "exit\n")
+    """Tear down an orphan split pane. Konsole exposes no D-Bus close method.
+    Sending bare `exit` only works when the pane's SHELL is foreground — if a
+    lingering `agent-deck session attach` holds the pane, the text is typed
+    INTO the live agent instead (observed 2026-07-04: mirror pane survived,
+    `exit` landed inside the mirrored session). So: SIGTERM whatever is
+    foreground until the shell is, then `exit`, then verify the session left."""
+    if not ksid:
+        return
+    path = "/Sessions/%s" % ksid
+    shell_pid = _qdbus(svc, path, "org.kde.konsole.Session.processId").strip()
+    for _ in range(10):
+        fg = _qdbus(svc, path, "org.kde.konsole.Session.foregroundProcessId").strip()
+        if not fg or fg in ("0", shell_pid):
+            break
+        try:
+            os.kill(int(fg), signal.SIGTERM)
+        except (OSError, ValueError):
+            break
+        time.sleep(0.2)
+    _qdbus(svc, path, "org.kde.konsole.Session.sendText", "exit\n")
+    time.sleep(0.3)
+    if ksid in _session_list(svc):
+        log("close_session: pane %s in %s did not close", ksid, svc)
 
 def _xrun(args, timeout=5):
-    try:
-        return subprocess.check_output(args, env=_dbus_env(), text=True, timeout=timeout)
-    except Exception:
-        return ""
+    return _xrun_checked(args, timeout)[1]
 
 def _konsole_windows():
     return set(_xrun(["xdotool", "search", "--class", "konsole"]).split())
@@ -773,6 +792,8 @@ def _new_window(cmd, sid=None):
     # track the konsole PROCESS pid (not the reusable X window id) so a later tap
     # can re-resolve the window — survives X id reuse, detects a real close.
     if sid and shutil.which("xdotool"):
+        # ponytail: 0.2s×20 poll to catch the new window id — upgrade: python-xlib
+        # substructure-notify events if polling ever misses slow-starting windows.
         for _ in range(20):
             time.sleep(0.2)
             new = _konsole_windows() - before
@@ -882,7 +903,7 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
             return bool(_clients_on(tmux) - c0)  # a NEW client on THIS session
         return _tmux_client_count() > g0         # fallback: any new client (less precise)
 
-    for _ in range(25):                          # up to ~2.5s for the client to bind
+    for _ in range(50):                          # up to ~5s — cold agent start / ssh hop can exceed 2.5s
         time.sleep(0.1)
         if _bound():
             break
@@ -969,40 +990,26 @@ def _attach_cmd(sid):
     # start-if-needed then attach: `start` revives a stopped/killed session (so a
     # session you stopped with dial-4 reopens cleanly); it errors harmlessly when
     # the session is already running, so we silence that and attach regardless.
-    return "%s session start %s >/dev/null 2>&1; %s session attach %s" % (AD, sid, AD, sid)
+    # flock one-shot guard: Konsole re-runs a window's original `-e` command for
+    # every NEW session created in that window (splits/tabs inherit it), which
+    # mirrored the original agent into fresh panes (observed 2026-07-04). The
+    # lock is held for the attach's lifetime, so an inherited re-run fails `-n`
+    # and degrades to a plain shell instead of a mirror.
+    if re.search(r"[^\w.-]", sid or ""):
+        # sid feeds a shell fragment + lock filename; agent-deck ids are hex-dash
+        # today — if that ever changes, skip the guard rather than break quoting.
+        log("attach: sid %r has unexpected chars; skipping flock guard", sid)
+        return "%s session start %s >/dev/null 2>&1; %s session attach %s" % (AD, sid, AD, sid)
+    lock = "$HOME/.cache/agentdeck/attach-%s.lock" % sid
+    return ("mkdir -p $HOME/.cache/agentdeck; flock -n %s -c "
+            "'%s session start %s >/dev/null 2>&1; %s session attach %s' "
+            "|| { echo \"[agentdeck] session %s already attached elsewhere "
+            "(lock held) - plain shell\"; exec bash; }"
+            % (lock, AD, sid, AD, sid, sid))
 
 def open_existing(s, mode):
     """(Re)open an existing session in the chosen placement (window/tab/split)."""
     place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"], tmux=s.get("tmux_session"))
-
-def focus_terminal(s):
-    """Raise the konsole window showing the active session for manual typing.
-    Never opens a duplicate: if the session's tmux already has a client (it's
-    visible somewhere), only raise the window — don't attach a new terminal."""
-    if not s:
-        return
-    sid = s["id"]; title = s.get("title", ""); t = s.get("tmux_session")
-    # Does this session already have a live terminal? (prevents mirror duplicates)
-    has_client = False
-    if t:
-        has_client = bool(_clients_on(t))
-    # Find an existing window: deck-tracked first, then title search
-    with _lock:
-        pid = _win_map.get(sid)
-    wins = _windows_of_pid(pid)
-    if not wins and title:
-        candidates = _xrun(["xdotool", "search", "--name", title]).split()
-        konsole = _konsole_windows()
-        wins = [w for w in candidates if w in konsole]
-    if wins:
-        _xrun(["wmctrl", "-i", "-a", wins[0]])
-        log("focus terminal for %s", title)
-    elif not has_client:
-        # truly no terminal — open one (attach-only, never restart)
-        place_konsole("%s session attach %s" % (AD, sid), "window", sid=sid)
-        log("open terminal for %s", title)
-    else:
-        log("session %s already visible (has client) — not opening a duplicate", title)
 
 def toggle_or_place(deck, s):
     """If this session's konsole window is alive: minimize it when visible,
@@ -1059,16 +1066,6 @@ def spawn(tool, mode):
         log("spawn parse error: %s", e); return
     if sid:
         place_konsole(_attach_cmd(sid), mode, sid=sid, tmux=tmux_name)
-
-def act_restart():
-    s = active_session()
-    if s:
-        log("restart %s", s.get("title")); _run([AD, "session", "restart", s["id"]])
-
-def act_stop():
-    s = active_session()
-    if s:
-        log("stop %s", s.get("title")); _run([AD, "session", "stop", s["id"]])
 
 def select_delta(n):
     global _active_id
@@ -1135,7 +1132,7 @@ def _key_img(deck, bg):
     ImageDraw.Draw(img).rectangle([0, 0, img.width, img.height], fill=bg)
     return img
 
-def _render_text(d, img, text, sub=None, text_fill=(205, 210, 220), size=20):
+def _render_text(d, img, text, sub=None, text_fill=TXT_DIM, size=20):
     """Lay out title + optional sub onto an existing image, vertically centered
     as a group. Auto-shrinks both fonts until they fit. Factored out of
     _centered so the animated-key path can overlay text on a dynamic background
@@ -1168,7 +1165,7 @@ def _render_text(d, img, text, sub=None, text_fill=(205, 210, 220), size=20):
         d.text((img.width / 2, y + gap), sub, font=sf, anchor="ma", fill=text_fill)
 
 def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
-              text_fill=(205, 210, 220)):
+              text_fill=TXT_DIM):
     img = _key_img(deck, bg)
     d = ImageDraw.Draw(img)
     _render_text(d, img, text, sub=sub, text_fill=text_fill, size=size)
@@ -1184,12 +1181,8 @@ def _ease_sine(t):
     """0..1 -> 0..1 smooth sine easing (slow at the extremes, fast in the middle)."""
     return (math.sin(2.0 * math.pi * (t % 1.0)) + 1.0) / 2.0
 
-def _lerp_color(a, b, t):
-    """Linear RGB blend. t in 0..1. No alpha; we composite onto a known base."""
-    t = max(0.0, min(1.0, t))
-    return (int(a[0] + (b[0] - a[0]) * t),
-            int(a[1] + (b[1] - a[1]) * t),
-            int(a[2] + (b[2] - a[2]) * t))
+# Linear RGB blend, t in 0..1 — canonical implementation lives in ghibli_scenes.
+_lerp_color = ghibli._lerp
 
 def _anim_pulse(draw, img, phase, color, base, amp=0.5):
     """Breathing background: bg eases between base and accent. amp is the peak
@@ -1259,7 +1252,7 @@ def _render_reply_key(deck, zone, rec_zone):
         _anim_pulse(d, img, _anim_phase / 1.6, GHIBLI["meadow"], MENU_COLOR, amp=0.55)
         text_fill = (25, 20, 10)
     else:
-        text_fill = (205, 210, 220)
+        text_fill = TXT_DIM
     _render_text(d, img, label, text_fill=text_fill, size=28)
     return PILHelper.to_native_key_format(deck, img)
 
@@ -1282,38 +1275,38 @@ def _render_session(deck, s, is_active):
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_pulse(d, img, P / 1.6, GHIBLI["meadow"], base, amp=0.55)
-        text_fill = _lerp_color((220, 225, 235), (25, 20, 10), _ease_sine(P / 1.6) * 0.5)
+        text_fill = _lerp_color(TXT_BRIGHT, (25, 20, 10), _ease_sine(P / 1.6) * 0.5)
     elif needs and urg == "patient":
         # Auto-suggest / patient text: Spirited Rose breathing, slower (3.0s).
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_pulse(d, img, P / 3.0, GHIBLI["rose"], base, amp=0.40)
-        text_fill = (220, 225, 235)
+        text_fill = TXT_BRIGHT
     elif st == "error":
         # Calm alarm: Muted Coral pulse, 1.0s. Slower than a strobe by 3x.
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_pulse(d, img, P / 1.0, GHIBLI["coral"], base, amp=0.45)
-        text_fill = (220, 225, 235)
+        text_fill = TXT_BRIGHT
     elif st in ("running", "starting") or label == "thinking":
         # Working: Enchanted Forest spinner arc rotating around the border.
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_spinner(d, img, P / 1.2, GHIBLI["forest"], base)
-        text_fill = (220, 225, 235)
+        text_fill = TXT_BRIGHT
     elif st == "queued":
         # Queued: Whispering Wind shimmer, slow diagonal sweep (5.0s).
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_shimmer(d, img, P / 5.0, GHIBLI["wind"], base, amp=0.18)
-        text_fill = (220, 225, 235)
+        text_fill = TXT_BRIGHT
     elif st == "idle":
         # Idle: barely-there Castle Cloud shimmer (3% wave, 8s). Never fully
         # still per user preference — feels alive without distracting.
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_shimmer(d, img, P / 8.0, GHIBLI["cloud"], base, amp=0.03)
-        text_fill = (205, 210, 220)
+        text_fill = TXT_DIM
     else:
         # stopped / unknown: static, no animation, cache-friendly.
         border = (180, 185, 195) if is_active else None
@@ -1341,7 +1334,7 @@ def _overlay_title(draw, img, title):
     y = 4
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         draw.text((4 + dx, y + dy), txt, font=f, fill=(0, 0, 0))
-    draw.text((4, y), txt, font=f, fill=(255, 230, 180))
+    draw.text((4, y), txt, font=f, fill=TXT_BANNER)
 
 def _overlay_activity(draw, img, phase, label=None):
     """Real-time CLI activity row just below the top-left title: a mini
@@ -1437,7 +1430,7 @@ def _render_reply_tile(tile, zone, rec_zone):
     cx, cy = tile.width / 2, tile.height / 2
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         d.text((cx + dx, cy + dy), label, font=f, anchor="mm", fill=(0, 0, 0))
-    d.text((cx, cy), label, font=f, anchor="mm", fill=(255, 230, 180))
+    d.text((cx, cy), label, font=f, anchor="mm", fill=TXT_BANNER)
     return tile
 
 def _animate_cinema(deck):
@@ -1562,7 +1555,7 @@ def render_touchscreen(deck):
             banner = ghibli.render_touchscreen_banner(_anim_phase)
             img.paste(banner, (0, 0))
             d = ImageDraw.Draw(img)
-            txt_c = (255, 230, 180)
+            txt_c = TXT_BANNER
         else:
             txt_c = (95, 140, 180)
         s = active_session()

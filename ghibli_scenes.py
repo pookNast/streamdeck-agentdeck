@@ -62,7 +62,6 @@ PAL = {
     "lightning":   (235, 245, 255),  # electric white-blue
     "ember":       (255, 130, 35),   # rising spark
     "airship":     (12, 8, 22),      # airship hull
-    "banner":      (255, 200, 100),  # touchscreen banner text
 }
 
 HORIZON_Y = int(SCENE_H * 0.72)  # where sky meets land (~y=43)

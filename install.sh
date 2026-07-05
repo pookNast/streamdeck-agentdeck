@@ -11,6 +11,9 @@ USER_UNIT_DIR="$HOME/.config/systemd/user"
 echo "==> System packages (libhidapi backend, Pillow, fonts; konsole tools optional)"
 if command -v apt-get >/dev/null; then
   sudo apt-get update -qq
+  # ponytail: `|| true` tolerates unavailable optional packages (qdbus/xdotool
+  # names vary by distro) — upgrade: split required vs optional sets and fail
+  # loudly on the required ones.
   sudo apt-get install -y libhidapi-libusb0 python3-pil fonts-dejavu-core \
                           tmux qdbus-qt5 xdotool || true
 fi

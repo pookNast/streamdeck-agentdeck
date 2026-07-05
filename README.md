@@ -28,9 +28,10 @@ and to agent-deck via its CLI.
 - **Reply from the deck** — the touchscreen's 4 zones send real keystrokes
   (`1` / `2` / `3` / `Esc`) into the selected session's tmux pane — answer a
   Claude permission prompt without touching the keyboard.
-- **Repurposed dials** — D0 turn = move selection · D0 push = attach ·
-  D1 push = spawn · D2 push = restart · D3 push = stop · D3 turn = brightness.
-- **Two-step spawn picker** — tap an empty `+` key (or push D1):
+- **Dials** — D0 turn = move selection · D1 turn = cycle reply set ·
+  D2 turn = page sessions · D3 turn = brightness · push on any dial = send
+  that reply slot (D2 push = "Next" on the select set).
+- **Two-step spawn picker** — tap an empty `+` key:
   1. **Tool menu** — pick which agent to launch (`TOOLS`).
   2. **Placement menu** — `Window` (new konsole) · `Tab` / `Split →` / `Split ↓`
      **inside the konsole you're focused on**, via Konsole's D-Bus API.
