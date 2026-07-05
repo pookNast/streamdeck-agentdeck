@@ -893,6 +893,21 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
     # typing the attach command into someone else's live session.
     refocus = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.currentSession").strip()
     if refocus != ksid:
+        # Konsole doesn't move currentSession on split when the window itself
+        # lacks input focus (deck spawns arrive with desktop focus anywhere),
+        # which made the sessionList-fallback branch above unreachable — it
+        # always tripped this guard. Nudge focus onto the new pane explicitly;
+        # a ghost sessionList entry has no view, so setCurrentSession no-ops
+        # and we still bail to a fresh window below.
+        _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.setCurrentSession", ksid)
+        for _ in range(5):
+            time.sleep(0.2)
+            refocus = _qdbus(svc, "/Windows/1",
+                             "org.kde.konsole.Window.currentSession").strip()
+            if refocus == ksid:
+                log("split: focus nudged onto session %s via setCurrentSession", ksid)
+                break
+    if refocus != ksid:
         log("split: focus drifted from %s to %s before inject; closing pane, opening window",
             ksid, refocus or "?")
         _close_session(svc, ksid); _new_window(cmd, sid=sid); return
