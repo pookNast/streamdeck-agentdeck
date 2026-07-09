@@ -777,6 +777,26 @@ def _windows_of_pid(pid):
 def _window_visible(wid):
     return wid in _xrun(["xdotool", "search", "--onlyvisible", "--class", "konsole"]).split()
 
+def _focus_konsole_window(svc):
+    """Activate the Konsole window for `svc` so it holds desktop input focus.
+    Konsole's split-view action only moves currentSession to the new pane — and
+    the setCurrentSession nudge in place_konsole only sticks — when the window
+    is focused. Deck-triggered splits arrive with focus elsewhere, so without
+    this currentSession drifts back to the original pane ('focus drifted from N
+    to M before inject') and the split bails to a fresh window. Activating
+    first makes the split's own focus change hold. Idempotent and safe under
+    the lock-free xdotool path; a failed activate just leaves focus as-is and
+    the existing nudge/window-fallback still apply."""
+    try:
+        pid = int(svc.rsplit("-", 1)[-1])
+    except ValueError:
+        return
+    wins = _windows_of_pid(pid)
+    if not wins:                                 # None (query fail) or [] (no window)
+        return
+    wid = next((w for w in wins if _window_visible(w)), wins[0])
+    _xrun(["xdotool", "windowactivate", "--sync", wid], timeout=3)
+
 def _new_window(cmd, sid=None):
     env = _dbus_env()
     # stderr inherited (not DEVNULL): Konsole/Qt D-Bus warnings need to land in
@@ -849,6 +869,7 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
     #    changes) but the session that receives `runCommand` was the ghost session,
     #    not the focused one. Fix: use currentSession() AFTER split to target the
     #    focused visible pane. Ignore sessionList ghosts.
+    _focus_konsole_window(svc)   # split's currentSession change only sticks when the window has desktop focus
     action = "split-view-left-right" if mode == "split-right" else "split-view-top-bottom"
     before = set(_session_list(svc))
     before_current = _qdbus(svc, "/Windows/1",
