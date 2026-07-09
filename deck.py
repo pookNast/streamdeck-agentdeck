@@ -128,6 +128,26 @@ MAX_PAGES = 3
 MAX_SESSIONS = PAGE_SIZE * MAX_PAGES   # 12
 _page = 0
 _page_synced_for = None
+
+# --- Stream Deck XL layout (32 keys, 8x4, no dials/touchscreen) --------------
+# The XL replaces the Plus on this rig. It has no dials or touchscreen, so the
+# Plus's 4 dial functions (select / cycle-reply-set / page / brightness) and its
+# touchscreen reply-strip all move onto keys. Rows 1-3 (keys 0-23) hold the
+# session board — all MAX_SESSIONS=12 fit with room, so pagination is dropped —
+# and row 4 (keys 24-31) is a fixed action row. Cinema mode (a Ghibli scene
+# sliced for the Plus's 4x2 grid) is off on the XL; the per-key state-animation
+# path is already key_count()-driven and model-agnostic.
+# ponytail: page + manual-brightness dials have no XL key (24 slots need no
+# paging; brightness auto-dims via sleep/wake) — upgrade: long-press a key if
+# manual brightness is ever wanted.
+IS_XL = False              # set in main() when the active deck is a Stream Deck XL
+XL_BOARD_KEYS = 24         # keys 0-23: session slots (rows 1-3)
+XL_SEL_PREV = 24           # select previous session (was knob 1, turn left)
+XL_SEL_NEXT = 25           # select next session (was knob 1, turn right)
+XL_REPLY0 = 26             # keys 26-29: reply zones 0-3 (was the touchscreen strip)
+XL_CYCLE = 30              # cycle reply set (was knob 2)
+XL_NEW = 31                # new session in board mode / cancel in a menu
+_cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_NEW (31)
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
 _pending_tool = None       # (label, command) chosen in the tool menu -> spawn new
@@ -1535,9 +1555,64 @@ def _animate_cinema(deck):
         frame = PILHelper.to_native_key_format(deck, tile)
         deck.set_key_image(i, frame)
 
+def _render_reply_key_xl(deck, zone, rec_zone):
+    """XL action-row reply key for `zone` (0-3). Unlike the Plus (whose keys pin
+    to REPLY_SETS[0] because its touchscreen showed the cycling set), the XL has
+    no touchscreen — so the keys themselves show the live _reply_set and the
+    Cycle key (30) relabels them. Golden Meadow pulse on the recommended zone."""
+    _, zones = REPLY_SETS[_reply_set]
+    label = zones[zone][0]
+    if _reply_set == 0 and zone == 2:
+        label = "Next"
+    img = _key_img(deck, MENU_COLOR)
+    d = ImageDraw.Draw(img)
+    if zone == rec_zone:
+        _anim_pulse(d, img, _anim_phase / 1.6, GHIBLI["meadow"], MENU_COLOR, amp=0.55)
+        text_fill = (25, 20, 10)
+    else:
+        text_fill = TXT_DIM
+    _render_text(d, img, label, text_fill=text_fill, size=26)
+    return PILHelper.to_native_key_format(deck, img)
+
+def _animate_xl(deck):
+    """XL board renderer: keys 0-23 = session board (no pagination — all
+    MAX_SESSIONS fit), keys 24-31 = fixed action row (◀/▶ select, 4 reply zones,
+    Set cycle, + new). The recommended-zone highlight only applies on the
+    "select" set (_reply_set 0), where a menu choice is being recommended."""
+    with _lock:
+        sess = list(_sessions[:XL_BOARD_KEYS])
+        active = _active_id
+    s_act = active_session()
+    rec_zone = (_activity.get(active, (None, False, None))[2]
+                if _reply_set == 0 and s_act is not None else None)
+    for i in range(deck.key_count()):
+        if i < XL_BOARD_KEYS:
+            if i < len(sess):
+                frame = _render_session(deck, sess[i], sess[i]["id"] == active)
+            else:
+                frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
+        elif i == XL_SEL_PREV:
+            frame = _centered(deck, MENU_COLOR, "◀", size=34, sub="prev")
+        elif i == XL_SEL_NEXT:
+            frame = _centered(deck, MENU_COLOR, "▶", size=34, sub="next")
+        elif XL_REPLY0 <= i <= XL_REPLY0 + 3:
+            frame = _render_reply_key_xl(deck, i - XL_REPLY0, rec_zone)
+        elif i == XL_CYCLE:
+            frame = _centered(deck, MENU_COLOR, "Set", size=22, sub=REPLY_SETS[_reply_set][0])
+        elif i == XL_NEW:
+            frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
+        else:
+            frame = _key_native_blank(deck)
+        if _frame_cache.get(i) != frame:
+            _frame_cache[i] = frame
+            deck.set_key_image(i, frame)
+
 def animate_active_keys(deck):
     """Render every key each tick. In cinema mode the full grid is one continuous
     8-bit Ghibli scene; otherwise per-key state animations (pulse/spinner/shimmer)."""
+    if IS_XL:
+        _animate_xl(deck)
+        return
     if _cinema_mode and _ui_mode == "board":
         _animate_cinema(deck)
         return
@@ -1563,7 +1638,7 @@ def animate_active_keys(deck):
 
 def paint_menu(deck, items):
     for i in range(deck.key_count()):
-        if i == CANCEL_KEY:
+        if i == _cancel_key:
             deck.set_key_image(i, _centered(deck, CANCEL_COLOR, "Cancel", size=18))
         elif i < len(items):
             deck.set_key_image(i, _centered(deck, MENU_COLOR, items[i][0], size=18))
@@ -1574,6 +1649,8 @@ def _key_native_blank(deck):
     return PILHelper.to_native_key_format(deck, _key_img(deck, (8, 9, 12)))
 
 def render_touchscreen(deck):
+    if IS_XL:
+        return                                  # XL has no touchscreen
     img = PILHelper.create_touchscreen_image(deck)
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, img.width, img.height], fill=(6, 7, 12))
@@ -1744,6 +1821,63 @@ def on_key(deck, key, pressed):
         open_menu("tool"); repaint(deck)
 
 @_safe_callback
+def on_key_xl(deck, key, pressed):
+    """XL key handler — everything the Plus put on dials/touchscreen lives on
+    keys here. Board slots (0-23) select on first tap and toggle the session's
+    window on a second tap of the active one, exactly like the Plus. Row 4:
+    24/25 = select prev/next, 26-29 = reply zones (honoring the live _reply_set),
+    30 = cycle reply set, 31 = new session (or Cancel while a menu is open)."""
+    if not pressed:
+        return
+    if _wake_and_note(deck):
+        return
+    global _active_id, _pending_tool, _reply_set
+    if _ui_mode == "tool":
+        if key == _cancel_key:
+            close_menu()
+        elif key < len(TOOLS):
+            _pending_tool = TOOLS[key]; open_menu("place")
+        repaint(deck); return
+    if _ui_mode == "place":
+        if key == _cancel_key:
+            close_menu()
+        elif key < len(PLACEMENTS):
+            mode = PLACEMENTS[key][1]
+            if _pending_tool:                       # spawn a NEW session
+                tool = _pending_tool; close_menu(); _bg(spawn, tool, mode)
+            elif _pending_session:                  # (re)open an EXISTING session
+                s = _pending_session; close_menu(); _bg(open_existing, s, mode)
+            else:
+                close_menu()
+        repaint(deck); return
+    # board mode — action row first, then board slots.
+    if key == XL_SEL_PREV:
+        select_delta(-1); return                    # state-only; 20fps loop repaints
+    if key == XL_SEL_NEXT:
+        select_delta(1); return
+    if XL_REPLY0 <= key <= XL_REPLY0 + 3:
+        _bg(act_reply, key - XL_REPLY0); return     # uses the live _reply_set
+    if key == XL_CYCLE:
+        _reply_set = (_reply_set + 1) % len(REPLY_SETS)
+        log("reply set -> %d (%s)", _reply_set, REPLY_SETS[_reply_set][0]); return
+    if key == XL_NEW:
+        open_menu("tool"); repaint(deck); return
+    if key >= XL_BOARD_KEYS:
+        return                                      # gap keys (none in this layout)
+    with _lock:
+        sess = list(_sessions[:XL_BOARD_KEYS])
+        active = _active_id
+    if key < len(sess):
+        s = sess[key]
+        if s["id"] == active:
+            _bg(toggle_or_place, deck, s)
+        else:
+            with _lock:
+                _active_id = s["id"]
+    else:
+        open_menu("tool"); repaint(deck)            # empty board slot = new session
+
+@_safe_callback
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
@@ -1789,11 +1923,15 @@ def main():
     # Retry HID enumeration+open with backoff (device may not be ready at boot).
     # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
     # settled the HID node yet; this keeps the process alive instead.
+    global IS_XL, _cancel_key, _cinema_mode
     _plus = None
     for _attempt in range(30):
         try:
             decks = DeviceManager().enumerate()
-            _plus = next((d for d in decks if "+" in d.deck_type()), None)
+            # Accept the Plus ("+" in the name, has dials + touchscreen) OR the
+            # XL (32 keys, no dials/touch). XL replaces the Plus on this rig, so
+            # the first Stream Deck of either kind wins.
+            _plus = next((d for d in decks if "Stream Deck" in d.deck_type()), None)
             if _plus:
                 _plus.open()
                 break
@@ -1806,11 +1944,23 @@ def main():
         time.sleep(_wait)
     plus = _plus
     if not plus:
-        log("no Stream Deck Plus found"); sys.exit(1)
+        log("no Stream Deck found"); sys.exit(1)
+    IS_XL = "XL" in plus.deck_type()
     plus.reset(); plus.set_brightness(_brightness)
-    plus.set_key_callback(on_key)
-    plus.set_dial_callback(on_dial)
-    plus.set_touchscreen_callback(on_touch)
+    if IS_XL:
+        # XL: all input on keys. Cinema scene (built for the Plus 4x2) is off;
+        # the menu-cancel key moves to the last key (31). No dials/touchscreen.
+        _cinema_mode = False
+        _cancel_key = XL_NEW
+        plus.set_key_callback(on_key_xl)
+        log("Stream Deck XL detected (%s, %d keys) — key-only layout",
+            plus.deck_type(), plus.key_count())
+    else:
+        plus.set_key_callback(on_key)
+        plus.set_dial_callback(on_dial)
+        plus.set_touchscreen_callback(on_touch)
+        log("Stream Deck Plus detected (%s) — dials + touchscreen layout",
+            plus.deck_type())
 
     _load_win_map()
     _load_pane_order()
