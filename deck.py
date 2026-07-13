@@ -36,6 +36,7 @@ TXT_BANNER = (255, 230, 180)   # banner / menu highlight text
 NEW_SESSION_DIR = os.path.expanduser("~")
 _WIN_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/windows.json")
 _PANE_ORDER_PATH = os.path.expanduser("~/.cache/agentdeck/pane_order.json")
+_DBUS_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/dbus_sessions.json")
 FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_R = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 if not os.path.exists(FONT_R):
@@ -175,6 +176,12 @@ _pending_tool = None       # (label, command) chosen in the tool menu -> spawn n
 _pending_session = None    # existing session chosen to (re)open in a placement
 _menu_deadline = 0.0
 _win_map = {}              # session id -> konsole process pid we opened for it
+# session id -> Konsole D-Bus session id (the ksid returned by newSession /
+# currentSession). Set on tab/split placements where ksid is known. New-window
+# sessions rely on _win_map's whole-PID window check (Signal 3) since they're
+# the sole session in their konsole process. Used by Signal 4 in _prune_dead
+# to catch per-tab closes that leave the konsole PID alive.
+_dbus_map = {}
 # pid (str) -> [sid, ...] in the order each was placed into that konsole window —
 # dict key order is window-open order, list order is top-to-bottom (split) /
 # left-to-right (tab) placement order. We control all placement, so insertion
@@ -210,6 +217,24 @@ def _load_win_map():
         pass
     except Exception as e:
         logging.warning("win_map load failed: %s", e)
+
+def _save_dbus_map():
+    try:
+        os.makedirs(os.path.dirname(_DBUS_MAP_PATH), exist_ok=True)
+        with open(_DBUS_MAP_PATH, "w") as f:
+            json.dump(_dbus_map, f)
+    except Exception as e:
+        logging.warning("dbus_map save failed: %s", e)
+
+def _load_dbus_map():
+    try:
+        with open(_DBUS_MAP_PATH) as f:
+            _dbus_map.update(json.load(f))
+        logging.info("dbus_map loaded: %d entries", len(_dbus_map))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning("dbus_map load failed: %s", e)
 
 def _save_pane_order():
     try:
@@ -492,6 +517,34 @@ def _prune_dead(sessions):
             _win_map.pop(sid, None)
         _save_win_map()
         log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
+    # Signal 4: tracked Konsole D-Bus session path no longer exists in
+    # sessionList. Catches per-tab close: closing one tab in a multi-tab
+    # window leaves the konsole PROCESS alive (other tabs hold it open), so
+    # Signal 3's whole-PID window check misses it. The D-Bus ksid is per-tab
+    # — if it's gone from sessionList, that specific tab was closed (user
+    # closed it, even though tmux + ssh underneath kept running). Batched:
+    # one qdbus call per unique konsole PID.
+    _dbus_live = {}                     # svc -> (ok, set-of-ksids) per prune
+    for s in sessions:
+        sid = s["id"]
+        if sid in dead_ids or sid in _pruned:
+            continue
+        ksid_tracked = _dbus_map.get(sid)
+        if not ksid_tracked:
+            continue                    # new-window session — Signal 3 covers it
+        pid = _win_map.get(sid)
+        if not pid:
+            continue
+        svc = "org.kde.konsole-%s" % pid
+        if svc not in _dbus_live:
+            ok, out = _xrun_checked(
+                ["qdbus", svc, "/Windows/1", "org.kde.konsole.Window.sessionList"])
+            _dbus_live[svc] = (ok, {p.strip() for p in out.split() if p.strip()})
+        ok, live = _dbus_live[svc]
+        if ok and ksid_tracked not in live:
+            dead_ids.add(sid)
+            log("prune dead '%s' (konsole D-Bus session %s gone)",
+                s.get("title"), ksid_tracked)
     if not dead_ids:
         return sessions
     for sid in dead_ids:
@@ -505,6 +558,8 @@ def _prune_dead(sessions):
         _needed_since.pop(sid, None)
         _dismissed.pop(sid, None)
         _suggest_sticky.pop(sid, None)
+        _dbus_map.pop(sid, None)
+        _save_dbus_map()
         _forget_pane(sid)
     # Expire stale prune cache entries (session could be re-created with same id)
     for sid in list(_pruned):
@@ -923,6 +978,7 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
                 pid = svc.rsplit("-", 1)[-1]
                 with _lock:
                     _win_map[sid] = pid; _save_win_map()
+                    _dbus_map[sid] = ksid; _save_dbus_map()
                 _record_pane(pid, sid)
         else:
             _new_window(cmd, sid=sid)
@@ -1023,6 +1079,7 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
             pid = svc.rsplit("-", 1)[-1]
             with _lock:
                 _win_map[sid] = pid; _save_win_map()
+                _dbus_map[sid] = ksid; _save_dbus_map()
             _record_pane(pid, sid)
         return
     log("split didn't hold for %s; closing pane %s, opening window",
@@ -2267,6 +2324,7 @@ def main():
             plus.deck_type())
 
     _load_win_map()
+    _load_dbus_map()
     _load_pane_order()
     _sessions = fetch_sessions()
     _active_id = _sessions[0]["id"] if _sessions else None
