@@ -129,25 +129,46 @@ MAX_SESSIONS = PAGE_SIZE * MAX_PAGES   # 12
 _page = 0
 _page_synced_for = None
 
-# --- Stream Deck XL layout (32 keys, 8x4, no dials/touchscreen) --------------
-# The XL replaces the Plus on this rig. It has no dials or touchscreen, so the
-# Plus's 4 dial functions (select / cycle-reply-set / page / brightness) and its
-# touchscreen reply-strip all move onto keys. Rows 1-3 (keys 0-23) hold the
-# session board — all MAX_SESSIONS=12 fit with room, so pagination is dropped —
-# and row 4 (keys 24-31) is a fixed action row. Cinema mode (a Ghibli scene
-# sliced for the Plus's 4x2 grid) is off on the XL; the per-key state-animation
-# path is already key_count()-driven and model-agnostic.
-# ponytail: page + manual-brightness dials have no XL key (24 slots need no
+# --- Stream Deck XL+ layout (36 keys, 9x4, no dials/touchscreen) -------------
+# The XL+ (deck_type "Stream Deck XL+", 9 cols x 4 rows) replaces the Plus on
+# this rig. It has no dials or touchscreen, so the Plus's 4 dial functions
+# (select / cycle-reply-set / page / brightness) and its touchscreen reply-strip
+# all move onto keys. Rows 0-2 (keys 0-26) hold the session board — all
+# MAX_SESSIONS=12 fit with room, so pagination is dropped — and row 3
+# (keys 27-35) is a fixed action row. Cinema mode spans the full 9x4 grid
+# (_animate_cinema_xl slices the scene to 36 tiles); the per-key state-animation
+# fallback is key_count()-driven and model-agnostic. Per-key image rotation
+# (upright glyphs on this quarter-turn panel) lives in the StreamDeckXLPlus
+# device class (KEY_ROTATION=270), so nothing here rotates.
+# ponytail: page + manual-brightness dials have no XL key (27 slots need no
 # paging; brightness auto-dims via sleep/wake) — upgrade: long-press a key if
 # manual brightness is ever wanted.
-IS_XL = False              # set in main() when the active deck is a Stream Deck XL
-XL_BOARD_KEYS = 24         # keys 0-23: session slots (rows 1-3)
-XL_SEL_PREV = 24           # select previous session (was knob 1, turn left)
-XL_SEL_NEXT = 25           # select next session (was knob 1, turn right)
-XL_REPLY0 = 26             # keys 26-29: reply zones 0-3 (was the touchscreen strip)
-XL_CYCLE = 30              # cycle reply set (was knob 2)
-XL_NEW = 31                # new session in board mode / cancel in a menu
-_cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_NEW (31)
+IS_XL = False              # set in main() when the active deck is a Stream Deck XL(+)
+HAS_DIALS = False          # set in main(): True for XL+ and Plus (have dials + touchscreen)
+# Geometry is the 9x4 / 36-key "XL+" (deck_type "Stream Deck XL+", PID 0x00c6),
+# laid out Plus-style: sessions on TOP, the answer/control strip in row 1 sitting
+# directly under the session names, then overflow sessions below.
+#   row 0  (keys 0-8):   session slots
+#   row 1  (keys 9-17):  [1][2][3][Go]  [Next]  [<][>]  [Set]  [+]
+#   rows 2-3 (keys 18-35): overflow session slots
+# So a numbered menu's answer keys are right beneath the sessions they answer
+# (the Plus stacked sessions-over-replies the same way).
+XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 36))   # 23 session slots (row 0 + rows 2-3 minus quick keys)
+XL_SLOT_OF_KEY = {k: j for j, k in enumerate(XL_BOARD_SLOTS)}  # key -> session index
+XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/Go)
+XL_NEXT = 13               # dismiss the active prompt ("Next") without sending keys
+XL_SEL_PREV = 14           # select previous session (was knob 1, turn left)
+XL_SEL_NEXT = 15           # select next session (was knob 1, turn right)
+XL_CYCLE = 16              # cycle reply set (was knob 2)
+XL_NEW = 17                # new session in board mode / cancel in a menu
+XL_QUICK0 = 18             # keys 18-21: always-visible quick controls (Go, S-Tab, Voice, Esc)
+XL_QUICK = [
+    ("4", ["Tab", "~0.5", "Enter"]),
+    ("S-Tab", ["BTab"]),
+    ("Voice", ["!voice"]),
+    ("Esc", ["Escape"]),
+]
+_cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_NEW (17)
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
 _pending_tool = None       # (label, command) chosen in the tool menu -> spawn new
@@ -161,6 +182,16 @@ _win_map = {}              # session id -> konsole process pid we opened for it
 # split-down. This drives the Stream Deck's session button ordering so it
 # mirrors what's actually on screen instead of a stale hand-maintained list.
 _pane_order = {}
+
+# Host health + system load — populated by background threads, read by
+# render_touchscreen at 20fps. ponytail: globals + a daemon thread each — no
+# psutil dep, no new config — upgrade: psutil if the-host already has it.
+_host_status = {"the-deck-host": True, "server-host": True, "nas-host": True, "git-host": True}
+_host_status_ts = 0.0
+_host_status_lock = threading.Lock()
+_cpu_prev = None              # (idle_cum, total_cum) last /proc/stat sample
+_cpu_ts = 0.0                 # timestamp of last cpu sample
+_cpu_pct_cached = 0.0         # last computed cpu % (refreshed at most every 1s)
 
 def _save_win_map():
     try:
@@ -226,7 +257,7 @@ def _forget_pane(sid):
                     del _pane_order[p]
         if changed:
             _save_pane_order()
-_reply_set = 1             # index into REPLY_SETS (cycled by knob 2 scroll); default "keys" 2/3
+_reply_set = 0             # index into REPLY_SETS (cycled by Set key / knob 2); default "select" 1/2/3/Go
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
 _urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
@@ -241,6 +272,9 @@ INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
 _anim_phase = 0.0
 _frame_cache = {}          # session id -> last native frame bytes (skip dup push)
 _touch_frame_cache = None  # last native touchscreen frame bytes (skip dup push)
+_ts_diag_logged = False    # one-shot diagnostic: log touchscreen image size on first render
+_ts_send_logged = False    # one-shot diagnostic: log set_touchscreen_image call result
+_manual_until = 0.0        # monotonic timestamp until which auto-focus is suppressed (knob 1 / sel keys)
 # Cinema mode: the full 4x2 key grid + touchscreen become ONE continuous canvas
 # playing an 8-bit Ghibli battle scene (Laputa Siege at Golden Hour). Sessions
 # needing input "break through" the canvas with a Ghibli-accent wash + pulsing
@@ -817,6 +851,22 @@ def _focus_konsole_window(svc):
     wid = next((w for w in wins if _window_visible(w)), wins[0])
     _xrun(["xdotool", "windowactivate", "--sync", wid], timeout=3)
 
+def focus_active_terminal():
+    """Raise + focus the active session's konsole window. XL+ knob 1.
+    Same xdotool/wmctrl path toggle_or_place uses on second tap."""
+    sid = _active_id
+    if not sid:
+        log("focus-terminal: no active session"); return
+    with _lock:
+        pid = _win_map.get(sid)
+    wins = _windows_of_pid(pid)
+    if not wins:
+        log("focus-terminal: no window for sid=%s", sid); return
+    wid = next((w for w in wins if _window_visible(w)), wins[0])
+    _xrun(["wmctrl", "-i", "-a", wid])
+    _xrun(["xdotool", "windowactivate", "--sync", wid], timeout=3)
+    log("focus-terminal: raised wid=%s for sid=%s", wid, sid)
+
 def _new_window(cmd, sid=None):
     env = _dbus_env()
     # stderr inherited (not DEVNULL): Konsole/Qt D-Bus warnings need to land in
@@ -987,6 +1037,63 @@ def active_session():
     with _lock:
         return next((s for s in _sessions if s.get("id") == _active_id), None)
 
+def _host_status_loop():
+    """Background ping loop: refresh _host_status every 2s."""
+    while True:
+        for h in list(_host_status.keys()):
+            try:
+                subprocess.run(["timeout", "1", "ping", "-c1", "-W1", h],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=2)
+                with _host_status_lock: _host_status[h] = True
+            except Exception:
+                with _host_status_lock: _host_status[h] = False
+        time.sleep(2)
+
+def _cpu_pct():
+    """Aggregate CPU% since the last sample. Cached at most every 1s — the
+    render loop calls this at 20fps, but /proc/stat only updates at the kernel
+    tick rate, so faster sampling is noise. ponytail: 4-line global + timestamp
+    — no thread, no psutil dep — upgrade: psutil if the-host already has it."""
+    global _cpu_prev, _cpu_ts, _cpu_pct_cached
+    now = time.monotonic()
+    if now - _cpu_ts < 1.0:
+        return _cpu_pct_cached
+    _cpu_ts = now
+    try:
+        with open("/proc/stat") as f:
+            parts = f.readline().split()[1:]   # user,nice,system,idle,iowait,...
+        vals = [int(x) for x in parts]
+        idle = vals[3]
+        total = sum(vals)
+        if _cpu_prev is not None:
+            di = idle - _cpu_prev[0]; dt = total - _cpu_prev[1]
+            _cpu_pct_cached = max(0.0, min(100.0, 100.0 * (1.0 - di / dt))) if dt > 0 else 0.0
+        _cpu_prev = (idle, total)
+    except Exception:
+        pass
+    return _cpu_pct_cached
+
+def _mem_pct():
+    """MemAvailable / MemTotal from /proc/meminfo. Read inline — one syscall
+    per frame at 20fps is ~zero cost. ponytail: no cache — upgrade: cache if
+    profiling ever shows the read in the hot path."""
+    try:
+        with open("/proc/meminfo") as f:
+            mi = {ln.split(":")[0]: ln for ln in f}
+        total = int(mi["MemTotal"].split()[1])
+        avail = int(mi["MemAvailable"].split()[1])
+        return 100.0 * (1.0 - avail / total) if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _bars(d, x, y, items):
+    """items = [(label, value_0_1, color), ...] — mini bars + label."""
+    for label, v, color in items:
+        d.text((x, y - 2), label, font=ImageFont.truetype(FONT_R, 11), fill=(220, 220, 220))
+        d.rectangle([x + 28, y, x + 28 + int(40 * max(0, min(1, v))), y + 6], fill=color)
+        x += 78
+
 def active_is_suggest():
     """True if the active session is at a free-text / auto-suggest prompt
     (label "suggest…"), OR was within the last few seconds — agent-deck flickers
@@ -1015,20 +1122,22 @@ def dismiss_session(sess):
     _needed_since.pop(sid, None)
     log("dismissed input gate for %s", sess.get("title"))
 
-def act_reply(slot, reply_set=None):
-    """reply_set overrides which REPLY_SETS entry to use — the bottom-row keys
-    are pinned to 0 ("select"/"1 2 Next Go") regardless of what's currently
-    cycling on the touchscreen; touch/dial callers omit it and get whatever
-    the touchscreen is showing (the global _reply_set)."""
+def act_reply(slot, reply_set=None, allow_dismiss=True):
+    """reply_set overrides which REPLY_SETS entry to use. allow_dismiss controls
+    whether slot 2 of the select set means "Next" (dismiss the prompt without
+    sending) — TRUE on the Plus, whose bottom row had no dedicated Next key, so
+    slot 2 doubled as it; FALSE on the XL+, which has its own XL_NEXT key, so
+    slot 2 there sends a real "3" (option-3 in a numbered menu)."""
     if reply_set is None:
         reply_set = _reply_set
     s = active_session()
     if not s:
         log("reply: no active session"); return
-    # Zone 2 is always "Next" on the select set: dismiss the active session's
-    # input gate (stop blinking, yield focus) WITHOUT sending keys to the agent.
-    # Applies to numbered menus AND auto-suggest prompts — "read it, move on".
-    if slot == 2 and reply_set == 0:
+    # Plus only: slot 2 of the select set dismisses the active session's input
+    # gate (stop blinking, yield focus) WITHOUT sending keys — for numbered menus
+    # AND auto-suggest prompts, "read it, move on". The XL+ passes allow_dismiss
+    # =False so slot 2 sends option 3 and dismiss lives on its own key.
+    if allow_dismiss and slot == 2 and reply_set == 0:
         dismiss_session(s); _advance_focus(s["id"]); return
     label, keys = REPLY_SETS[reply_set][1][slot]
     if not keys:
@@ -1556,14 +1665,12 @@ def _animate_cinema(deck):
         deck.set_key_image(i, frame)
 
 def _render_reply_key_xl(deck, zone, rec_zone):
-    """XL action-row reply key for `zone` (0-3). Unlike the Plus (whose keys pin
-    to REPLY_SETS[0] because its touchscreen showed the cycling set), the XL has
-    no touchscreen — so the keys themselves show the live _reply_set and the
-    Cycle key (30) relabels them. Golden Meadow pulse on the recommended zone."""
+    """XL+ answer-strip reply key for `zone` (0-3). The XL+ has no touchscreen, so
+    the keys themselves show the live _reply_set (select = 1/2/3/Go) and the Set
+    key relabels them. No "Next" override here — dismiss has its own XL_NEXT key,
+    so the select set shows a real "3". Golden Meadow pulse on the recommended zone."""
     _, zones = REPLY_SETS[_reply_set]
     label = zones[zone][0]
-    if _reply_set == 0 and zone == 2:
-        label = "Next"
     img = _key_img(deck, MENU_COLOR)
     d = ImageDraw.Draw(img)
     if zone == rec_zone:
@@ -1575,34 +1682,135 @@ def _render_reply_key_xl(deck, zone, rec_zone):
     return PILHelper.to_native_key_format(deck, img)
 
 def _animate_xl(deck):
-    """XL board renderer: keys 0-23 = session board (no pagination — all
-    MAX_SESSIONS fit), keys 24-31 = fixed action row (◀/▶ select, 4 reply zones,
-    Set cycle, + new). The recommended-zone highlight only applies on the
-    "select" set (_reply_set 0), where a menu choice is being recommended."""
+    """XL+ board renderer (non-cinema fallback): session slots on the board keys
+    (XL_BOARD_SLOTS = row 0 + rows 2-3), and row 1 = the answer/control strip
+    (1/2/3/Go reply zones, Next, ◀/▶ select, Set cycle, + new). The
+    recommended-zone highlight only applies on the select set (_reply_set 0)."""
     with _lock:
-        sess = list(_sessions[:XL_BOARD_KEYS])
+        sess = list(_sessions[:len(XL_BOARD_SLOTS)])
         active = _active_id
     s_act = active_session()
     rec_zone = (_activity.get(active, (None, False, None))[2]
                 if _reply_set == 0 and s_act is not None else None)
     for i in range(deck.key_count()):
-        if i < XL_BOARD_KEYS:
-            if i < len(sess):
-                frame = _render_session(deck, sess[i], sess[i]["id"] == active)
+        if i in XL_SLOT_OF_KEY:
+            j = XL_SLOT_OF_KEY[i]
+            if j < len(sess):
+                frame = _render_session(deck, sess[j], sess[j]["id"] == active)
             else:
                 frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
+        elif XL_REPLY0 <= i <= XL_REPLY0 + 3:
+            frame = _render_reply_key_xl(deck, i - XL_REPLY0, rec_zone)
+        elif i == XL_NEXT:
+            frame = _centered(deck, MENU_COLOR, "Next", size=24, sub="drop")
         elif i == XL_SEL_PREV:
             frame = _centered(deck, MENU_COLOR, "◀", size=34, sub="prev")
         elif i == XL_SEL_NEXT:
             frame = _centered(deck, MENU_COLOR, "▶", size=34, sub="next")
-        elif XL_REPLY0 <= i <= XL_REPLY0 + 3:
-            frame = _render_reply_key_xl(deck, i - XL_REPLY0, rec_zone)
         elif i == XL_CYCLE:
             frame = _centered(deck, MENU_COLOR, "Set", size=22, sub=REPLY_SETS[_reply_set][0])
         elif i == XL_NEW:
             frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
+        elif XL_QUICK0 <= i < XL_QUICK0 + len(XL_QUICK):
+            label, _ = XL_QUICK[i - XL_QUICK0]
+            qc = {"4": (24, 56, 100), "Esc": (60, 28, 28)}.get(label, MENU_COLOR)
+            frame = _centered(deck, qc, label, size=22)
         else:
             frame = _key_native_blank(deck)
+        if _frame_cache.get(i) != frame:
+            _frame_cache[i] = frame
+            deck.set_key_image(i, frame)
+
+def _overlay_xl_control(tile, key, rec_zone):
+    """Overlay an XL+ row-1 control (keys 9-17) onto its Ghibli scene tile with a
+    4-way drop-shadow so the panorama shows through behind the label — the same
+    "wash over, never replace" treatment the Plus gives its reply strip. Reply
+    zones honor the live _reply_set (select = 1/2/3/Go) and pulse Golden Meadow on
+    the recommended zone. Returns the mutated tile."""
+    sub = None
+    if XL_REPLY0 <= key <= XL_REPLY0 + 3:
+        zone = key - XL_REPLY0
+        _, zones = REPLY_SETS[_reply_set]
+        label = zones[zone][0]
+        if zone == rec_zone:
+            pulse = _ease_sine(_anim_phase / 1.6)
+            wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
+            tile = Image.blend(tile, wash, 0.25 + pulse * 0.25)
+    elif key == XL_NEXT:
+        label, sub = "Next", "drop"
+    elif key == XL_SEL_PREV:
+        label, sub = "◀", "prev"
+    elif key == XL_SEL_NEXT:
+        label, sub = "▶", "next"
+    elif key == XL_CYCLE:
+        label, sub = "Set", REPLY_SETS[_reply_set][0]
+    elif key == XL_NEW:
+        label, sub = "+", "new"
+    elif XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
+        label, sub = XL_QUICK[key - XL_QUICK0][0], None
+    else:
+        label = ""
+    d = ImageDraw.Draw(tile)
+    f = ImageFont.truetype(FONT_B, 26)
+    cx, cy = tile.width / 2, tile.height / 2 - (7 if sub else 0)
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        d.text((cx + dx, cy + dy), label, font=f, anchor="mm", fill=(0, 0, 0))
+    d.text((cx, cy), label, font=f, anchor="mm", fill=TXT_BANNER)
+    if sub:
+        sf = ImageFont.truetype(FONT_R, 12)
+        sy = cy + 18
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            d.text((cx + dx, sy + dy), sub, font=sf, anchor="mm", fill=(0, 0, 0))
+        d.text((cx, sy), sub, font=sf, anchor="mm", fill=(210, 215, 225))
+    return tile
+
+def _animate_cinema_xl(deck):
+    """XL+ cinema: the Laputa-siege scene spans all 36 keys as one continuous
+    panorama (9x4 canvas, no touchscreen to carry the banner). Board slots
+    (XL_BOARD_SLOTS) overlay their session tile (title/status/activity/needy-wash/
+    selector) ON the scene; row 1 (keys 9-17) overlays the answer/control labels —
+    the scene is never interrupted, alerts wash over it. Per-key _frame_cache dedup
+    bounds the 36-key HID load."""
+    scene = ghibli.render_scene(_anim_phase)
+    canvas = ghibli.scale_to_canvas_xl(scene)
+    tiles = ghibli.slice_tiles_xl(canvas)
+    with _lock:
+        sess = list(_sessions[:len(XL_BOARD_SLOTS)])
+        active = _active_id
+    s_act = active_session()
+    rec_zone = (_activity.get(active, (None, False, None))[2]
+                if _reply_set == 0 and s_act is not None else None)
+    for i in range(deck.key_count()):
+        tile = tiles[i].copy()
+        j = XL_SLOT_OF_KEY.get(i)
+        if j is None:
+            tile = _overlay_xl_control(tile, i, rec_zone)
+        elif j < len(sess):
+            s = sess[j]
+            label, needs, _rec = _activity.get(s["id"], (s.get("status", "idle"), False, None))
+            urg = _urgency.get(s["id"], "menu") if needs else None
+            st = s.get("status", "idle")
+            thinking = (label == "thinking" or st in ("running", "starting"))
+            # 1) Break-through wash for needy keys (before overlays stay crisp).
+            if needs:
+                accent = GHIBLI["meadow"] if urg in ("menu", "urgent") else GHIBLI["rose"]
+                period = 1.6 if urg in ("menu", "urgent") else 3.0
+                pulse = _ease_sine(_anim_phase / period)
+                wash = Image.new("RGB", tile.size, accent)
+                tile = Image.blend(tile, wash, pulse * 0.35)
+            d = ImageDraw.Draw(tile)
+            _overlay_title(d, tile, s.get("title", "?"))
+            _overlay_status_dot(d, tile, st)
+            if thinking:
+                _overlay_activity(d, tile, _anim_phase, label=str(label))
+            if needs:
+                border_c = _lerp_color((20, 20, 28), accent, 0.65 + pulse * 0.35)
+                d.rectangle([2, 2, tile.width - 3, tile.height - 3],
+                            outline=border_c, width=3)
+            if s["id"] == active:
+                _draw_selector(d, tile)
+        # else: empty board slot -> pure scene tile (the siege plays through).
+        frame = PILHelper.to_native_key_format(deck, tile)
         if _frame_cache.get(i) != frame:
             _frame_cache[i] = frame
             deck.set_key_image(i, frame)
@@ -1611,7 +1819,10 @@ def animate_active_keys(deck):
     """Render every key each tick. In cinema mode the full grid is one continuous
     8-bit Ghibli scene; otherwise per-key state animations (pulse/spinner/shimmer)."""
     if IS_XL:
-        _animate_xl(deck)
+        if _cinema_mode and _ui_mode == "board":
+            _animate_cinema_xl(deck)
+        else:
+            _animate_xl(deck)
         return
     if _cinema_mode and _ui_mode == "board":
         _animate_cinema(deck)
@@ -1649,9 +1860,16 @@ def _key_native_blank(deck):
     return PILHelper.to_native_key_format(deck, _key_img(deck, (8, 9, 12)))
 
 def render_touchscreen(deck):
-    if IS_XL:
-        return                                  # XL has no touchscreen
+    if IS_XL and not HAS_DIALS:
+        return                                  # original XL has no touchscreen; XL+ does
     img = PILHelper.create_touchscreen_image(deck)
+    if img.width == 0 or img.height == 0:
+        return                                  # XL+ driver doesn't expose touchscreen geometry yet (library gap)
+    global _ts_diag_logged
+    if not _ts_diag_logged:
+        log("render_touchscreen: img.size=%s IS_XL=%s HAS_DIALS=%s deck_type=%s",
+            img.size, IS_XL, HAS_DIALS, deck.deck_type())
+        _ts_diag_logged = True
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, img.width, img.height], fill=(6, 7, 12))
     if _ui_mode == "tool":
@@ -1677,55 +1895,98 @@ def render_touchscreen(deck):
             if not _cinema_mode:
                 d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (40, 42, 50)))
             head = "▶ {}  ·  {}".format(s.get("title", "?"), st)
+            sess_name = s.get("title", "?")
         else:
             head = "▶ Laputa Siege  ·  cinema" if _cinema_mode else "▶ no session selected"
+            sess_name = "—"
         # Drop-shadow text when on the banner (JPEG has no alpha; 4-direction
         # shadow makes any text readable over the scene without a backing rect).
         if _cinema_mode:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 d.text((16 + dx, 6 + dy), head, font=ImageFont.truetype(FONT_B, 24), fill=(0, 0, 0))
         d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=txt_c)
-        setname, zones = REPLY_SETS[_reply_set]
-        setinfo = "%s %d/%d · pg %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS),
-                                            _page + 1, MAX_PAGES)
+        # Change 6a — time + date in top-right (replaces the old setinfo draw;
+        # reply-set info has moved into knob zone 2 per Change 4).
+        _timestr = time.strftime("%a %H:%M:%S")           # "Fri 14:32:07"
         if _cinema_mode:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                d.text((img.width - 12 + dx, 8 + dy), setinfo,
+                d.text((img.width - 12 + dx, 8 + dy), _timestr,
                        font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
-        d.text((img.width - 12, 8), setinfo,
+        d.text((img.width - 12, 8), _timestr,
                font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=txt_c)
-        # Recommended choice: the zone Claude Code's ❯ cursor marks
-        # (1/2/3 for numbered menus, "Go" for auto-suggest). decoupled from the
-        # "Next" label override below so menus still light their number.
-        rec_zone = None
-        if _reply_set == 0 and s is not None:
-            rec_zone = _activity.get(s["id"], (None, False, None))[2]
-        zw = img.width / 4
-        for i, (label, _) in enumerate(zones):
-            # Zone 2 is always "Next" on the select set: dismiss the active
-            # session's input gate (stop blinking, move on) without sending
-            # keys. Works for both numbered menus and auto-suggest prompts.
-            if _reply_set == 0 and i == 2:
-                label = "Next"
+        # Change 7 — agent heartbeat pulses: up to MAX_SESSIONS dots at y=28,
+        # leftmost = active. pulse phase reuses the existing _anim_phase global
+        # so all heartbeats breathe in sync with the rest of the cinema animation.
+        with _lock:
+            sess_snapshot = list(_sessions[:MAX_SESSIONS])
+            active = _active_id
+        for i, s in enumerate(sess_snapshot):
+            sid = s["id"]; st = s.get("status", "idle")
+            base = STATE_COLOR.get(st, (40, 42, 50))
+            if st in ("running", "starting"):
+                # breath: scale 0.5..1.0 over 1.6s (matches the meadow-pulse period)
+                b = 0.5 + 0.5 * (0.5 + 0.5 * math.sin(_anim_phase / 1.6 * 2 * math.pi))
+                fill = tuple(int(c * b + 20 * (1 - b)) for c in base)
+            elif st == "error":
+                fill = (200, 60, 60)                       # steady red
+            elif st == "done":
+                fill = (40, 180, 80)                       # steady green
+            else:                                          # idle / unknown
+                fill = tuple(int(c * 0.4) for c in base)   # dim flat
+            x = 16 + i * 12
+            d.ellipse([x, 28, x + 8, 36], fill=fill)
+            if sid == active:
+                d.rectangle([x - 1, 27, x + 9, 37], outline=(220, 220, 220))  # active ring
+        # Change 6b — SSH host health dots at y=30, positioned to the right of
+        # the agent heartbeat dots.
+        _hosts = ["the-deck-host", "server-host", "nas-host", "git-host"]
+        with _host_status_lock:
+            states = [_host_status[h] for h in _hosts]
+        _host_x0 = 16 + len(sess_snapshot) * 12 + 8
+        for i, up in enumerate(states):
+            color = (40, 180, 80) if up else (200, 60, 60)
+            d.ellipse([_host_x0 + i * 14, 30, _host_x0 + 8 + i * 14, 38], fill=color)
+        # Load avg read once per frame — used in zone 4 below.
+        try:
+            with open("/proc/loadavg") as _f:
+                load1 = float(_f.read().split()[0])
+        except Exception:
+            load1 = 0.0
+        # Change 4 — board mode: 6 zones = 6 knobs. Zones 4-5 carry the
+        # system monitors (load/cpu/mem) moved from the tiny top banner.
+        setname = REPLY_SETS[_reply_set][0]
+        _cpu_val = _cpu_pct()
+        _mem_val = _mem_pct()
+        knob_labels = [
+            sess_name,
+            "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
+            "pg %d/%d" % (_page + 1, MAX_PAGES),
+            "load %.1f" % load1,
+            "cpu %d%%  mem %d%%" % (_cpu_val, _mem_val),
+            "%d%%" % _brightness,
+        ]
+        zw = img.width / 6
+        for i, label in enumerate(knob_labels):
             x0 = i * zw
             if i:
                 d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
-            # Recommended zone: concentric Spirited Rose sweep instead of a hard
-            # blink. Pulses continuously in sync with the matching key's meadow
-            # pulse (1.6s period), so eye + key read as one cue.
-            if i == rec_zone:
-                _anim_sweep_rects(d, _anim_phase / 1.6, GHIBLI["rose"],
-                                  (12, 13, 18),
-                                  (x0 + 2, 46, x0 + zw - 2, img.height - 1))
-                lbl_fill = (25, 20, 25)             # dark text on lit sweep
-            else:
-                lbl_fill = txt_c
-            if _cinema_mode:
-                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    d.text((x0 + zw / 2 + dx, 70 + dy), label,
-                           font=ImageFont.truetype(FONT_B, 26), anchor="mm", fill=(0, 0, 0))
-            d.text((x0 + zw / 2, 70), label, font=ImageFont.truetype(FONT_B, 26),
-                   anchor="mm", fill=lbl_fill)
+            # Zone 4: load bar
+            if i == 3:
+                bw = int((zw - 16) * min(load1 / 8.0, 1.0))
+                d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
+            # Zone 5: cpu + mem bars side by side
+            if i == 4:
+                half = (zw - 20) / 2
+                bw_cpu = int(half * (_cpu_val / 100.0))
+                bw_mem = int(half * (_mem_val / 100.0))
+                d.rectangle([x0 + 8, 48, x0 + 8 + bw_cpu, 56], fill=(180, 140, 60))
+                d.rectangle([x0 + 12 + half, 48, x0 + 12 + half + bw_mem, 56], fill=(140, 100, 180))
+            # Zone 6: brightness bar
+            if i == 5:
+                bw = int((zw - 16) * (_brightness / 100.0))
+                d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
+            d.text((x0 + zw / 2, 72), label, font=ImageFont.truetype(FONT_B, 18),
+                   anchor="mm", fill=txt_c)
     native = PILHelper.to_native_touchscreen_format(deck, img)
     # Dedup like animate_active_keys does per-key: the touchscreen image is far
     # bigger than a key icon, so pushing it unconditionally every 20fps tick
@@ -1739,7 +2000,14 @@ def render_touchscreen(deck):
     if native == _touch_frame_cache:
         return
     _touch_frame_cache = native
-    deck.set_touchscreen_image(native, 0, 0, img.width, img.height)
+    global _ts_send_logged
+    try:
+        deck.set_touchscreen_image(native, 0, 0, img.width, img.height)
+        if not _ts_send_logged:
+            log("set_touchscreen_image OK: %d bytes, geom=%dx%d", len(native), img.width, img.height)
+            _ts_send_logged = True
+    except Exception as e:
+        log("set_touchscreen_image ERROR: %s", e)
 
 def repaint(deck):
     if _ui_mode == "tool":
@@ -1822,11 +2090,12 @@ def on_key(deck, key, pressed):
 
 @_safe_callback
 def on_key_xl(deck, key, pressed):
-    """XL key handler — everything the Plus put on dials/touchscreen lives on
-    keys here. Board slots (0-23) select on first tap and toggle the session's
-    window on a second tap of the active one, exactly like the Plus. Row 4:
-    24/25 = select prev/next, 26-29 = reply zones (honoring the live _reply_set),
-    30 = cycle reply set, 31 = new session (or Cancel while a menu is open)."""
+    """XL+ key handler — everything the Plus put on dials/touchscreen lives on
+    keys here. Board slots (XL_BOARD_SLOTS = row 0 + rows 2-3) select on first
+    tap and toggle the session's window on a second tap of the active one, exactly
+    like the Plus. Row 1 (keys 9-17): 9-12 = reply zones 1/2/3/Go (live
+    _reply_set), 13 = Next (dismiss), 14/15 = select prev/next, 16 = cycle reply
+    set, 17 = new session (or Cancel while a menu is open)."""
     if not pressed:
         return
     if _wake_and_note(deck):
@@ -1850,25 +2119,45 @@ def on_key_xl(deck, key, pressed):
             else:
                 close_menu()
         repaint(deck); return
-    # board mode — action row first, then board slots.
+    # board mode — row-1 action strip first, then board slots.
+    if XL_REPLY0 <= key <= XL_REPLY0 + 3:
+        # allow_dismiss=False: slot 2 sends a real "3" (Next has its own key).
+        _bg(act_reply, key - XL_REPLY0, _reply_set, False); return
+    if key == XL_NEXT:
+        s = active_session()
+        if s:
+            dismiss_session(s); _advance_focus(s["id"])
+        return
     if key == XL_SEL_PREV:
         select_delta(-1); return                    # state-only; 20fps loop repaints
     if key == XL_SEL_NEXT:
         select_delta(1); return
-    if XL_REPLY0 <= key <= XL_REPLY0 + 3:
-        _bg(act_reply, key - XL_REPLY0); return     # uses the live _reply_set
     if key == XL_CYCLE:
         _reply_set = (_reply_set + 1) % len(REPLY_SETS)
         log("reply set -> %d (%s)", _reply_set, REPLY_SETS[_reply_set][0]); return
     if key == XL_NEW:
         open_menu("tool"); repaint(deck); return
-    if key >= XL_BOARD_KEYS:
-        return                                      # gap keys (none in this layout)
+    if XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
+        label, keys = XL_QUICK[key - XL_QUICK0]
+        s = active_session()
+        if not s:
+            log("quick '%s': no active session", label); return
+        if keys[0] == "!voice":
+            _bg(_voice_toggle, s); return
+        if keys[0].startswith("!"):
+            _run(["bash", "-lc", keys[0][1:]]); return
+        log("quick '%s' -> %s", label, s.get("title"))
+        tmux_send(s, keys)
+        _advance_focus(s["id"])
+        return
+    j = XL_SLOT_OF_KEY.get(key)
+    if j is None:
+        return                                      # gap key (none in this layout)
     with _lock:
-        sess = list(_sessions[:XL_BOARD_KEYS])
+        sess = list(_sessions[:len(XL_BOARD_SLOTS)])
         active = _active_id
-    if key < len(sess):
-        s = sess[key]
+    if j < len(sess):
+        s = sess[j]
         if s["id"] == active:
             _bg(toggle_or_place, deck, s)
         else:
@@ -1881,14 +2170,17 @@ def on_key_xl(deck, key, pressed):
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
+    log("on_dial: dial=%d event=%s value=%s active_id=%s", dial, event, value, _active_id[:8] if _active_id else None)
     global _brightness, _reply_set, _page
     if event == DialEventType.TURN:
         if _ui_mode != "board":
             return
-        if dial == 0:                                   # knob 1: select session
+        if dial == 0:                                   # knob 1: move selection cursor across sessions
             # State-only update: the 20fps main loop renders the new selector
             # within ~50ms. Calling repaint() here would race the main render
             # thread (both pushing frames concurrently → glitch/flicker).
+            global _manual_until
+            _manual_until = time.monotonic() + 5.0     # suppress auto-focus for 5s
             select_delta(1 if value > 0 else -1)
         elif dial == 1:                                 # knob 2: cycle reply set
             _reply_set = (_reply_set + (1 if value > 0 else -1)) % len(REPLY_SETS)
@@ -1896,15 +2188,18 @@ def on_dial(deck, dial, event, value):
         elif dial == 2:                                 # knob 3: page the top row
             _page = (_page + (1 if value > 0 else -1)) % MAX_PAGES
             log("page -> %d/%d (manual)", _page + 1, MAX_PAGES)
-        elif dial == 3:                                 # knob 4: brightness
+        elif dial == 3:                                 # knob 4: unassigned
+            pass
+        elif dial == 4:                                 # knob 5: unassigned
+            pass
+        elif dial == 5:                                 # knob 6: brightness (dimmer)
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             deck.set_brightness(_brightness)
+            log("knob 6 (brightness) -> %d", _brightness)
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
-        # Knob N push = reply slot N. Knob 3 (dial 2) is "Next" on the select
-        # set (dismiss the gate); on other reply sets it sends that slot's keys.
-        # ponytail: focus-terminal that lived on dial 2 was dropped so knob 3
-        # always matches its "Next" label — upgrade: long-press dial 2 if needed.
-        _bg(act_reply, dial)
+        # Knob N push = reply slot N (knobs 1-4 only; knobs 5-6 have no reply slot).
+        if dial < 4:
+            _bg(act_reply, dial)
 
 @_safe_callback
 def on_touch(deck, evt, value):
@@ -1913,7 +2208,7 @@ def on_touch(deck, evt, value):
     if _ui_mode != "board" or evt not in (TouchscreenEventType.SHORT, TouchscreenEventType.LONG):
         return
     x = (value or {}).get("x", 0)
-    zone = max(0, min(3, int(x // (800 / 4))))
+    zone = max(0, min(3, int(x // (deck.TOUCHSCREEN_PIXEL_WIDTH / 4))))
     _bg(act_reply, zone)
 
 # ---- main -----------------------------------------------------------------
@@ -1923,7 +2218,7 @@ def main():
     # Retry HID enumeration+open with backoff (device may not be ready at boot).
     # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
     # settled the HID node yet; this keeps the process alive instead.
-    global IS_XL, _cancel_key, _cinema_mode
+    global IS_XL, HAS_DIALS, _cancel_key, _cinema_mode
     _plus = None
     for _attempt in range(30):
         try:
@@ -1946,15 +2241,24 @@ def main():
     if not plus:
         log("no Stream Deck found"); sys.exit(1)
     IS_XL = "XL" in plus.deck_type()
+    HAS_DIALS = "+" in plus.deck_type()          # XL+ and Plus have dials+touch
     plus.reset(); plus.set_brightness(_brightness)
     if IS_XL:
-        # XL: all input on keys. Cinema scene (built for the Plus 4x2) is off;
-        # the menu-cancel key moves to the last key (31). No dials/touchscreen.
-        _cinema_mode = False
+        # XL: all input on keys; menu-cancel key moves to the last key (31).
+        # Cinema is ON — the Ghibli scene now spans the XL's full 8x4 grid via
+        # _animate_cinema_xl (the Plus's 4x2 slicer was the only reason it was
+        # off before). No dials/touchscreen.
+        _cinema_mode = True
         _cancel_key = XL_NEW
         plus.set_key_callback(on_key_xl)
-        log("Stream Deck XL detected (%s, %d keys) — key-only layout",
-            plus.deck_type(), plus.key_count())
+        if HAS_DIALS:
+            plus.set_dial_callback(on_dial)
+            plus.set_touchscreen_callback(on_touch)
+            log("Stream Deck XL+ detected (%s, %d keys + dials) — hybrid layout",
+                plus.deck_type(), plus.key_count())
+        else:
+            log("Stream Deck XL detected (%s, %d keys) — key-only layout",
+                plus.deck_type(), plus.key_count())
     else:
         plus.set_key_callback(on_key)
         plus.set_dial_callback(on_dial)
@@ -1968,6 +2272,7 @@ def main():
     _active_id = _sessions[0]["id"] if _sessions else None
     _activity = {s["id"]: session_activity(s) for s in _sessions[:MAX_SESSIONS]}
     _last_input = time.monotonic()
+    _bg(_host_status_loop)
     repaint(plus)
     log("session board ready: %d sessions, tools=%s", len(_sessions),
         [t[0] for t in TOOLS])
@@ -2079,7 +2384,7 @@ def main():
                 # (e.g. a live menu) indefinitely. The strict `choice_rank <
                 # cur_rank` inequality below is already the anti-jitter guard
                 # the comment describes; `manual` added nothing but the bug.
-                if choice_id and _ui_mode == "board":
+                if choice_id and _ui_mode == "board" and time.monotonic() > _manual_until:
                     cur_needs = act.get(_active_id, (None, False))[1]
                     cur_rank = URG_RANK.get(urg.get(_active_id), 99) if cur_needs else 99
                     choice_rank = URG_RANK.get(urg.get(choice_id), 99)

@@ -403,10 +403,35 @@ def slice_tiles(canvas_img, tile_w=120, tile_h=120):
     return tiles
 
 
+# ---- Stream Deck XL+ canvas (9 cols x 4 rows of 96px keys) ------------------
+# The XL+ has no touchscreen, so the whole 36-key grid becomes the panorama.
+# 864x384 (9:4 = 2.25:1) vs the 120x60 scene's 2:1 stretches the siege ~12%
+# wider — imperceptible for the pixel-art scene, and it spans the full wall.
+XL_TILE = 96
+XL_COLS, XL_ROWS = 9, 4
+CANVAS_XL_W, CANVAS_XL_H = XL_TILE * XL_COLS, XL_TILE * XL_ROWS  # 864 x 384
+
+
+def scale_to_canvas_xl(scene_img):
+    """Scale a 120x60 scene to the full 768x384 XL key canvas with NEAREST."""
+    return scene_img.resize((CANVAS_XL_W, CANVAS_XL_H), Image.NEAREST)
+
+
+def slice_tiles_xl(canvas_img):
+    """Slice the 768x384 XL canvas into 32 key tiles (8 cols x 4 rows), returned
+    in key-index (row-major) order: key index = row*8 + col."""
+    tiles = []
+    for i in range(XL_COLS * XL_ROWS):
+        row, col = i // XL_COLS, i % XL_COLS
+        tiles.append(canvas_img.crop((col * XL_TILE, row * XL_TILE,
+                                      (col + 1) * XL_TILE, (row + 1) * XL_TILE)))
+    return tiles
+
+
 def render_touchscreen_banner(phase):
-    """Render the 800x100 touchscreen as a Ghibli panorama banner.
+    """Render the 1200x100 touchscreen as a Ghibli panorama banner.
     Shows distant mountains + scrolling cloud strip + subtle title text."""
-    TW, TH = 800, 100
+    TW, TH = 1200, 100
     img = Image.new("RGB", (TW, TH), PAL["sky_zenith"])
     draw = ImageDraw.Draw(img)
 
