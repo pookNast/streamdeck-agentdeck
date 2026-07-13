@@ -82,7 +82,7 @@ REPLY_SETS = [
     ("select", [("1", ["Up", "Enter"]),
                 ("2", ["Down", "Enter"]),
                 ("3", ["Down", "Down", "Enter"]),
-                ("Go", ["Tab", "~0.5", "Enter"])]),
+                ("4", ["Tab", "~0.5", "Enter"])]),
     ("keys",   [("Esc", ["Escape"]), ("Space", ["Space"]),
                 ("S-Tab", ["BTab"]),
                 ("Voice", ["!voice"])]),
@@ -150,26 +150,29 @@ HAS_DIALS = False          # set in main(): True for XL+ and Plus (have dials + 
 # laid out Plus-style: sessions on TOP, the answer/control strip in row 1 sitting
 # directly under the session names, then overflow sessions below.
 #   row 0  (keys 0-8):   session slots
-#   row 1  (keys 9-17):  [1][2][3][Go]  [Next]  [<][>]  [Set]  [+]
-#   rows 2-3 (keys 18-35): overflow session slots
+#   row 1  (keys 9-17):  [1][2][3][4]  [·][·][·][·][·]   (keys 13-17 blank)
+#   rows 2-3 (keys 18-35): overflow session slots (keys 18-21 = quick controls)
 # So a numbered menu's answer keys are right beneath the sessions they answer
 # (the Plus stacked sessions-over-replies the same way).
+# ponytail: keys 13-17 (Next/◀/▶/Set/+) are dead — the user never used them.
+# Constants retained to document physical positions; upgrade: revive any of them
+# by re-adding its elif branch in _animate_xl / _overlay_xl_control / on_key_xl.
 XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 36))   # 23 session slots (row 0 + rows 2-3 minus quick keys)
 XL_SLOT_OF_KEY = {k: j for j, k in enumerate(XL_BOARD_SLOTS)}  # key -> session index
-XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/Go)
-XL_NEXT = 13               # dismiss the active prompt ("Next") without sending keys
-XL_SEL_PREV = 14           # select previous session (was knob 1, turn left)
-XL_SEL_NEXT = 15           # select next session (was knob 1, turn right)
-XL_CYCLE = 16              # cycle reply set (was knob 2)
-XL_NEW = 17                # new session in board mode / cancel in a menu
-XL_QUICK0 = 18             # keys 18-21: always-visible quick controls (Go, S-Tab, Voice, Esc)
+XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/4); also menu-cancel
+XL_NEXT = 13               # DEAD KEY — was "Next"/dismiss prompt; no longer rendered/handled
+XL_SEL_PREV = 14           # DEAD KEY — was select previous session
+XL_SEL_NEXT = 15           # DEAD KEY — was select next session
+XL_CYCLE = 16              # DEAD KEY — was cycle reply set
+XL_NEW = 17                # DEAD KEY — was new session / menu-cancel; cancel now on XL_REPLY0
+XL_QUICK0 = 18             # keys 18-21: always-visible quick controls (Esc, S-Tab, Voice, Go)
 XL_QUICK = [
-    ("4", ["Tab", "~0.5", "Enter"]),
+    ("Esc", ["Escape"]),
     ("S-Tab", ["BTab"]),
     ("Voice", ["!voice"]),
-    ("Esc", ["Escape"]),
+    ("Go", ["Tab", "~0.5", "Enter"]),
 ]
-_cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_NEW (17)
+_cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_REPLY0 (key 9)
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
 _pending_tool = None       # (label, command) chosen in the tool menu -> spawn new
@@ -282,7 +285,7 @@ def _forget_pane(sid):
                     del _pane_order[p]
         if changed:
             _save_pane_order()
-_reply_set = 0             # index into REPLY_SETS (cycled by Set key / knob 2); default "select" 1/2/3/Go
+_reply_set = 0             # index into REPLY_SETS (no longer cycled — Set key removed); default "select" 1/2/3/4
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
 _urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
@@ -1183,8 +1186,9 @@ def act_reply(slot, reply_set=None, allow_dismiss=True):
     """reply_set overrides which REPLY_SETS entry to use. allow_dismiss controls
     whether slot 2 of the select set means "Next" (dismiss the prompt without
     sending) — TRUE on the Plus, whose bottom row had no dedicated Next key, so
-    slot 2 doubled as it; FALSE on the XL+, which has its own XL_NEXT key, so
-    slot 2 there sends a real "3" (option-3 in a numbered menu)."""
+    slot 2 doubled as it; FALSE on the XL+, where the Next/</>/Set/+ strip was
+    removed (keys 13-17 are dead), so slot 2 there sends a real "3" (option-3
+    in a numbered menu)."""
     if reply_set is None:
         reply_set = _reply_set
     s = active_session()
@@ -1723,9 +1727,9 @@ def _animate_cinema(deck):
 
 def _render_reply_key_xl(deck, zone, rec_zone):
     """XL+ answer-strip reply key for `zone` (0-3). The XL+ has no touchscreen, so
-    the keys themselves show the live _reply_set (select = 1/2/3/Go) and the Set
-    key relabels them. No "Next" override here — dismiss has its own XL_NEXT key,
-    so the select set shows a real "3". Golden Meadow pulse on the recommended zone."""
+    the keys themselves show the live _reply_set (select = 1/2/3/4). The Set key
+    that used to cycle reply sets is gone (dead key), so the reply set stays put
+    unless cycled elsewhere. Golden Meadow pulse on the recommended zone."""
     _, zones = REPLY_SETS[_reply_set]
     label = zones[zone][0]
     img = _key_img(deck, MENU_COLOR)
@@ -1740,9 +1744,9 @@ def _render_reply_key_xl(deck, zone, rec_zone):
 
 def _animate_xl(deck):
     """XL+ board renderer (non-cinema fallback): session slots on the board keys
-    (XL_BOARD_SLOTS = row 0 + rows 2-3), and row 1 = the answer/control strip
-    (1/2/3/Go reply zones, Next, ◀/▶ select, Set cycle, + new). The
-    recommended-zone highlight only applies on the select set (_reply_set 0)."""
+    (XL_BOARD_SLOTS = row 0 + rows 2-3), and row 1 = the answer strip
+    (1/2/3/4 reply zones; keys 13-17 blank). The recommended-zone highlight only
+    applies on the select set (_reply_set 0)."""
     with _lock:
         sess = list(_sessions[:len(XL_BOARD_SLOTS)])
         active = _active_id
@@ -1758,19 +1762,9 @@ def _animate_xl(deck):
                 frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
         elif XL_REPLY0 <= i <= XL_REPLY0 + 3:
             frame = _render_reply_key_xl(deck, i - XL_REPLY0, rec_zone)
-        elif i == XL_NEXT:
-            frame = _centered(deck, MENU_COLOR, "Next", size=24, sub="drop")
-        elif i == XL_SEL_PREV:
-            frame = _centered(deck, MENU_COLOR, "◀", size=34, sub="prev")
-        elif i == XL_SEL_NEXT:
-            frame = _centered(deck, MENU_COLOR, "▶", size=34, sub="next")
-        elif i == XL_CYCLE:
-            frame = _centered(deck, MENU_COLOR, "Set", size=22, sub=REPLY_SETS[_reply_set][0])
-        elif i == XL_NEW:
-            frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
         elif XL_QUICK0 <= i < XL_QUICK0 + len(XL_QUICK):
             label, _ = XL_QUICK[i - XL_QUICK0]
-            qc = {"4": (24, 56, 100), "Esc": (60, 28, 28)}.get(label, MENU_COLOR)
+            qc = {"Go": (24, 56, 100), "Esc": (60, 28, 28)}.get(label, MENU_COLOR)
             frame = _centered(deck, qc, label, size=22)
         else:
             frame = _key_native_blank(deck)
@@ -1782,7 +1776,7 @@ def _overlay_xl_control(tile, key, rec_zone):
     """Overlay an XL+ row-1 control (keys 9-17) onto its Ghibli scene tile with a
     4-way drop-shadow so the panorama shows through behind the label — the same
     "wash over, never replace" treatment the Plus gives its reply strip. Reply
-    zones honor the live _reply_set (select = 1/2/3/Go) and pulse Golden Meadow on
+    zones honor the live _reply_set (select = 1/2/3/4) and pulse Golden Meadow on
     the recommended zone. Returns the mutated tile."""
     sub = None
     if XL_REPLY0 <= key <= XL_REPLY0 + 3:
@@ -1793,20 +1787,10 @@ def _overlay_xl_control(tile, key, rec_zone):
             pulse = _ease_sine(_anim_phase / 1.6)
             wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
             tile = Image.blend(tile, wash, 0.25 + pulse * 0.25)
-    elif key == XL_NEXT:
-        label, sub = "Next", "drop"
-    elif key == XL_SEL_PREV:
-        label, sub = "◀", "prev"
-    elif key == XL_SEL_NEXT:
-        label, sub = "▶", "next"
-    elif key == XL_CYCLE:
-        label, sub = "Set", REPLY_SETS[_reply_set][0]
-    elif key == XL_NEW:
-        label, sub = "+", "new"
     elif XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
         label, sub = XL_QUICK[key - XL_QUICK0][0], None
     else:
-        label = ""
+        label = ""   # keys 13-17 (dead) and any non-action key: blank tile
     d = ImageDraw.Draw(tile)
     f = ImageFont.truetype(FONT_B, 26)
     cx, cy = tile.width / 2, tile.height / 2 - (7 if sub else 0)
@@ -2150,9 +2134,9 @@ def on_key_xl(deck, key, pressed):
     """XL+ key handler — everything the Plus put on dials/touchscreen lives on
     keys here. Board slots (XL_BOARD_SLOTS = row 0 + rows 2-3) select on first
     tap and toggle the session's window on a second tap of the active one, exactly
-    like the Plus. Row 1 (keys 9-17): 9-12 = reply zones 1/2/3/Go (live
-    _reply_set), 13 = Next (dismiss), 14/15 = select prev/next, 16 = cycle reply
-    set, 17 = new session (or Cancel while a menu is open)."""
+    like the Plus. Row 1 (keys 9-17): 9-12 = reply zones 1/2/3/4 (live
+    _reply_set); keys 13-17 are dead (formerly Next/select/cycle/new). While a
+    menu is open, key 9 (XL_REPLY0) acts as Cancel."""
     if not pressed:
         return
     if _wake_and_note(deck):
@@ -2176,24 +2160,10 @@ def on_key_xl(deck, key, pressed):
             else:
                 close_menu()
         repaint(deck); return
-    # board mode — row-1 action strip first, then board slots.
+    # board mode — reply strip then quick controls, then board slots.
     if XL_REPLY0 <= key <= XL_REPLY0 + 3:
-        # allow_dismiss=False: slot 2 sends a real "3" (Next has its own key).
+        # allow_dismiss=False: slot 2 sends a real "3".
         _bg(act_reply, key - XL_REPLY0, _reply_set, False); return
-    if key == XL_NEXT:
-        s = active_session()
-        if s:
-            dismiss_session(s); _advance_focus(s["id"])
-        return
-    if key == XL_SEL_PREV:
-        select_delta(-1); return                    # state-only; 20fps loop repaints
-    if key == XL_SEL_NEXT:
-        select_delta(1); return
-    if key == XL_CYCLE:
-        _reply_set = (_reply_set + 1) % len(REPLY_SETS)
-        log("reply set -> %d (%s)", _reply_set, REPLY_SETS[_reply_set][0]); return
-    if key == XL_NEW:
-        open_menu("tool"); repaint(deck); return
     if XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
         label, keys = XL_QUICK[key - XL_QUICK0]
         s = active_session()
@@ -2209,7 +2179,7 @@ def on_key_xl(deck, key, pressed):
         return
     j = XL_SLOT_OF_KEY.get(key)
     if j is None:
-        return                                      # gap key (none in this layout)
+        return                                      # dead key (13-17) or out-of-board key
     with _lock:
         sess = list(_sessions[:len(XL_BOARD_SLOTS)])
         active = _active_id
@@ -2301,12 +2271,13 @@ def main():
     HAS_DIALS = "+" in plus.deck_type()          # XL+ and Plus have dials+touch
     plus.reset(); plus.set_brightness(_brightness)
     if IS_XL:
-        # XL: all input on keys; menu-cancel key moves to the last key (31).
-        # Cinema is ON — the Ghibli scene now spans the XL's full 8x4 grid via
-        # _animate_cinema_xl (the Plus's 4x2 slicer was the only reason it was
-        # off before). No dials/touchscreen.
+        # XL: all input on keys; menu-cancel lives on the first reply key
+        # (XL_REPLY0 = key 9). Reply set's 4th label is "4" (was "Go"; the
+        # Go action moved to the always-visible quick-control strip at key 18).
+        # Cinema is ON — the Ghibli scene spans the XL's full 9x4 grid via
+        # _animate_cinema_xl. Keys 13-17 are intentionally dead.
         _cinema_mode = True
-        _cancel_key = XL_NEW
+        _cancel_key = XL_REPLY0
         plus.set_key_callback(on_key_xl)
         if HAS_DIALS:
             plus.set_dial_callback(on_dial)
