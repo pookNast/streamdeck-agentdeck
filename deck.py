@@ -289,6 +289,11 @@ _reply_set = 0             # index into REPLY_SETS (no longer cycled — Set key
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
 _urgency = {}              # session id -> "menu" | "urgent" | "patient" (blink speed + focus)
+# ponytail: separate dict rather than a 4th tuple element on _activity —
+# avoids resizing every `_activity.get(sid, (None, False, None))` call site.
+# Populated only when session_activity detects a live numbered menu; cleared
+# on every other branch. Renderers read this to label row-1 reply keys.
+_menu_opts = {}            # session id -> [str|None] * 4 (option labels for zones 0-3)
 INPUT_TIMEOUT = 10.0       # seconds before text-input sessions slow-blink
 # Animation: replaces the old _blink/_blink_slow booleans. _anim_phase is a
 # monotonic seconds accumulator incremented by ANIM each render tick; each
@@ -409,6 +414,11 @@ DONE_RE = re.compile(r"[✻✢✶✳✽⋆✺✦✷✸✹*◉●○◐◑◒◓�
 # keyword AND end with a prompt symbol, and a recent DONE_RE completion marker
 # suppresses the whole branch (checked after DONE_RE in session_activity).
 NUMBERED_RE = re.compile(r"(?m)^\s*[1-9]\.\s+\S")
+# Menu option text extractor: "1. Yes" / "2. No" / "3. Don't ask again" lines
+# near a live ❯ N. cursor. Used to surface option labels on the row-1 reply
+# keys so the user sees "1 Yes / 2 No" instead of bare digits. Captures the
+# option number (1-9) and the trailing label text.
+MENU_OPT_RE = re.compile(r"(?m)^[ \t]*([1-9])\.\s+(.+?)\s*$")
 PROMPT_KW_RE = re.compile(
     r"(?i)^\s*(?:choose|select|enter|press|pick|option|input|reply|answer|your (?:choice|selection))\b[^:?\n]{0,40}[:?]\s*$")
 
@@ -620,13 +630,37 @@ def _voice_toggle(sess):
     else:
         log("voice: empty transcript")
 
+def _extract_menu_opts(pane, cursor_match):
+    """Extract up to 4 numbered-option labels surrounding a live ❯ N. cursor.
+    Returns a 4-element list (str|None) padded with None for missing slots, or
+    None if no option lines were found. Used to label the row-1 reply keys with
+    the actual menu text ("1 Yes / 2 No") instead of bare digits. Window is
+    ±400 chars around the cursor — covers Claude Code's typical 4-option block
+    without pulling in scrollback from earlier prompts."""
+    start = max(0, cursor_match.start() - 400)
+    end = min(len(pane), cursor_match.end() + 400)
+    window = pane[start:end]
+    opts = [None, None, None, None]
+    for m in MENU_OPT_RE.finditer(window):
+        n = int(m.group(1))
+        if 1 <= n <= 4:
+            # Clip to 18 chars so "1 Don't ask again" fits the XL tile at 13pt.
+            opts[n - 1] = m.group(2).strip()[:18]
+    return opts if any(opts) else None
+
 def session_activity(sess):
     """Scrape the session's pane -> (label, needs_choice, rec_zone). label is
     the live action (e.g. 'Vibing 8m23s' while thinking, 'choose…' at a prompt)
     else the agent-deck status. needs_choice=True means blink for user input.
     rec_zone is the touchscreen zone index (0-2) Claude Code's ❯ cursor marks as
     the recommended pick in a numbered menu, else None. agent-deck can't track
-    shell-tool activity (oc-start, plain shells), so also scrape idle shells."""
+    shell-tool activity (oc-start, plain shells), so also scrape idle shells.
+
+    Side effect: populates _menu_opts[sid] when a live numbered menu is
+    detected, so reply-key renderers can label themselves with the actual
+    option text ("1 Yes / 2 No"). Cleared on every non-menu path."""
+    sid = sess.get("id")
+    _menu_opts.pop(sid, None)   # default: no menu — only the live-menu branch sets it
     st = sess.get("status", "idle")
     t = sess.get("tmux_session")
     tool = sess.get("tool", "")
@@ -672,6 +706,9 @@ def session_activity(sess):
         if not (DONE_RE.search(below) or PROMPT_RE.search(below)):
             n = int(menu_hits[-1].group(1))
             rec = (n - 1) if 1 <= n <= 2 else None
+            opts = _extract_menu_opts(pane, menu_hits[-1])
+            if opts:
+                _menu_opts[sid] = opts
             return ("choose…", True, rec)
     # Find the LAST ❯ in the footer — only the live prompt matters. Scrollback
     # ❯ lines (old commands like "❯ /clear", previous turns) sit ABOVE the live
@@ -1097,6 +1134,13 @@ def active_session():
     with _lock:
         return next((s for s in _sessions if s.get("id") == _active_id), None)
 
+def _active_menu_opts():
+    """Menu option labels for the active session (4-element list of str|None),
+    or None when the active session is not at a numbered menu. Reply-key
+    renderers call this to label row-1 keys with the actual menu text."""
+    sid = _active_id
+    return _menu_opts.get(sid) if sid else None
+
 def _host_status_loop():
     """Background ping loop: refresh _host_status every 2s."""
     while True:
@@ -1496,18 +1540,30 @@ def _render_session(deck, s, is_active):
     # Periods were chosen for seizure safety (all >= 1.0s) and to layer
     # without beating (no two periods share a common multiple under 6s).
     P = _anim_phase  # seconds, monotonic
-    if needs and urg in ("menu", "urgent"):
-        # Numbered menu / urgent text: Golden Meadow breathing, 1.6s cycle.
+    if needs and is_active and urg in ("menu", "urgent"):
+        # AUTO-FOCUSED needy session: Golden Meadow breathing, 1.6s cycle.
+        # Only one session breathes at a time — the one shown on the LCD — so
+        # the auto-focus target is unambiguous even when multiple sessions
+        # need input. Other needy sessions fall through to the static-border
+        # branch below.
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_pulse(d, img, P / 1.6, GHIBLI["meadow"], base, amp=0.55)
         text_fill = _lerp_color(TXT_BRIGHT, (25, 20, 10), _ease_sine(P / 1.6) * 0.5)
-    elif needs and urg == "patient":
-        # Auto-suggest / patient text: Spirited Rose breathing, slower (3.0s).
+    elif needs and is_active and urg == "patient":
+        # AUTO-FOCUSED patient text: Spirited Rose breathing, slower (3.0s).
         img = _key_img(deck, base)
         d = ImageDraw.Draw(img)
         _anim_pulse(d, img, P / 3.0, GHIBLI["rose"], base, amp=0.40)
         text_fill = TXT_BRIGHT
+    elif needs and not is_active:
+        # Other needy sessions: steady accent border, NO breathing. Keeps the
+        # auto-focus target unambiguous while still signalling "I also need
+        # input". 65% lerp toward the urgency accent matches the cinema path.
+        accent = GHIBLI["meadow"] if urg in ("menu", "urgent") else GHIBLI["rose"]
+        border_c = _lerp_color((20, 20, 28), accent, 0.65)
+        return _centered(deck, base, title, sub=sub, border=border_c, border_w=3,
+                         text_fill=TXT_BRIGHT)
     elif st == "error":
         # Calm alarm: Muted Coral pulse, 1.0s. Slower than a strobe by 3x.
         img = _key_img(deck, base)
@@ -1537,7 +1593,11 @@ def _render_session(deck, s, is_active):
         # stopped / unknown: static, no animation, cache-friendly.
         border = (180, 185, 195) if is_active else None
         return _centered(deck, base, title, sub=sub, border=border)
-    _render_text(d, img, title, sub=sub, text_fill=text_fill)
+    # Auto-focused needy session gets a slightly larger title (22pt vs 20pt)
+    # to match the cinema path's _overlay_title_centered treatment and make
+    # the live target pop. _render_text auto-shrinks if it doesn't fit.
+    title_size = 22 if (needs and is_active) else 20
+    _render_text(d, img, title, sub=sub, text_fill=text_fill, size=title_size)
     if is_active:
         _draw_selector(d, img)
     return PILHelper.to_native_key_format(deck, img)
@@ -1562,6 +1622,14 @@ def _overlay_title(draw, img, title):
         draw.text((4 + dx, y + dy), txt, font=f, fill=(0, 0, 0))
     draw.text((4, y), txt, font=f, fill=TXT_BANNER)
 
+def _overlay_title_centered(draw, img, title, sub=None):
+    """Title centered at 22pt for the AUTO-FOCUSED needy session — larger than
+    the top-left overlay so the active session is instantly findable on the
+    board. Optional sub-label (e.g. 'choose…', 'thinking 3m') renders below in
+    13pt regular. Uses _render_text's auto-shrink + wrap so long titles still
+    fit. Drop-shadow comes from the cinema wash, not per-pixel shadows."""
+    _render_text(draw, img, title, sub=sub, text_fill=TXT_BANNER, size=22)
+
 def _overlay_activity(draw, img, phase, label=None):
     """Real-time CLI activity row just below the top-left title: a mini
     Enchanted-Forest arc spinner (1.2s rotation, matching the per-key spinner
@@ -1581,8 +1649,10 @@ def _overlay_activity(draw, img, phase, label=None):
                  start, end, fill=(0, 0, 0), width=2)
     draw.arc(bbox, start, end, fill=color, width=2)
     if label and label != "thinking":
-        f = ImageFont.truetype(FONT_R, 11)
-        txt = label[:16]
+        # Slightly larger legibility per user request — was 11pt / 16 chars.
+        # 13pt + 18 chars still fits the XL tile alongside the 12px spinner arc.
+        f = ImageFont.truetype(FONT_R, 13)
+        txt = label[:18]
         tx, ty = cx + r + 4, cy - 7
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             draw.text((tx + dx, ty + dy), txt, font=f, fill=(0, 0, 0))
@@ -1729,17 +1799,32 @@ def _render_reply_key_xl(deck, zone, rec_zone):
     """XL+ answer-strip reply key for `zone` (0-3). The XL+ has no touchscreen, so
     the keys themselves show the live _reply_set (select = 1/2/3/4). The Set key
     that used to cycle reply sets is gone (dead key), so the reply set stays put
-    unless cycled elsewhere. Golden Meadow pulse on the recommended zone."""
+    unless cycled elsewhere. Golden Meadow pulse on the recommended zone.
+
+    When the active session has a live numbered menu (select set only), the key
+    label becomes the option text ("1 Yes / 2 No / 3 Don't ask") instead of a
+    bare digit. Zones past the menu's option count render as a dim placeholder
+    dash so it's clear they're inert."""
     _, zones = REPLY_SETS[_reply_set]
-    label = zones[zone][0]
+    opts = _active_menu_opts() if _reply_set == 0 else None
     img = _key_img(deck, MENU_COLOR)
     d = ImageDraw.Draw(img)
     if zone == rec_zone:
         _anim_pulse(d, img, _anim_phase / 1.6, GHIBLI["meadow"], MENU_COLOR, amp=0.55)
         text_fill = (25, 20, 10)
+    elif opts and not opts[zone]:
+        text_fill = (60, 65, 75)   # very dim for inert placeholder
     else:
         text_fill = TXT_DIM
-    _render_text(d, img, label, text_fill=text_fill, size=26)
+    if opts and opts[zone]:
+        # Option label may need to wrap ("3 Don't ask again") — _render_text
+        # auto-shrinks and wraps up to 3 lines.
+        label = "%d  %s" % (zone + 1, opts[zone])
+        _render_text(d, img, label, text_fill=text_fill, size=20)
+    elif opts:
+        _render_text(d, img, "–", text_fill=text_fill, size=22)
+    else:
+        _render_text(d, img, zones[zone][0], text_fill=text_fill, size=26)
     return PILHelper.to_native_key_format(deck, img)
 
 def _animate_xl(deck):
@@ -1777,13 +1862,31 @@ def _overlay_xl_control(tile, key, rec_zone):
     4-way drop-shadow so the panorama shows through behind the label — the same
     "wash over, never replace" treatment the Plus gives its reply strip. Reply
     zones honor the live _reply_set (select = 1/2/3/4) and pulse Golden Meadow on
-    the recommended zone. Returns the mutated tile."""
+    the recommended zone. Returns the mutated tile.
+
+    When the active session has a live numbered menu (select set only), the
+    label becomes the option text ("1 Yes / 3 Don't ask") and is rendered
+    through _render_text on a darkened wash so the wrapped text stays legible
+    over the panorama. Zones past the menu's option count render as a dim dash."""
     sub = None
+    use_text_renderer = False   # option-label path uses _render_text (wraps)
+    is_rec = False
+    is_placeholder = False
     if XL_REPLY0 <= key <= XL_REPLY0 + 3:
         zone = key - XL_REPLY0
         _, zones = REPLY_SETS[_reply_set]
-        label = zones[zone][0]
+        opts = _active_menu_opts() if _reply_set == 0 else None
+        if opts and opts[zone]:
+            label = "%d  %s" % (zone + 1, opts[zone])
+            use_text_renderer = True
+        elif opts:
+            label = "–"
+            use_text_renderer = True
+            is_placeholder = True
+        else:
+            label = zones[zone][0]
         if zone == rec_zone:
+            is_rec = True
             pulse = _ease_sine(_anim_phase / 1.6)
             wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
             tile = Image.blend(tile, wash, 0.25 + pulse * 0.25)
@@ -1791,6 +1894,22 @@ def _overlay_xl_control(tile, key, rec_zone):
         label, sub = XL_QUICK[key - XL_QUICK0][0], None
     else:
         label = ""   # keys 13-17 (dead) and any non-action key: blank tile
+    if use_text_renderer:
+        # Wrap-able option label needs a flatter background than drop-shadows
+        # provide over a busy panorama. Skip the extra dark wash on the rec
+        # zone (Golden Meadow already supplies contrast there).
+        if not is_rec:
+            dft = Image.new("RGB", tile.size, (10, 12, 18))
+            tile = Image.blend(tile, dft, 0.45)
+        d = ImageDraw.Draw(tile)
+        if is_rec:
+            fill = (25, 20, 10)
+        elif is_placeholder:
+            fill = (90, 95, 105)
+        else:
+            fill = TXT_BANNER
+        _render_text(d, tile, label, text_fill=fill, size=18)
+        return tile
     d = ImageDraw.Draw(tile)
     f = ImageFont.truetype(FONT_B, 26)
     cx, cy = tile.width / 2, tile.height / 2 - (7 if sub else 0)
@@ -1832,23 +1951,41 @@ def _animate_cinema_xl(deck):
             urg = _urgency.get(s["id"], "menu") if needs else None
             st = s.get("status", "idle")
             thinking = (label == "thinking" or st in ("running", "starting"))
-            # 1) Break-through wash for needy keys (before overlays stay crisp).
-            if needs:
-                accent = GHIBLI["meadow"] if urg in ("menu", "urgent") else GHIBLI["rose"]
-                period = 1.6 if urg in ("menu", "urgent") else 3.0
-                pulse = _ease_sine(_anim_phase / period)
+            # AUTO-FOCUS gating: only the currently focused session (the one on
+            # the LCD) breathes. Other needy sessions get a STATIC accent wash
+            # + steady border so they still signal "needs input" but don't
+            # compete for attention with the auto-focus target.
+            is_focus = (s["id"] == active)
+            accent = GHIBLI["meadow"] if urg in ("menu", "urgent") else GHIBLI["rose"]
+            period = 1.6 if urg in ("menu", "urgent") else 3.0
+            pulse = _ease_sine(_anim_phase / period) if needs else 0.0
+            if needs and is_focus:
+                # Breathing wash — auto-focus target only.
                 wash = Image.new("RGB", tile.size, accent)
                 tile = Image.blend(tile, wash, pulse * 0.35)
+            elif needs:
+                # Static faint wash for other needy sessions (no pulse).
+                wash = Image.new("RGB", tile.size, accent)
+                tile = Image.blend(tile, wash, 0.18)
             d = ImageDraw.Draw(tile)
-            _overlay_title(d, tile, s.get("title", "?"))
+            # Title: auto-focus gets a centered 22pt title (with sub-label),
+            # everyone else keeps the top-left 13pt overlay. The centered
+            # treatment makes the active needy session instantly findable.
+            if needs and is_focus:
+                _overlay_title_centered(d, tile, s.get("title", "?"),
+                                        sub=str(label)[:18] if label != "choose…" else "choose…")
+            else:
+                _overlay_title(d, tile, s.get("title", "?"))
             _overlay_status_dot(d, tile, st)
             if thinking:
                 _overlay_activity(d, tile, _anim_phase, label=str(label))
             if needs:
-                border_c = _lerp_color((20, 20, 28), accent, 0.65 + pulse * 0.35)
+                # Border: breathing lerp for focus, fixed 0.65 lerp otherwise.
+                border_lerp = (0.65 + pulse * 0.35) if is_focus else 0.65
+                border_c = _lerp_color((20, 20, 28), accent, border_lerp)
                 d.rectangle([2, 2, tile.width - 3, tile.height - 3],
                             outline=border_c, width=3)
-            if s["id"] == active:
+            if is_focus:
                 _draw_selector(d, tile)
         # else: empty board slot -> pure scene tile (the siege plays through).
         frame = PILHelper.to_native_key_format(deck, tile)
