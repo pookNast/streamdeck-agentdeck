@@ -417,8 +417,11 @@ NUMBERED_RE = re.compile(r"(?m)^\s*[1-9]\.\s+\S")
 # Menu option text extractor: "1. Yes" / "2. No" / "3. Don't ask again" lines
 # near a live ❯ N. cursor. Used to surface option labels on the row-1 reply
 # keys so the user sees "1 Yes / 2 No" instead of bare digits. Captures the
-# option number (1-9) and the trailing label text.
-MENU_OPT_RE = re.compile(r"(?m)^[ \t]*([1-9])\.\s+(.+?)\s*$")
+# option number (1-9) and the trailing label text. The leading [ \t❯>]*
+# accepts the cursor char itself — Claude Code puts ❯ on the DEFAULT option's
+# line ("❯ 1. Yes"), and without this the recommended option would never
+# extract (which is exactly what glm-2 was hitting — its default is option 1).
+MENU_OPT_RE = re.compile(r"(?m)^[ \t❯>]*([1-9])\.\s+(.+?)\s*$")
 PROMPT_KW_RE = re.compile(
     r"(?i)^\s*(?:choose|select|enter|press|pick|option|input|reply|answer|your (?:choice|selection))\b[^:?\n]{0,40}[:?]\s*$")
 
@@ -1973,11 +1976,15 @@ def _animate_cinema_xl(deck):
             # treatment makes the active needy session instantly findable.
             if needs and is_focus:
                 _overlay_title_centered(d, tile, s.get("title", "?"),
-                                        sub=str(label)[:18] if label != "choose…" else "choose…")
+                                        sub=str(label)[:18])
             else:
                 _overlay_title(d, tile, s.get("title", "?"))
             _overlay_status_dot(d, tile, st)
-            if thinking:
+            # Skip the top-left activity overlay when the centered title is
+            # already showing the activity as a sub-label — otherwise the
+            # auto-focused needy session renders "choose…" twice (once in the
+            # top-left spinner row, once beneath the centered title).
+            if thinking and not (needs and is_focus):
                 _overlay_activity(d, tile, _anim_phase, label=str(label))
             if needs:
                 # Border: breathing lerp for focus, fixed 0.65 lerp otherwise.
