@@ -160,17 +160,51 @@ HAS_DIALS = False          # set in main(): True for XL+ and Plus (have dials + 
 XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 36))   # 23 session slots (row 0 + rows 2-3 minus quick keys)
 XL_SLOT_OF_KEY = {k: j for j, k in enumerate(XL_BOARD_SLOTS)}  # key -> session index
 XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/4); also menu-cancel
-XL_NEXT = 13               # DEAD KEY — was "Next"/dismiss prompt; no longer rendered/handled
-XL_SEL_PREV = 14           # DEAD KEY — was select previous session
-XL_SEL_NEXT = 15           # DEAD KEY — was select next session
-XL_CYCLE = 16              # DEAD KEY — was cycle reply set
-XL_NEW = 17                # DEAD KEY — was new session / menu-cancel; cancel now on XL_REPLY0
+XL_NEXT = 13               # R1 C4 — was "Next"/dismiss; now /commit (M-SD2)
+XL_SEL_PREV = 14           # R1 C5 — was select previous; now /resume (M-SD2)
+XL_SEL_NEXT = 15           # R1 C6 — was select next; now /clear (M-SD2)
+XL_CYCLE = 16              # R1 C7 — was cycle reply set; now /cost (M-SD2)
+XL_NEW = 17                # R1 C8 — was new session; now /super-worker (M-SD2)
+# M-SD1: control-key spec — spec-driven dispatch for the XL quick/control keys.
+# Each spec is a dict with "label", "class", and class-specific payload keys.
+# Dispatched by _fire_action(). Long-press behavior layers on top in M-SD3.
+#
+# Classes:
+#   "tmux_keys"     — send tmux key sequence (existing XL_QUICK behavior)
+#   "slash_command" — fire "/<cmd>" + Enter to the session (used by M-SD2)
+#   "shell"         — run `bash -lc "<cmd>` (was the "!<cmd>" prefix convention)
+#   "voice"         — toggle voice input (was the "!voice" special case)
+#
+# This refactor preserves XL_QUICK's existing behavior verbatim — the old
+# ("!voice"/"!<cmd>"/tmux-keys) pseudo-spec collapses into explicit classes.
+# ponytail: dict-of-kwargs over a dataclass — YAGNI; the spec never escapes
+# this module. Defined before any consumer (XL_SLASH/XL_QUICK) since the
+# list literals evaluate _ctrl at import time. Upgrade: dataclass if a 2nd consumer appears.
+def _ctrl(label, cls, **payload):
+    spec = {"label": label, "class": cls}
+    spec.update(payload)
+    return spec
+
+XL_SLASH0 = XL_NEXT        # first key of the slash-command row (R1 C4-C8)
+# M-SD2: 5 slash-command keys filling the former dead row 1 cols 4-8. Each
+# fires "/<cmd>" + Enter to the active session via the slash_command spec
+# class wired in M-SD1. cmd is stored without the leading "/" — _fire_action
+# adds it. ponytail: no tool filter — if the active session is a shell
+# (oc-start) the slash either hits a binary in PATH or no-ops with "command
+# not found"; upgrade: gate by sess["tool"] in (claude, glm, gpt) if it bites.
+XL_SLASH = [
+    _ctrl("/commit",        "slash_command", cmd="commit"),
+    _ctrl("/resume",        "slash_command", cmd="resume"),
+    _ctrl("/clear",         "slash_command", cmd="clear"),
+    _ctrl("/cost",          "slash_command", cmd="cost"),
+    _ctrl("/super-worker",  "slash_command", cmd="super-worker"),
+]
 XL_QUICK0 = 18             # keys 18-21: always-visible quick controls (Esc, S-Tab, Voice, Go)
 XL_QUICK = [
-    ("Esc", ["Escape"]),
-    ("S-Tab", ["BTab"]),
-    ("Voice", ["!voice"]),
-    ("Go", ["Tab", "~0.5", "Enter"]),
+    _ctrl("Esc",   "tmux_keys", keys=["Escape"]),
+    _ctrl("S-Tab", "tmux_keys", keys=["BTab"]),
+    _ctrl("Voice", "voice"),
+    _ctrl("Go",    "tmux_keys", keys=["Tab", "~0.5", "Enter"]),
 ]
 _cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_REPLY0 (key 9)
 _brightness = 60
@@ -346,7 +380,7 @@ _auto_restart_at = {}      # session id -> monotonic time the next retry is allo
 # ponytail: hardcoded probes — upgrade: derive from tool command when it grows.
 TOOL_READY = {
     "glm":    'test -f /opt/claude-glm/secrets && . /opt/claude-glm/secrets && test -n "$ZAI_API_KEY"',
-    "local":  'curl -sf --max-time 3 http://localhost:11434/health >/dev/null 2>&1 || pgrep -x ollama >/dev/null 2>&1',
+    "local":  'curl -sf --max-time 3 http://localhost:11436/health >/dev/null 2>&1 || pgrep -x ollama >/dev/null 2>&1',
     "claude": 'which claude >/dev/null 2>&1',
     "gpt":    'which claude >/dev/null 2>&1',
 }
@@ -611,6 +645,33 @@ def tmux_send_text(sess, text):
         log("no tmux_session for %s", sess.get("title")); return
     _run(["tmux", "send-keys", "-t", t, "-l", text], timeout=8)
     log("send-text -> %s : %d chars", t, len(text))
+
+def _fire_action(sess, spec):
+    """Dispatch a control-key spec against `sess`. Returns True if the caller
+    should advance focus to sess (tmux/slash classes — user intent is to land
+    back in the session); False for voice/shell which don't target the pane.
+
+    M-SD1: consolidates the old ad-hoc dispatch in on_key_xl (the "!voice"
+    special case, the "!<cmd>" shell prefix, and plain tmux_keys) into a
+    spec-driven dispatcher so new control classes (slash_command in M-SD2,
+    long_press in M-SD3) can be added without touching the key handler."""
+    cls = spec.get("class")
+    if cls == "tmux_keys":
+        tmux_send(sess, spec["keys"])
+        return True
+    if cls == "slash_command":
+        # Fire "/<cmd>" as literal text, then Enter to submit.
+        tmux_send_text(sess, "/" + spec["cmd"])
+        tmux_send(sess, ["Enter"])
+        return True
+    if cls == "shell":
+        _run(["bash", "-lc", spec["cmd"]])
+        return False
+    if cls == "voice":
+        _bg(_voice_toggle, sess)
+        return False
+    log("unknown control class: %r", cls)
+    return False
 
 def _voice_toggle(sess):
     """Voice dictation via the-deck-host (mic is there). First press starts recording;
@@ -1850,8 +1911,13 @@ def _animate_xl(deck):
                 frame = _centered(deck, EMPTY_COLOR, "+", size=32, sub="new")
         elif XL_REPLY0 <= i <= XL_REPLY0 + 3:
             frame = _render_reply_key_xl(deck, i - XL_REPLY0, rec_zone)
+        elif XL_SLASH0 <= i < XL_SLASH0 + len(XL_SLASH):
+            # M-SD2: slash-command keys (R1 C4-C8). Cool blue background
+            # distinguishes them from the warm MENU_COLOR quick row below.
+            label = XL_SLASH[i - XL_SLASH0]["label"]
+            frame = _centered(deck, (28, 38, 60), label, size=18)
         elif XL_QUICK0 <= i < XL_QUICK0 + len(XL_QUICK):
-            label, _ = XL_QUICK[i - XL_QUICK0]
+            label = XL_QUICK[i - XL_QUICK0]["label"]
             qc = {"Go": (24, 56, 100), "Esc": (60, 28, 28)}.get(label, MENU_COLOR)
             frame = _centered(deck, qc, label, size=22)
         else:
@@ -1893,10 +1959,19 @@ def _overlay_xl_control(tile, key, rec_zone):
             pulse = _ease_sine(_anim_phase / 1.6)
             wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
             tile = Image.blend(tile, wash, 0.25 + pulse * 0.25)
+    elif XL_SLASH0 <= key < XL_SLASH0 + len(XL_SLASH):
+        # M-SD2: slash-command keys (R1 C4-C8). Cool blue tint matches the
+        # non-cinema (28,38,60) background; use_text_renderer auto-shrinks
+        # so "/super-worker" fits without overflow.
+        label = XL_SLASH[key - XL_SLASH0]["label"]
+        sub = None
+        use_text_renderer = True
+        tint = Image.new("RGB", tile.size, (28, 38, 60))
+        tile = Image.blend(tile, tint, 0.55)
     elif XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
-        label, sub = XL_QUICK[key - XL_QUICK0][0], None
+        label, sub = XL_QUICK[key - XL_QUICK0]["label"], None
     else:
-        label = ""   # keys 13-17 (dead) and any non-action key: blank tile
+        label = ""   # any non-action key: blank tile
     if use_text_renderer:
         # Wrap-able option label needs a flatter background than drop-shadows
         # provide over a busy panorama. Skip the extra dark wash on the rec
@@ -2304,26 +2379,33 @@ def on_key_xl(deck, key, pressed):
             else:
                 close_menu()
         repaint(deck); return
-    # board mode — reply strip then quick controls, then board slots.
+    # board mode — reply strip, slash row, quick controls, then board slots.
     if XL_REPLY0 <= key <= XL_REPLY0 + 3:
         # allow_dismiss=False: slot 2 sends a real "3".
         _bg(act_reply, key - XL_REPLY0, _reply_set, False); return
-    if XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
-        label, keys = XL_QUICK[key - XL_QUICK0]
+    if XL_SLASH0 <= key < XL_SLASH0 + len(XL_SLASH):
+        # M-SD2: slash-command keys (R1 C4-C8). Fire "/<cmd>" + Enter to the
+        # active session via the shared _fire_action dispatcher.
+        spec = XL_SLASH[key - XL_SLASH0]
         s = active_session()
         if not s:
-            log("quick '%s': no active session", label); return
-        if keys[0] == "!voice":
-            _bg(_voice_toggle, s); return
-        if keys[0].startswith("!"):
-            _run(["bash", "-lc", keys[0][1:]]); return
-        log("quick '%s' -> %s", label, s.get("title"))
-        tmux_send(s, keys)
-        _advance_focus(s["id"])
+            log("slash '%s': no active session", spec["label"]); return
+        log("slash '%s' -> %s", spec["label"], s.get("title"))
+        if _fire_action(s, spec):
+            _advance_focus(s["id"])
+        return
+    if XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
+        spec = XL_QUICK[key - XL_QUICK0]
+        s = active_session()
+        if not s:
+            log("quick '%s': no active session", spec["label"]); return
+        log("quick '%s' -> %s", spec["label"], s.get("title"))
+        if _fire_action(s, spec):
+            _advance_focus(s["id"])
         return
     j = XL_SLOT_OF_KEY.get(key)
     if j is None:
-        return                                      # dead key (13-17) or out-of-board key
+        return                                      # out-of-board key
     with _lock:
         sess = list(_sessions[:len(XL_BOARD_SLOTS)])
         active = _active_id
