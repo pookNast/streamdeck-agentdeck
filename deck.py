@@ -157,7 +157,7 @@ HAS_DIALS = False          # set in main(): True for XL+ and Plus (have dials + 
 # ponytail: keys 13-17 (Next/◀/▶/Set/+) are dead — the user never used them.
 # Constants retained to document physical positions; upgrade: revive any of them
 # by re-adding its elif branch in _animate_xl / _overlay_xl_control / on_key_xl.
-XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 36))   # 23 session slots (row 0 + rows 2-3 minus quick keys)
+XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 35))   # 22 session slots (row 0 + rows 2-3 minus quick/status keys)
 XL_SLOT_OF_KEY = {k: j for j, k in enumerate(XL_BOARD_SLOTS)}  # key -> session index
 XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/4); also menu-cancel
 XL_NEXT = 13               # R1 C4 — was "Next"/dismiss; now /commit (M-SD2)
@@ -206,6 +206,7 @@ XL_QUICK = [
     _ctrl("Voice", "voice"),
     _ctrl("Go",    "tmux_keys", keys=["Tab", "~0.5", "Enter"]),
 ]
+XL_STATUS = 35           # R3 C8 — status blast key (M-SD5): opens tmux popup with homelab status
 _cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_REPLY0 (key 9)
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
@@ -1920,6 +1921,8 @@ def _animate_xl(deck):
             label = XL_QUICK[i - XL_QUICK0]["label"]
             qc = {"Go": (24, 56, 100), "Esc": (60, 28, 28)}.get(label, MENU_COLOR)
             frame = _centered(deck, qc, label, size=22)
+        elif i == XL_STATUS:
+            frame = _centered(deck, (40, 60, 50), "Status", size=16)
         else:
             frame = _key_native_blank(deck)
         if _frame_cache.get(i) != frame:
@@ -1970,6 +1973,10 @@ def _overlay_xl_control(tile, key, rec_zone):
         tile = Image.blend(tile, tint, 0.55)
     elif XL_QUICK0 <= key < XL_QUICK0 + len(XL_QUICK):
         label, sub = XL_QUICK[key - XL_QUICK0]["label"], None
+    elif key == XL_STATUS:
+        label, sub = "Status", None
+        tint = Image.new("RGB", tile.size, (40, 60, 50))
+        tile = Image.blend(tile, tint, 0.55)
     else:
         label = ""   # any non-action key: blank tile
     if use_text_renderer:
@@ -2403,6 +2410,18 @@ def _tail_agent_log():
           "journalctl --user -u streamdeck-agentdeck -f"], timeout=5)
     log("tail-log -> new pane in %s", t)
 
+def _status_blast():
+    """M-SD5: open a tmux split running ~/bin/status-blast in the active
+    session's window. Shows homelab uptime/mem/disk/services at a glance.
+    `read -p` holds the pane open until the user presses Enter."""
+    s = active_session()
+    t = (s or {}).get("tmux_session")
+    if not t:
+        log("status-blast: no active tmux session"); return
+    cmd = "bash ~/bin/status-blast; echo; read -p 'Press Enter to close...'"
+    _run(["tmux", "split-window", "-p", "40", "-t", t, cmd], timeout=5)
+    log("status-blast -> new pane in %s", t)
+
 _LONG_PRESS = {
     7:  (_toggle_cinema,  0.6),
     17: (_cycle_reply,    0.6),   # R1 C8 /super-worker long-press
@@ -2522,6 +2541,8 @@ def on_key_xl(deck, key, pressed):
         if _fire_action(s, spec):
             _advance_focus(s["id"])
         return
+    if key == XL_STATUS:
+        _status_blast(); return
     j = XL_SLOT_OF_KEY.get(key)
     if j is None:
         return                                      # out-of-board key
