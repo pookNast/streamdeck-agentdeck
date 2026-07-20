@@ -157,7 +157,7 @@ HAS_DIALS = False          # set in main(): True for XL+ and Plus (have dials + 
 # ponytail: keys 13-17 (Next/◀/▶/Set/+) are dead — the user never used them.
 # Constants retained to document physical positions; upgrade: revive any of them
 # by re-adding its elif branch in _animate_xl / _overlay_xl_control / on_key_xl.
-XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 35))   # 22 session slots (row 0 + rows 2-3 minus quick/status keys)
+XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 33))   # 20 session slots (row 0 + rows 2-3 minus quick/status/goal keys)
 XL_SLOT_OF_KEY = {k: j for j, k in enumerate(XL_BOARD_SLOTS)}  # key -> session index
 XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/4); also menu-cancel
 XL_NEXT = 13               # R1 C4 — was "Next"/dismiss; now /commit (M-SD2)
@@ -207,6 +207,11 @@ XL_QUICK = [
     _ctrl("Go",    "tmux_keys", keys=["Tab", "~0.5", "Enter"]),
 ]
 XL_STATUS = 35           # R3 C8 — status blast key (M-SD5): opens tmux popup with homelab status
+XL_GOAL0 = 33            # R3 C6 — first goal-loop key (M-SD11)
+XL_GOAL = [              # M-SD11: goal-loop lifecycle pair beside the Status key.
+    _ctrl("/goal",           "slash_command", cmd="goal"),
+    _ctrl("/goal complete",  "slash_command", cmd="goal complete"),
+]
 _cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_REPLY0 (key 9)
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
@@ -1923,6 +1928,8 @@ def _animate_xl(deck):
             frame = _centered(deck, qc, label, size=22)
         elif i == XL_STATUS:
             frame = _centered(deck, (40, 60, 50), "Status", size=16)
+        elif XL_GOAL0 <= i < XL_GOAL0 + len(XL_GOAL):
+            frame = _centered(deck, (50, 40, 60), XL_GOAL[i - XL_GOAL0]["label"], size=15)
         else:
             frame = _key_native_blank(deck)
         if _frame_cache.get(i) != frame:
@@ -1976,6 +1983,11 @@ def _overlay_xl_control(tile, key, rec_zone):
     elif key == XL_STATUS:
         label, sub = "Status", None
         tint = Image.new("RGB", tile.size, (40, 60, 50))
+        tile = Image.blend(tile, tint, 0.55)
+    elif XL_GOAL0 <= key < XL_GOAL0 + len(XL_GOAL):
+        label, sub = XL_GOAL[key - XL_GOAL0]["label"], None
+        use_text_renderer = True
+        tint = Image.new("RGB", tile.size, (50, 40, 60))
         tile = Image.blend(tile, tint, 0.55)
     else:
         label = ""   # any non-action key: blank tile
@@ -2543,6 +2555,14 @@ def on_key_xl(deck, key, pressed):
         return
     if key == XL_STATUS:
         _status_blast(); return
+    if XL_GOAL0 <= key < XL_GOAL0 + len(XL_GOAL):
+        spec = XL_GOAL[key - XL_GOAL0]
+        s = active_session()
+        if not s:
+            log("goal '%s': no active session", spec["label"]); return
+        log("goal '%s' -> %s", spec["label"], s.get("title"))
+        _fire_action(s, spec)
+        return
     j = XL_SLOT_OF_KEY.get(key)
     if j is None:
         return                                      # out-of-board key
