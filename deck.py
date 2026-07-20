@@ -2355,16 +2355,64 @@ _long_timers = {}    # key -> threading.Timer handle for the pending long-press
 
 # Keys with a long-press action. key index -> (action callable, threshold seconds).
 # M-SD3 seeds key 7 (last slot of row 0) with cinema-mode toggle — the feature
-# the module comment at line 349 described but never wired. M-SD4 will add
-# Esc/force-kill, Go/git-push, /super-worker/cycle-reply, session/log-tail here.
+# the module comment at line 349 described but never wired. M-SD4 adds:
+# key 18 (Esc) → force-kill, key 21 (Go) → git-push, key 17 (/super-worker) →
+# cycle-reply, and all other board slots → tail agentdeck log in a new pane.
 def _toggle_cinema():
     global _cinema_mode
     _cinema_mode = not _cinema_mode
     log("cinema mode -> %s (long-press key 7)", _cinema_mode)
 
+def _force_kill():
+    """SIGTERM the foreground process of the active session's tmux pane."""
+    s = active_session()
+    t = (s or {}).get("tmux_session")
+    if not t:
+        log("force-kill: no active tmux session"); return
+    r = _run(["tmux", "display-message", "-p", "-t", t, "#{pane_pid}"], timeout=5)
+    pid = (r.stdout if r and r.returncode == 0 else "").strip()
+    if not pid.isdigit():
+        log("force-kill: no pane_pid for %s", t); return
+    _run(["kill", "-TERM", pid], timeout=5)
+    log("force-kill -> %s pid=%s", t, pid)
+
+def _git_push():
+    """Send `git push origin <current-branch>` to the active session's pane.
+    ponytail: runs in the pane's own shell — git's own error handling covers
+    the non-repo case (prints 'fatal: not a git repository'). No CWD probe."""
+    s = active_session()
+    if not s:
+        log("git-push: no active session"); return
+    tmux_send_text(s, "git push origin $(git branch --show-current)")
+    tmux_send(s, ["Enter"])
+    log("git-push -> %s", s.get("title"))
+
+def _cycle_reply():
+    global _reply_set
+    _reply_set = (_reply_set + 1) % len(REPLY_SETS)
+    log("reply set -> %d %s (long-press)", _reply_set, REPLY_SETS[_reply_set][0])
+
+def _tail_agent_log():
+    """Open a 30%-height tmux pane tailing the agentdeck journal in the active
+    session's window. Useful for debugging render/input issues on the fly."""
+    s = active_session()
+    t = (s or {}).get("tmux_session")
+    if not t:
+        log("tail-log: no active tmux session"); return
+    _run(["tmux", "split-window", "-p", "30", "-t", t,
+          "journalctl --user -u streamdeck-agentdeck -f"], timeout=5)
+    log("tail-log -> new pane in %s", t)
+
 _LONG_PRESS = {
-    7: (_toggle_cinema, 0.6),
+    7:  (_toggle_cinema,  0.6),
+    17: (_cycle_reply,    0.6),   # R1 C8 /super-worker long-press
+    18: (_force_kill,     0.6),   # R2 C0 Esc long-press
+    21: (_git_push,       0.6),   # R2 C3 Go long-press
 }
+# M-SD4: all board slots except key 7 (cinema toggle) get tail-log on long-press.
+for _k in XL_BOARD_SLOTS:
+    if _k not in _LONG_PRESS:
+        _LONG_PRESS[_k] = (_tail_agent_log, 0.6)
 
 def _track_press(key, pressed):
     """M-SD3: long-press tracker. Call on BOTH edges for every key event.
