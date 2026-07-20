@@ -2193,38 +2193,54 @@ def render_touchscreen(deck):
                        font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
         d.text((img.width - 12, 8), _timestr,
                font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=txt_c)
-        # Change 7 — agent heartbeat pulses: up to MAX_SESSIONS dots at y=28,
-        # leftmost = active. pulse phase reuses the existing _anim_phase global
-        # so all heartbeats breathe in sync with the rest of the cinema animation.
-        with _lock:
-            sess_snapshot = list(_sessions[:MAX_SESSIONS])
-            active = _active_id
-        for i, s in enumerate(sess_snapshot):
-            sid = s["id"]; st = s.get("status", "idle")
-            base = STATE_COLOR.get(st, (40, 42, 50))
-            if st in ("running", "starting"):
-                # breath: scale 0.5..1.0 over 1.6s (matches the meadow-pulse period)
-                b = 0.5 + 0.5 * (0.5 + 0.5 * math.sin(_anim_phase / 1.6 * 2 * math.pi))
-                fill = tuple(int(c * b + 20 * (1 - b)) for c in base)
-            elif st == "error":
-                fill = (200, 60, 60)                       # steady red
-            elif st == "done":
-                fill = (40, 180, 80)                       # steady green
-            else:                                          # idle / unknown
-                fill = tuple(int(c * 0.4) for c in base)   # dim flat
-            x = 16 + i * 12
-            d.ellipse([x, 28, x + 8, 36], fill=fill)
-            if sid == active:
-                d.rectangle([x - 1, 27, x + 9, 37], outline=(220, 220, 220))  # active ring
-        # Change 6b — SSH host health dots at y=30, positioned to the right of
-        # the agent heartbeat dots.
-        _hosts = ["the-deck-host", "server-host", "nas-host", "git-host"]
-        with _host_status_lock:
-            states = [_host_status[h] for h in _hosts]
-        _host_x0 = 16 + len(sess_snapshot) * 12 + 8
-        for i, up in enumerate(states):
-            color = (40, 180, 80) if up else (200, 60, 60)
-            d.ellipse([_host_x0 + i * 14, 30, _host_x0 + 8 + i * 14, 38], fill=color)
+        # M-SD8: reply-preview strip — when the active session has a live menu,
+        # show the 4 options on the LCD at y=28-42 so the user can read them
+        # before glancing at the physical keys. Replaces the heartbeat + host
+        # dots row for the duration of the menu (dots return when menu closes).
+        _opts = _active_menu_opts()
+        if _opts:
+            ow = img.width / 4
+            for i, opt in enumerate(_opts):
+                x0 = int(i * ow)
+                num = "%d" % (i + 1)
+                label = "%s  %s" % (num, opt[:24]) if opt else "%s  —" % num
+                color = (95, 200, 140) if opt else (60, 60, 60)
+                f = ImageFont.truetype(FONT_R, 14)
+                if _cinema_mode:
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        d.text((x0 + 10 + dx, 28 + dy), label, font=f, fill=(0, 0, 0))
+                d.text((x0 + 10, 28), label, font=f, fill=color)
+        else:
+            # Change 7 — agent heartbeat pulses: up to MAX_SESSIONS dots at y=28,
+            # leftmost = active. pulse phase reuses the existing _anim_phase global
+            # so all heartbeats breathe in sync with the rest of the cinema animation.
+            with _lock:
+                sess_snapshot = list(_sessions[:MAX_SESSIONS])
+                active = _active_id
+            for i, s in enumerate(sess_snapshot):
+                sid = s["id"]; st = s.get("status", "idle")
+                base = STATE_COLOR.get(st, (40, 42, 50))
+                if st in ("running", "starting"):
+                    b = 0.5 + 0.5 * (0.5 + 0.5 * math.sin(_anim_phase / 1.6 * 2 * math.pi))
+                    fill = tuple(int(c * b + 20 * (1 - b)) for c in base)
+                elif st == "error":
+                    fill = (200, 60, 60)
+                elif st == "done":
+                    fill = (40, 180, 80)
+                else:
+                    fill = tuple(int(c * 0.4) for c in base)
+                x = 16 + i * 12
+                d.ellipse([x, 28, x + 8, 36], fill=fill)
+                if sid == active:
+                    d.rectangle([x - 1, 27, x + 9, 37], outline=(220, 220, 220))
+            # Change 6b — SSH host health dots at y=30.
+            _hosts = ["the-deck-host", "server-host", "nas-host", "git-host"]
+            with _host_status_lock:
+                states = [_host_status[h] for h in _hosts]
+            _host_x0 = 16 + len(sess_snapshot) * 12 + 8
+            for i, up in enumerate(states):
+                color = (40, 180, 80) if up else (200, 60, 60)
+                d.ellipse([_host_x0 + i * 14, 30, _host_x0 + 8 + i * 14, 38], fill=color)
         # Load avg read once per frame — used in zone 4 below.
         try:
             with open("/proc/loadavg") as _f:
