@@ -2504,11 +2504,22 @@ def _cycle_tool():
     tmux_send(s, ["Enter"])
     log("tool-swap %s -> %s in %s", cur, nxt, s.get("title"))
 
+def _manual_prune():
+    """M-SD7: manually invoke _prune_dead to catch zombie panes that survived
+    the automatic sweep. No-ops (with a log line) when nothing is pruned."""
+    before = _prune_dead(fetch_sessions())
+    n = len(before)
+    if n:
+        log("manual-prune: %d session(s) remain after sweep" % n)
+    else:
+        log("manual-prune: nothing to prune")
+
 _LONG_PRESS = {
     7:  (_toggle_cinema,  0.6),
     17: (_cycle_reply,    0.6),   # R1 C8 /super-worker long-press
     18: (_force_kill,     0.6),   # R2 C0 Esc long-press
     21: (_git_push,       0.6),   # R2 C3 Go long-press
+    35: (_manual_prune,   0.6),   # R3 C8 Status long-press (M-SD7)
 }
 # M-SD4: all board slots except key 7 (cinema toggle) get tail-log on long-press.
 for _k in XL_BOARD_SLOTS:
