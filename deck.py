@@ -157,7 +157,7 @@ HAS_DIALS = False          # set in main(): True for XL+ and Plus (have dials + 
 # ponytail: keys 13-17 (Next/◀/▶/Set/+) are dead — the user never used them.
 # Constants retained to document physical positions; upgrade: revive any of them
 # by re-adding its elif branch in _animate_xl / _overlay_xl_control / on_key_xl.
-XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 33))   # 20 session slots (row 0 + rows 2-3 minus quick/status/goal keys)
+XL_BOARD_SLOTS = list(range(0, 9)) + list(range(22, 32))   # 19 session slots (row 0 + rows 2-3 minus quick/status/goal/tool keys)
 XL_SLOT_OF_KEY = {k: j for j, k in enumerate(XL_BOARD_SLOTS)}  # key -> session index
 XL_REPLY0 = 9              # keys 9-12: reply zones 0-3 (live reply set; select = 1/2/3/4); also menu-cancel
 XL_NEXT = 13               # R1 C4 — was "Next"/dismiss; now /commit (M-SD2)
@@ -212,6 +212,7 @@ XL_GOAL = [              # M-SD11: goal-loop lifecycle pair beside the Status ke
     _ctrl("/goal",           "slash_command", cmd="goal"),
     _ctrl("/goal complete",  "slash_command", cmd="goal complete"),
 ]
+XL_TOOL_SWAP = 32        # R3 C5 — cycle focused session's tool (M-SD6)
 _cancel_key = CANCEL_KEY   # menu-cancel key; XL sets this to XL_REPLY0 (key 9)
 _brightness = 60
 _ui_mode = "board"         # board | tool | place
@@ -1930,6 +1931,8 @@ def _animate_xl(deck):
             frame = _centered(deck, (40, 60, 50), "Status", size=16)
         elif XL_GOAL0 <= i < XL_GOAL0 + len(XL_GOAL):
             frame = _centered(deck, (50, 40, 60), XL_GOAL[i - XL_GOAL0]["label"], size=15)
+        elif i == XL_TOOL_SWAP:
+            frame = _centered(deck, (60, 50, 30), "Swap", size=18)
         else:
             frame = _key_native_blank(deck)
         if _frame_cache.get(i) != frame:
@@ -1988,6 +1991,10 @@ def _overlay_xl_control(tile, key, rec_zone):
         label, sub = XL_GOAL[key - XL_GOAL0]["label"], None
         use_text_renderer = True
         tint = Image.new("RGB", tile.size, (50, 40, 60))
+        tile = Image.blend(tile, tint, 0.55)
+    elif key == XL_TOOL_SWAP:
+        label, sub = "Swap", None
+        tint = Image.new("RGB", tile.size, (60, 50, 30))
         tile = Image.blend(tile, tint, 0.55)
     else:
         label = ""   # any non-action key: blank tile
@@ -2193,6 +2200,19 @@ def render_touchscreen(deck):
                        font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
         d.text((img.width - 12, 8), _timestr,
                font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=txt_c)
+        # M-SD10: needy-count badge — shows "⚠ N waiting" when >1 session needs
+        # input, so the breathing pulse on a single key isn't the only signal.
+        # Hidden when count ≤ 1 (no noise during normal single-session use).
+        with _lock:
+            _needy = sum(1 for s in _sessions if s["id"] in _urgency)
+        if _needy > 1:
+            _badge = "\u26a0 %d waiting" % _needy
+            _bx = img.width - 135
+            _bf = ImageFont.truetype(FONT_R, 14)
+            if _cinema_mode:
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    d.text((_bx + dx, 9 + dy), _badge, font=_bf, anchor="ra", fill=(0, 0, 0))
+            d.text((_bx, 9), _badge, font=_bf, anchor="ra", fill=(220, 180, 60))
         # M-SD8: reply-preview strip — when the active session has a live menu,
         # show the 4 options on the LCD at y=28-42 so the user can read them
         # before glancing at the physical keys. Replaces the heartbeat + host
@@ -2450,6 +2470,40 @@ def _status_blast():
     _run(["tmux", "split-window", "-p", "40", "-t", t, cmd], timeout=5)
     log("status-blast -> new pane in %s", t)
 
+# M-SD6: tool swap — cycle the focused session's CLI tool.
+_TOOL_CYCLE = ["claude", "glm", "gpt", "local"]
+_TOOL_CMDS = {t: c for t, c in [(l, _remote(cmd)) for l, cmd in
+    [("claude", "claude"), ("glm", "claude-glm"), ("gpt", "claude-gpt"), ("local", "oc-start")]]}
+_tool_swap_at = {}  # session id -> monotonic ts of last swap (10s cooldown)
+
+def _cycle_tool():
+    """M-SD6: cycle the focused session's tool claude→glm→gpt→local→claude.
+    Sends Ctrl-C to kill the current CLI, then launches the next tool in the
+    same tmux pane. 10s cooldown prevents rapid-cycle thrash.
+    ponytail: Ctrl-C + relaunch over kill+respawn — preserves pane/window
+    without D-Bus gymnastics. Upgrade: proper _close_session + spawn if
+    pane recycling proves unreliable."""
+    s = active_session()
+    if not s:
+        log("tool-swap: no active session"); return
+    sid = s["id"]
+    now = time.monotonic()
+    if now - _tool_swap_at.get(sid, 0) < 10.0:
+        log("tool-swap: cooldown for %s", s.get("title")); return
+    _tool_swap_at[sid] = now
+    cur = s.get("tool", "claude")
+    try:
+        idx = _TOOL_CYCLE.index(cur)
+    except ValueError:
+        idx = 0
+    nxt = _TOOL_CYCLE[(idx + 1) % len(_TOOL_CYCLE)]
+    cmd = _TOOL_CMDS.get(nxt, _TOOL_CMDS["claude"])
+    tmux_send(s, ["C-c"])
+    time.sleep(0.5)
+    tmux_send_text(s, cmd)
+    tmux_send(s, ["Enter"])
+    log("tool-swap %s -> %s in %s", cur, nxt, s.get("title"))
+
 _LONG_PRESS = {
     7:  (_toggle_cinema,  0.6),
     17: (_cycle_reply,    0.6),   # R1 C8 /super-worker long-press
@@ -2579,6 +2633,8 @@ def on_key_xl(deck, key, pressed):
         log("goal '%s' -> %s", spec["label"], s.get("title"))
         _fire_action(s, spec)
         return
+    if key == XL_TOOL_SWAP:
+        _bg(_cycle_tool); return
     j = XL_SLOT_OF_KEY.get(key)
     if j is None:
         return                                      # out-of-board key
