@@ -2348,18 +2348,89 @@ def on_key(deck, key, pressed):
     else:
         open_menu("tool"); repaint(deck)
 
+# M-SD3: long-press detection — state + helper.
+_press_ts = {}       # key -> monotonic timestamp of key-down edge
+_long_fired = set()  # keys whose long-press action already fired (cleared on key-up)
+_long_timers = {}    # key -> threading.Timer handle for the pending long-press
+
+# Keys with a long-press action. key index -> (action callable, threshold seconds).
+# M-SD3 seeds key 7 (last slot of row 0) with cinema-mode toggle — the feature
+# the module comment at line 349 described but never wired. M-SD4 will add
+# Esc/force-kill, Go/git-push, /super-worker/cycle-reply, session/log-tail here.
+def _toggle_cinema():
+    global _cinema_mode
+    _cinema_mode = not _cinema_mode
+    log("cinema mode -> %s (long-press key 7)", _cinema_mode)
+
+_LONG_PRESS = {
+    7: (_toggle_cinema, 0.6),
+}
+
+def _track_press(key, pressed):
+    """M-SD3: long-press tracker. Call on BOTH edges for every key event.
+    Returns True to SUPPRESS the short-tap action, False to allow it.
+
+    Key-down: if the key is long-press-aware, starts a daemon timer and
+    returns True (suppress — discriminate on key-up). Otherwise returns False
+    (fire short immediately, as before M-SD3).
+
+    Key-up: cancels the pending timer. Returns False if the hold was brief
+    (short should fire now) or True if the long action already fired
+    (suppress the redundant short).
+
+    ponytail: threading.Timer over a poll-loop check — the 20fps render loop
+    shouldn't care about press timing. Daemon threads never block shutdown.
+    Upgrade: single timer wheel if concurrent holds ever matter (they won't)."""
+    now = time.monotonic()
+    if pressed:
+        _press_ts[key] = now
+        spec = _LONG_PRESS.get(key)
+        if spec is None:
+            return False
+        action, threshold = spec
+        _long_fired.discard(key)
+        def _fire():
+            _long_fired.add(key)
+            try:
+                action()
+            except Exception:
+                log.exception("long-press action failed for key %d", key)
+        t = threading.Timer(threshold, _fire)
+        t.daemon = True
+        _long_timers[key] = t
+        t.start()
+        return True
+    _press_ts.pop(key, None)
+    t = _long_timers.pop(key, None)
+    if t is not None:
+        t.cancel()
+    if key in _long_fired:
+        _long_fired.discard(key)
+        return True
+    return False
+
 @_safe_callback
 def on_key_xl(deck, key, pressed):
     """XL+ key handler — everything the Plus put on dials/touchscreen lives on
     keys here. Board slots (XL_BOARD_SLOTS = row 0 + rows 2-3) select on first
     tap and toggle the session's window on a second tap of the active one, exactly
     like the Plus. Row 1 (keys 9-17): 9-12 = reply zones 1/2/3/4 (live
-    _reply_set); keys 13-17 are dead (formerly Next/select/cycle/new). While a
-    menu is open, key 9 (XL_REPLY0) acts as Cancel."""
-    if not pressed:
-        return
-    if _wake_and_note(deck):
-        return
+    _reply_set); keys 13-17 = slash-command keys (M-SD2). While a menu is open,
+    key 9 (XL_REPLY0) acts as Cancel.
+
+    M-SD3: long-press-aware keys defer their short action to key-up so tap vs
+    hold can be discriminated. Non-long-press keys fire on key-down (instant)."""
+    if pressed:
+        if _wake_and_note(deck):
+            return                         # wake tap consumed — no timer, no dispatch
+        if _track_press(key, True):
+            return                         # long-press-aware: defer short action to key-up
+    else:
+        if _track_press(key, False):
+            return                         # long action already fired → suppress short
+        if key not in _LONG_PRESS:
+            return                         # non-long-press: handled on key-down
+        # brief tap on long-press-aware key → fall through to dispatch
     global _active_id, _pending_tool, _reply_set
     if _ui_mode == "tool":
         if key == _cancel_key:
