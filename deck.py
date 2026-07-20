@@ -2180,7 +2180,10 @@ def render_touchscreen(deck):
             st = s.get("status", "idle")
             if not _cinema_mode:
                 d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (40, 42, 50)))
-            head = "▶ {}  ·  {}".format(s.get("title", "?"), st)
+            # LCD improvement: show live activity label (e.g. "Wrangling 1m 20s")
+            # instead of the raw status ("running") when activity data is available.
+            _lbl = _activity.get(s["id"], (None,))[0]
+            head = "▶ {}  ·  {}".format(s.get("title", "?"), _lbl or st)
             sess_name = s.get("title", "?")
         else:
             head = "▶ Laputa Siege  ·  cinema" if _cinema_mode else "▶ no session selected"
@@ -2209,22 +2212,34 @@ def render_touchscreen(deck):
             _badge = "\u26a0 %d waiting" % _needy
             _bx = img.width - 135
             _bf = ImageFont.truetype(FONT_R, 14)
+            # LCD improvement: pulse the badge (1.0s period) to draw the eye.
+            _pulse = 0.5 + 0.5 * math.sin(_anim_phase / 1.0 * 2 * math.pi)
+            _bc = tuple(int(c * (0.55 + 0.45 * _pulse)) for c in (220, 180, 60))
             if _cinema_mode:
                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     d.text((_bx + dx, 9 + dy), _badge, font=_bf, anchor="ra", fill=(0, 0, 0))
-            d.text((_bx, 9), _badge, font=_bf, anchor="ra", fill=(220, 180, 60))
+            d.text((_bx, 9), _badge, font=_bf, anchor="ra", fill=_bc)
         # M-SD8: reply-preview strip — when the active session has a live menu,
         # show the 4 options on the LCD at y=28-42 so the user can read them
         # before glancing at the physical keys. Replaces the heartbeat + host
         # dots row for the duration of the menu (dots return when menu closes).
         _opts = _active_menu_opts()
         if _opts:
+            # LCD improvement: highlight the ❯ cursor option (rec_zone), not
+            # always option 1. rec_zone comes from RECO_RE parsing in
+            # session_activity — tracks which option Claude Code recommends.
+            _rec = _activity.get(_active_id, (None, False, None))[2]
             ow = img.width / 4
             for i, opt in enumerate(_opts):
                 x0 = int(i * ow)
                 num = "%d" % (i + 1)
                 label = "%s  %s" % (num, opt[:24]) if opt else "%s  —" % num
-                color = (95, 200, 140) if opt else (60, 60, 60)
+                if opt and i == _rec:
+                    color = (95, 220, 140)    # cursor-recommended: bright green
+                elif opt:
+                    color = (140, 180, 200)   # other valid options: muted blue
+                else:
+                    color = (60, 60, 60)      # empty zone: dim
                 f = ImageFont.truetype(FONT_R, 14)
                 if _cinema_mode:
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
