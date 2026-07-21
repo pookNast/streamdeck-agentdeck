@@ -19,7 +19,7 @@ Config = the TOOLS / PLACEMENTS / REPLY_ZONES lists below. ponytail: state in
 module globals + a lock, no config file — upgrade: external file only if these
 must change without a restart.
 """
-import os, re, sys, json, time, math, signal, shutil, subprocess, threading, logging, traceback
+import os, re, sys, json, time, math, signal, shutil, subprocess, threading, logging, traceback, urllib.request, gzip
 
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.ImageHelpers import PILHelper
@@ -51,6 +51,19 @@ SLEEP_SECS = 3600         # idle seconds before the OLEDs blank (wake on any inp
 # shell (`bash -lc`) puts ~/bin and ~/.local/bin on the remote PATH.
 # ponytail: hardcoded tool list — upgrade: read from config.toml when it grows.
 SSH_HOST = "the-deck-host"
+
+# Weather + grilling display keys (keys 27 + 28, R3 far-left).
+# ponytail: single city hardcoded — upgrade: list + tap-cycle when a 2nd location matters.
+# NWS (api.weather.gov): free, no API key, US-gov, the-host-reachable.
+# ponytail: 15-min cadence — NWS updates hourly; upgrade: adaptive on alert severity.
+FORT_MYERS_LATLON = (0.0, 0.0)
+WEATHER_REFRESH_SEC = 900       # 15 min
+WEATHER_TIMEOUT_SEC = 8
+NWS_USER_AGENT = "streamdeck-agentdeck (git-host:pook/streamdeck-agentdeck)"
+GRILL_HORIZON_HOURS = 6
+GRILL_WIND_MPH = 20             # sustained wind no-go threshold
+GRILL_GUST_MPH = 30             # ponytail: NWS hourly often omits windGust — sustained is main guard
+GRILL_HEAT_F = 100              # extreme heat no-go threshold
 
 def _remote(tool):
     return "ssh -t %s bash -lc %s" % (SSH_HOST, tool)
@@ -243,6 +256,15 @@ _host_status_lock = threading.Lock()
 _cpu_prev = None              # (idle_cum, total_cum) last /proc/stat sample
 _cpu_ts = 0.0                 # timestamp of last cpu sample
 _cpu_pct_cached = 0.0         # last computed cpu % (refreshed at most every 1s)
+
+# Weather + grilling state — populated by _weather_loop (15-min cadence), read
+# by render_touchscreen at 20fps. ponytail: globals + a daemon thread + a lock,
+# mirrors _host_status pattern. upgrade: persistent cache file to survive restarts.
+_weather = {"temp_f": None, "short": "", "icon_word": "", "ts": 0.0, "fail_streak": 0}
+_weather_lock = threading.Lock()
+_grill = {"ok": None, "reason": "", "ts": 0.0}   # ok=None unknown; True/False decided
+_grill_lock = threading.Lock()
+_nws_grid = None                                  # cached (gridId, gridX, gridY) tuple; never expires
 
 def _save_win_map():
     try:
@@ -1227,6 +1249,119 @@ def _host_status_loop():
                 with _host_status_lock: _host_status[h] = False
         time.sleep(2)
 
+# ---- weather + grilling (NWS api.weather.gov, free, no key) ----------------
+def _nws_get(url):
+    """NWS GET with User-Agent + gzip. Returns parsed JSON dict, or raises."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": NWS_USER_AGENT,
+        "Accept-Encoding": "gzip",                 # ponytail: opt-in — NWS hourly ~30-80KB; 5-10x wire savings
+        "Accept": "application/geo+json",
+    })
+    with urllib.request.urlopen(req, timeout=WEATHER_TIMEOUT_SEC) as r:
+        raw = r.read()
+        if r.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw)
+
+_ALERT_NOGO = {"Moderate", "Severe", "Extreme"}    # ponytail: belt-and-suspenders with per-condition thresholds
+# ponytail: light rain OK — match only on these (NOT "rain"/"shower"/"drizzle" alone)
+_NOGO_WORDS = ("thunderstorm", "tstm", "lightning", "heavy rain", "downpour", "heavy shower", "squall")
+
+def _decide_grill(periods, alerts):
+    """Pure decision: given NWS hourly periods + active alerts, return (ok, reason).
+    Reasons (precedence ALERT > TSTM > RAIN > WIND > HEAT — most-dangerous first
+    since the key shows one code). Light rain / drizzle / showers are explicitly OK."""
+    reasons = []
+    for p in periods[:GRILL_HORIZON_HOURS]:
+        text = ((p.get("shortForecast") or "") + " " + (p.get("detailedForecast") or "")).lower()
+        if any(w in text for w in _NOGO_WORDS):
+            if any(t in text for t in ("thunderstorm", "tstm", "lightning")):
+                reasons.append("TSTM")
+            else:
+                reasons.append("RAIN")
+        temp = p.get("temperature")
+        if isinstance(temp, (int, float)) and temp >= GRILL_HEAT_F:
+            reasons.append("HEAT")
+        ws = p.get("windSpeed") or ""
+        nums = re.findall(r"\d+", ws)
+        if nums and int(nums[-1]) >= GRILL_WIND_MPH:    # upper bound of "10 to 15 mph"
+            reasons.append("WIND")
+        wgust = p.get("windGust") or ""
+        gnums = re.findall(r"\d+", wgust)
+        if gnums and int(gnums[-1]) >= GRILL_GUST_MPH:
+            reasons.append("WIND")
+    for a in alerts:
+        if a.get("severity") in _ALERT_NOGO:
+            reasons.append("ALERT")
+            break
+    if not reasons:
+        return (True, "")
+    for code in ("ALERT", "TSTM", "RAIN", "WIND", "HEAT"):
+        if code in reasons:
+            return (False, code)
+    return (False, "?")
+
+def _weather_poll():
+    """One weather refresh cycle. Resolves NWS grid on first call (cached forever),
+    then fetches hourly forecast + active alerts sequentially, decides grilling
+    suitability, and writes globals under their locks. On any failure: increment
+    fail_streak, log, preserve last good state."""
+    global _nws_grid
+    try:
+        lat, lon = FORT_MYERS_LATLON
+        if _nws_grid is None:
+            pts = _nws_get(f"https://api.weather.gov/points/{lat},{lon}")
+            props = pts["properties"]
+            _nws_grid = (props["gridId"], props["gridX"], props["gridY"])
+            logging.info("weather: NWS grid resolved %s", _nws_grid)
+        gid, gx, gy = _nws_grid
+        hourly = _nws_get(f"https://api.weather.gov/gridpoints/{gid}/{gx},{gy}/forecast/hourly")
+        alerts = _nws_get(f"https://api.weather.gov/alerts/active?point={lat},{lon}")
+        periods = hourly["properties"]["periods"]
+        now_p = periods[0]
+        temp_f = now_p.get("temperature")
+        short = (now_p.get("shortForecast") or "").strip()
+        # Condition word for icon: derive a short uppercase token from the forecast text.
+        text_lc = short.lower()
+        if "thunder" in text_lc or "tstm" in text_lc:
+            icon_word = "TSTM"
+        elif "heavy rain" in text_lc or "downpour" in text_lc:
+            icon_word = "RAIN"
+        elif "rain" in text_lc or "shower" in text_lc or "drizzle" in text_lc:
+            icon_word = "DRIZ"
+        elif "snow" in text_lc:
+            icon_word = "SNOW"
+        elif "fog" in text_lc or "haze" in text_lc:
+            icon_word = "FOG"
+        elif "cloud" in text_lc or "overcast" in text_lc:
+            icon_word = "CLD"
+        elif "clear" in text_lc or "sunny" in text_lc or "fair" in text_lc:
+            icon_word = "CLR"
+        else:
+            icon_word = short[:4].upper() or "—"
+        active_alerts = alerts.get("features", [])
+        alert_titles = [a["properties"].get("event", "") for a in active_alerts]
+        ok, reason = _decide_grill(periods, active_alerts)
+        ts = time.time()
+        with _weather_lock:
+            _weather.update({"temp_f": temp_f, "short": short, "icon_word": icon_word,
+                             "ts": ts, "fail_streak": 0})
+        with _grill_lock:
+            _grill.update({"ok": ok, "reason": reason, "ts": ts})
+        logging.info("weather: %s°F %s — grill=%s %s alerts=%s",
+                     temp_f, icon_word, "OK" if ok else "NO",
+                     reason or "", alert_titles or "none")
+    except Exception as e:
+        with _weather_lock:
+            _weather["fail_streak"] += 1
+        logging.warning("weather poll failed (#%d): %s", _weather["fail_streak"], e)
+
+def _weather_loop():
+    """Background weather poller: refresh every WEATHER_REFRESH_SEC."""
+    while True:
+        _weather_poll()
+        time.sleep(WEATHER_REFRESH_SEC)
+
 def _cpu_pct():
     """Aggregate CPU% since the last sample. Cached at most every 1s — the
     render loop calls this at 20fps, but /proc/stat only updates at the kernel
@@ -1516,6 +1651,38 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
         d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=border_w)
     return PILHelper.to_native_key_format(deck, img)
 
+# ---- weather + grill label/color helpers (used by LCD renderer) ------------
+def _weather_bg(icon_word, temp_f):
+    """Pick a background color from the condition word + temp. Ghibli-muted."""
+    if icon_word == "TSTM":    return (50, 40, 70)    # purple-ish (matches XL_GOAL palette)
+    if icon_word == "RAIN":    return (40, 50, 70)    # dark blue-gray
+    if icon_word in ("DRIZ", "FOG", "SNOW"): return (45, 50, 58)  # neutral gray
+    if icon_word == "CLD":     return (50, 55, 65)    # neutral cloudy
+    if isinstance(temp_f, (int, float)) and temp_f >= 95:
+        return (70, 50, 30)                           # amber (matches XL_TOOL_SWAP)
+    return (40, 60, 80)                               # cool blue (fair/clear)
+
+def _weather_label():
+    """Short label string used by both render paths. Cinema overlays call this."""
+    with _weather_lock:
+        t = _weather["temp_f"]
+        w = _weather["icon_word"]
+        fail = _weather["fail_streak"]
+    if fail > 4 or t is None:
+        return "?"
+    return "%d %s" % (int(t), w or "—")
+
+def _grill_label():
+    """Short label string used by both render paths."""
+    with _grill_lock:
+        ok = _grill["ok"]
+        reason = _grill["reason"]
+    if ok is None:
+        return "?"
+    if ok:
+        return "GRILL"
+    return ("GRILL %s" % reason) if reason else "GRILL"
+
 # ---- animation renderers (Ghibli accents) ---------------------------------
 # Each takes the PIL draw context, a 0..1 phase, an accent color, and the dark
 # base color. They mutate the image in place. Renderers are pure: same phase +
@@ -1577,6 +1744,156 @@ def _anim_sweep_rects(draw, phase, color, base, rect):
         hh = (y1 - y0) * scale / 2
         draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh],
                        fill=_lerp_color(base, color, alpha))
+
+# ---- weather animation primitives (LCD weather zone) ----------------------
+# Each takes a PIL draw context + a bounding region + phase 0..1 + color.
+# Pure: same phase + color → same pixels. Used by _render_weather_lcd_zone to
+# animate the condition icon at the left of the weather strip. ponytail: no
+# asset files — all procedural with PIL primitives. upgrade: PNG sprites if a
+# richer look is ever worth the disk footprint.
+def _draw_sun(d, cx, cy, r, phase, color):
+    """Sun disk + 8 rotating spokes. phase 0..1 = one full rotation."""
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+    for k in range(8):
+        a = phase * 2 * math.pi + k * (math.pi / 4)
+        x1 = cx + math.cos(a) * (r + 4)
+        y1 = cy + math.sin(a) * (r + 4)
+        x2 = cx + math.cos(a) * (r + 10)
+        y2 = cy + math.sin(a) * (r + 10)
+        d.line([x1, y1, x2, y2], fill=color, width=2)
+
+def _draw_cloud(d, cx, cy, w, phase, color):
+    """3 overlapping ellipses drifting right; wraps modulo w."""
+    drift = (phase * w) % w
+    for k, off in enumerate((-w/3, 0, w/3)):
+        x = (cx + off + drift - w/2) % w + (cx - w/2)
+        ew = w / 3
+        d.ellipse([x - ew/2, cy - 6, x + ew/2, cy + 6], fill=color)
+
+def _draw_rain(d, x0, y0, w, h, phase, density, color):
+    """Vertical streaks falling. density = number of drops. phase 0..1 = one wrap."""
+    span = h + 8
+    for k in range(density):
+        # Stable per-drop x position; only y animates.
+        x = x0 + int((k * 37.5) % w)
+        y_off = (phase * span + k * (span / density)) % span
+        y_top = y0 + y_off - 6
+        d.line([x, y_top, x, y_top + 6], fill=color, width=1)
+
+def _draw_lightning(d, cx, cy, h, phase, color):
+    """Jagged bolt + brief bright flash every cycle."""
+    # Flash background on first 10% of cycle.
+    if phase < 0.1:
+        flash = (255, 255, 200) if color == (255, 220, 80) else color
+        # caller's rect should already be drawn; we just add the bolt brighter.
+    bolt_h = h - 8
+    pts = [(cx - 3, cy - bolt_h/2), (cx + 4, cy - bolt_h/4),
+           (cx - 2, cy), (cx + 3, cy + bolt_h/4), (cx, cy + bolt_h/2)]
+    d.line(pts, fill=color, width=2, joint="curve")
+
+def _draw_fog(d, x0, y0, w, h, phase, color):
+    """Three horizontal translucent bands drifting at different speeds."""
+    for k in range(3):
+        speed = (1.0, 0.6, 0.4)[k]
+        offset = (phase * w * speed + k * w/3) % w
+        y = y0 + 8 + k * 12
+        # Bands wrap; draw two copies to cover the seam.
+        for off in (offset - w, offset):
+            d.rectangle([x0 + off, y, x0 + off + w * 0.6, y + 4], fill=color)
+
+def _draw_snow(d, x0, y0, w, h, phase, density, color):
+    """Small dots falling with sine-wave horizontal drift."""
+    span = h + 6
+    for k in range(density):
+        sx = (k * 41.0) % w
+        drift = math.sin((phase + k * 0.3) * 2 * math.pi) * 4
+        x = x0 + int(sx + drift)
+        y_off = (phase * span + k * (span / density)) % span
+        y = y0 + y_off
+        d.ellipse([x - 1, y - 1, x + 1, y + 1], fill=color)
+
+def _draw_heat_shimmer(d, x0, y0, w, h, phase, color):
+    """Three wavy horizontal lines below the sun (heat rising)."""
+    for k in range(3):
+        y = y0 + 4 + k * 6
+        pts = []
+        for x in range(0, int(w), 3):
+            wave = math.sin((x / w) * 2 * math.pi + phase * 2 * math.pi + k) * 2
+            pts.append((x0 + x, y + wave))
+        if len(pts) > 1:
+            d.line(pts, fill=color, width=1)
+
+def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
+    """Draw the 400px weather zone: animated condition icon (left 100px),
+    temp+condition+city (mid 200px), grill verdict badge (right 100px).
+    Reads _weather + _grill under their locks."""
+    with _weather_lock:
+        snap = dict(_weather)
+    with _grill_lock:
+        grill = dict(_grill)
+    fail = snap["fail_streak"] > 4 or snap["temp_f"] is None
+    icon_word = snap["icon_word"] if not fail else "?"
+    # ---- animated icon (left 100px) ----
+    icon_cx = x0 + 50
+    icon_cy = y0 + h/2
+    icon_color = TXT_BRIGHT if not fail else (120, 120, 120)
+    if fail or icon_word == "?":
+        # Dim "?" pulsing.
+        pulse = 0.5 + 0.5 * math.sin(phase * 2 * math.pi)
+        c = tuple(int(v * (0.4 + 0.4 * pulse)) for v in icon_color)
+        f = ImageFont.truetype(FONT_B, 22)
+        d.text((icon_cx, icon_cy), "?", font=f, anchor="mm", fill=c)
+    elif icon_word == "CLR":
+        _draw_sun(d, icon_cx, icon_cy, 8, phase / 8.0, icon_color)
+        if isinstance(snap["temp_f"], (int, float)) and snap["temp_f"] >= 95:
+            _draw_heat_shimmer(d, x0 + 10, icon_cy + 10, 80, 14, phase / 2.0, icon_color)
+    elif icon_word == "CLD":
+        _draw_cloud(d, icon_cx, icon_cy, 60, phase / 12.0, icon_color)
+    elif icon_word == "DRIZ":
+        _draw_cloud(d, icon_cx, icon_cy - 6, 60, phase / 12.0, icon_color)
+        _draw_rain(d, x0 + 10, icon_cy + 4, 80, 16, phase / 1.5, 6, icon_color)
+    elif icon_word == "RAIN":
+        _draw_cloud(d, icon_cx, icon_cy - 6, 60, phase / 12.0, icon_color)
+        _draw_rain(d, x0 + 10, icon_cy + 4, 80, 18, phase / 0.8, 10, icon_color)
+    elif icon_word == "TSTM":
+        # Lightning every 1.5s; dark cloud behind.
+        _draw_cloud(d, icon_cx, icon_cy - 8, 60, phase / 12.0, (100, 90, 110))
+        _draw_lightning(d, icon_cx, icon_cy + 4, 18, (phase / 1.5) % 1.0, (255, 220, 80))
+    elif icon_word == "FOG":
+        _draw_fog(d, x0 + 8, icon_cy - 10, 84, 22, phase / 6.0, icon_color)
+    elif icon_word == "SNOW":
+        _draw_snow(d, x0 + 10, icon_cy - 8, 80, 22, phase / 2.0, 8, icon_color)
+    else:
+        # Fallback: short text label.
+        f = ImageFont.truetype(FONT_B, 14)
+        d.text((icon_cx, icon_cy), icon_word[:4], font=f, anchor="mm", fill=icon_color)
+    # ---- temp + condition + city (middle 200px, x=x0+100..x0+300) ----
+    mid_x = x0 + 200
+    if not fail and isinstance(snap["temp_f"], (int, float)):
+        d.text((mid_x, y0 + 8), "%d°F" % int(snap["temp_f"]),
+               font=ImageFont.truetype(FONT_B, 22), anchor="ma", fill=TXT_BRIGHT)
+        d.text((mid_x, y0 + 32), icon_word or snap["short"][:8] or "—",
+               font=ImageFont.truetype(FONT_R, 13), anchor="ma", fill=TXT_DIM)
+        d.text((mid_x, y0 + 46), "the city",
+               font=ImageFont.truetype(FONT_R, 10), anchor="ma", fill=(140, 140, 140))
+    else:
+        d.text((mid_x, y0 + h/2), "no signal",
+               font=ImageFont.truetype(FONT_R, 13), anchor="mm", fill=(140, 140, 140))
+    # divider before grill badge
+    d.line([(x0 + 300, y0 + 8), (x0 + 300, y0 + h - 4)], fill=(30, 32, 38), width=1)
+    # ---- grill verdict (right 100px, x=x0+300..x0+400) ----
+    badge_x = x0 + 350
+    if grill["ok"] is None:
+        bg_c, label_c, sub = (40, 40, 40), (140, 140, 140), "?"
+    elif grill["ok"]:
+        bg_c, label_c, sub = (30, 80, 50), (140, 230, 170), "ok"
+    else:
+        bg_c, label_c, sub = (80, 35, 35), (240, 170, 170), (grill["reason"].lower() or "no")
+    d.rectangle([x0 + 304, y0 + 6, x0 + 396, y0 + h - 4], fill=bg_c)
+    d.text((badge_x, y0 + 14), "GRILL", font=ImageFont.truetype(FONT_B, 13),
+           anchor="ma", fill=label_c)
+    d.text((badge_x, y0 + 36), sub, font=ImageFont.truetype(FONT_B, 13),
+           anchor="ma", fill=label_c)
 
 def _render_reply_key(deck, zone, rec_zone):
     """Non-cinema bottom-row key mirroring reply zone `zone` (0-3) — flat dark
@@ -2284,41 +2601,54 @@ def render_touchscreen(deck):
                 load1 = float(_f.read().split()[0])
         except Exception:
             load1 = 0.0
-        # Change 4 — board mode: 6 zones = 6 knobs. Zones 4-5 carry the
-        # system monitors (load/cpu/mem) moved from the tiny top banner.
+        # Change 4 — board mode: 5 visual zones. Knob 3 hardware (page) keeps
+        # working but its label was dropped; zone 3 was repurposed for the
+        # weather + grill display (400px). System stats (load/cpu/mem) merged
+        # into one zone (was zones 4+5, now zone 2).
+        # ponytail: zone widths non-uniform — pg zone absorbed into weather;
+        # upgrade: re-add pg label if paging becomes a real workflow.
         setname = REPLY_SETS[_reply_set][0]
         _cpu_val = _cpu_pct()
         _mem_val = _mem_pct()
+        sys_label = "%.1f  %d%%  %d%%" % (load1, _cpu_val, _mem_val)
         knob_labels = [
             sess_name,
             "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
-            "pg %d/%d" % (_page + 1, MAX_PAGES),
-            "load %.1f" % load1,
-            "cpu %d%%  mem %d%%" % (_cpu_val, _mem_val),
+            sys_label,
+            None,                    # zone 3 = weather (drawn separately, no text label)
             "%d%%" % _brightness,
         ]
-        zw = img.width / 6
+        half = img.width / 6        # canonical 200px unit (1200 / 6)
+        zone_widths = [half, half, half, half * 2, half]   # [200, 200, 200, 400, 200] = 1200
+        x0 = 0
         for i, label in enumerate(knob_labels):
-            x0 = i * zw
+            zw = zone_widths[i]
             if i:
                 d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
-            # Zone 4: load bar
+            # Zone 2 (system): 3 stacked mini-bars — load (blue), cpu (amber), mem (purple).
+            if i == 2:
+                bar_w = zw - 16
+                # load: scale 0..8 to bar width
+                bw_load = int(bar_w * min(load1 / 8.0, 1.0))
+                d.rectangle([x0 + 8, 48, x0 + 8 + bw_load, 53], fill=(95, 140, 180))
+                # cpu
+                bw_cpu = int(bar_w * (_cpu_val / 100.0))
+                d.rectangle([x0 + 8, 55, x0 + 8 + bw_cpu, 60], fill=(180, 140, 60))
+                # mem
+                bw_mem = int(bar_w * (_mem_val / 100.0))
+                d.rectangle([x0 + 8, 62, x0 + 8 + bw_mem, 67], fill=(140, 100, 180))
+            # Zone 3 (weather): animated condition icon + temp/word/city + grill badge.
             if i == 3:
-                bw = int((zw - 16) * min(load1 / 8.0, 1.0))
-                d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
-            # Zone 5: cpu + mem bars side by side
+                _render_weather_lcd_zone(d, x0, 44, zw, img.height - 44, _anim_phase)
+            # Zone 4 (brightness): single bar.
             if i == 4:
-                half = (zw - 20) / 2
-                bw_cpu = int(half * (_cpu_val / 100.0))
-                bw_mem = int(half * (_mem_val / 100.0))
-                d.rectangle([x0 + 8, 48, x0 + 8 + bw_cpu, 56], fill=(180, 140, 60))
-                d.rectangle([x0 + 12 + half, 48, x0 + 12 + half + bw_mem, 56], fill=(140, 100, 180))
-            # Zone 6: brightness bar
-            if i == 5:
                 bw = int((zw - 16) * (_brightness / 100.0))
                 d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
-            d.text((x0 + zw / 2, 72), label, font=ImageFont.truetype(FONT_B, 18),
-                   anchor="mm", fill=txt_c)
+            # Text label (skipped for weather zone — it has its own text).
+            if label is not None:
+                d.text((x0 + zw / 2, 84), label,
+                       font=ImageFont.truetype(FONT_R, 13), anchor="mm", fill=txt_c)
+            x0 += zw
     native = PILHelper.to_native_touchscreen_format(deck, img)
     # Dedup like animate_active_keys does per-key: the touchscreen image is far
     # bigger than a key icon, so pushing it unconditionally every 20fps tick
@@ -2798,6 +3128,7 @@ def main():
     _activity = {s["id"]: session_activity(s) for s in _sessions[:MAX_SESSIONS]}
     _last_input = time.monotonic()
     _bg(_host_status_loop)
+    _bg(_weather_loop)
     repaint(plus)
     log("session board ready: %d sessions, tools=%s", len(_sessions),
         [t[0] for t in TOOLS])
@@ -2938,4 +3269,12 @@ def main():
         pass
 
 if __name__ == "__main__":
+    if os.environ.get("_SMOKE"):
+        # Smoke test: exercise weather HTTP + parse + decision without the Stream
+        # Deck attached. Run on the-host: `_SMOKE=1 python3 deck.py`. Verifies NWS
+        # reachability, JSON schema drift, and grilling logic; prints state.
+        _weather_poll()
+        print("weather:", _weather)
+        print("grill:", _grill)
+        sys.exit(0)
     main()

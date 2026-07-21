@@ -4,7 +4,7 @@
 **Host:** the-host (homelab LAN, user `pooknast`)
 **Source:** `git-host:pook/streamdeck-agentdeck` — `deck.py` is the single-file service
 **Deploy:** `scp deck.py the-host:~/streamdeck-agentdeck/ && ssh the-host "systemctl --user restart streamdeck-agentdeck"`
-**Last updated:** 2026-07-20 (post-sprint: 10/11 milestones + 3 LCD improvements shipped)
+**Last updated:** 2026-07-21 (LCD weather+grill zone shipped; knob zone 3 absorbed, system stats merged)
 
 ---
 
@@ -104,13 +104,24 @@
 │  ❶ 1 Yes     ❷ 2 No     ❸ 3 Don't ask    ❹ 4 —                        │  y=28–42
 │  (OR: ● ● ● ● ●  ● ● ● ●  heartbeat + host dots)                        │
 │                                                                          │
-│ ┌────────┬────────┬────────┬────────┬────────┬────────┐                 │
-│ │  glm   │select  │ pg 1/1 │load 1.2│cpu 23%│  60%   │                 │  y=44–100
-│ │        │ 1/3    │        │ ▓▓▓░░░ │mem 45%│ ▓▓░░░  │                 │
-│ └────────┴────────┴────────┴────────┴────────┴────────┘                 │
-│        ←────────── 6 knob zones (200px each) ──────────→                 │
+│ ┌────────┬────────┬────────┬─────────────────────────────┬────────┐      │
+│ │  glm   │select  │ld·cpu·m│ ☀  88°F   [GRILL]           │  60%   │      │  y=44–100
+│ │        │ 1/3    │1.2 23 45│    CLR   ok                │ ▓▓░░░  │      │
+│ └────────┴────────┴────────┴─────────────────────────────┴────────┘      │
+│   ← 200 → ← 200 → ← 200 → ←─────── 400 (weather) ─────→ ← 200 →          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Visual zones (5, was 6):** session · reply · system-merged · **weather+grill (400px)** · brightness.
+The dead `pg 1/1` zone (knob 3) was absorbed into the weather zone; knob 3 hardware still pages the top row if turned, just no on-screen label. Load + CPU + MEM merged into one stacked-bar system zone.
+
+### Weather zone (400px, x=600–1000)
+
+Polled every 15 min from NWS `api.weather.gov` for the city, FL (grid `TBW/99,43`). Background thread `_weather_loop` mirrors `_host_status_loop` pattern; data lives in `_weather` + `_grill` globals under their locks.
+
+- **Left 100px (x=600–700):** animated condition icon — sun rays rotating (CLR), cloud drift (CLD), rain streaks (DRIZ/RAIN), lightning flash (TSTM), fog bands (FOG), snow flakes (SNOW), heat shimmer under sun when temp ≥ 95°F.
+- **Middle 200px (x=700–900):** big temp (`88°F`) + condition word (`CLR`) + `the city` small underneath. Shows `no signal` if `_weather["fail_streak"] > 4` (1 hour without fresh data).
+- **Right 100px (x=900–1000):** grill verdict badge — green `[GRILL ok]` when conditions are safe, red `[GRILL <reason>]` when not. Reasons (precedence ALERT > TSTM > RAIN > WIND > HEAT): NWS alert severity ≥ Moderate, forecast text contains thunderstorm/lightning, heavy rain/downpour, sustained wind ≥ 20 mph, gust ≥ 30 mph, temp ≥ 100°F. **Light rain / drizzle / showers are explicitly OK.**
 
 ### Elements
 
@@ -122,12 +133,11 @@
 | **Reply preview** | y=28–42, 4 segments | When active session has live menu | Shows 4 menu options: `1 Yes  2 No  3 Don't ask  4 —`. The ❯ cursor option gets bright green; others muted blue; empty zones dim |
 | **Heartbeat dots** | y=28–36, left | When NO live menu | One dot per session (up to MAX_SESSIONS), leftmost=active. Breathing pulse for running, steady red=error, green=done, dim=idle |
 | **Host dots** | y=30–38, right of heartbeats | When NO live menu | Green/red dots for the-deck-host, server-host, nas-host, git-host reachability |
-| **Knob zone 1** | 0–200px | Board mode | Session name |
-| **Knob zone 2** | 200–400px | Board mode | Reply set + index (`select 1/3`) |
-| **Knob zone 3** | 400–600px | Board mode | Page (`pg 1/1`) |
-| **Knob zone 4** | 600–800px | Board mode | Load avg + bar (scale 0–8) |
-| **Knob zone 5** | 800–1000px | Board mode | CPU% + MEM% bars side by side |
-| **Knob zone 6** | 1000–1200px | Board mode | Brightness% + bar |
+| **Zone 1** | 0–200px | Board mode | Session name |
+| **Zone 2** | 200–400px | Board mode | Reply set + index (`select 1/3`) |
+| **Zone 3** | 400–600px | Board mode | System: 3 stacked mini-bars (load blue / cpu amber / mem purple) + numeric label `1.2  23%  45%` |
+| **Zone 4** | 600–1000px (400 wide) | Board mode | **Weather + grill** (see above) |
+| **Zone 5** | 1000–1200px | Board mode | Brightness% + bar |
 
 ### Knob behavior (dials)
 
@@ -135,7 +145,7 @@
 |---|---|---|
 | 1 | Left/Right | Move session selection cursor (5s auto-focus suppression) |
 | 2 | Left/Right | Cycle reply set (select/keys/type) |
-| 3 | Left/Right | Page the top row |
+| 3 | Left/Right | Page the top row (no on-screen label — knob hardware kept for muscle memory) |
 | 4 | — | Unassigned |
 
 ---
