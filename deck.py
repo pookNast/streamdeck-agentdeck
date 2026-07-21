@@ -667,8 +667,10 @@ def _fire_action(sess, spec):
         tmux_send(sess, spec["keys"])
         return True
     if cls == "slash_command":
-        # Fire "/<cmd>" as literal text, then Enter to submit.
-        tmux_send_text(sess, "/" + spec["cmd"])
+        # Fire "/<cmd> " (trailing space so the CLI registers the command name
+        # as complete — required for multi-word commands like "/goal complete"
+        # and for the CLI's command parser to recognize the boundary).
+        tmux_send_text(sess, "/" + spec["cmd"] + " ")
         tmux_send(sess, ["Enter"])
         return True
     if cls == "shell":
