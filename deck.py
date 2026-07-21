@@ -2450,11 +2450,19 @@ def _force_kill():
 
 def _git_push():
     """Send `git push origin <current-branch>` to the active session's pane.
-    ponytail: runs in the pane's own shell — git's own error handling covers
-    the non-repo case (prints 'fatal: not a git repository'). No CWD probe."""
+    Pre-checks the pane's CWD via tmux display-message — no-ops with a log
+    line if CWD is not inside a git work tree (M-SD4 contract: 'logs + no-op')."""
     s = active_session()
     if not s:
         log("git-push: no active session"); return
+    t = s.get("tmux_session")
+    if t:
+        r = _run(["tmux", "display-message", "-p", "-t", t, "#{pane_current_path}"], timeout=5)
+        cwd = (r.stdout if r and r.returncode == 0 else "").strip()
+        if cwd:
+            gr = _run(["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"], timeout=5)
+            if not (gr and gr.returncode == 0 and gr.stdout.strip() == "true"):
+                log("git-push: skip — CWD %s not a git work tree", cwd); return
     tmux_send_text(s, "git push origin $(git branch --show-current)")
     tmux_send(s, ["Enter"])
     log("git-push -> %s", s.get("title"))
@@ -2523,13 +2531,15 @@ def _cycle_tool():
 
 def _manual_prune():
     """M-SD7: manually invoke _prune_dead to catch zombie panes that survived
-    the automatic sweep. No-ops (with a log line) when nothing is pruned."""
-    before = _prune_dead(fetch_sessions())
-    n = len(before)
-    if n:
-        log("manual-prune: %d session(s) remain after sweep" % n)
+    the automatic sweep. No-ops (with a log line) when nothing is pruned.
+    Reports both pruned count and survivors per contract done-bar."""
+    pre = fetch_sessions()
+    survivors = _prune_dead(pre)
+    n_pruned = len(pre) - len(survivors)
+    if n_pruned:
+        log("manual-prune: pruned %d session(s), %d remain" % (n_pruned, len(survivors)))
     else:
-        log("manual-prune: nothing to prune")
+        log("manual-prune: nothing to prune (%d sessions all healthy)" % len(survivors))
 
 _LONG_PRESS = {
     7:  (_toggle_cinema,  0.6),
