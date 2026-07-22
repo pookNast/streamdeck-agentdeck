@@ -1835,8 +1835,9 @@ def _draw_heat_shimmer(d, x0, y0, w, h, phase, color):
             d.line(pts, fill=color, width=1)
 
 def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
-    """Draw the 400px weather zone: animated condition icon (left 100px),
-    temp+condition+city (mid 200px), grill verdict badge (right 100px).
+    """Draw the 400px weather zone: temp+condition+city (left 300px),
+    grill verdict badge (right 100px). The animated condition icon was removed
+    because the beach panorama itself now depicts the live weather.
     Reads _weather + _grill under their locks."""
     with _weather_lock:
         snap = dict(_weather)
@@ -1844,42 +1845,8 @@ def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
         grill = dict(_grill)
     fail = snap["fail_streak"] > 4 or snap["temp_f"] is None
     icon_word = snap["icon_word"] if not fail else "?"
-    # ---- animated icon (left 100px) ----
-    icon_cx = x0 + 50
-    icon_cy = y0 + h/2
-    icon_color = TXT_BRIGHT if not fail else (120, 120, 120)
-    if fail or icon_word == "?":
-        # Dim "?" pulsing.
-        pulse = 0.5 + 0.5 * math.sin(phase * 2 * math.pi)
-        c = tuple(int(v * (0.4 + 0.4 * pulse)) for v in icon_color)
-        f = ImageFont.truetype(FONT_B, 22)
-        d.text((icon_cx, icon_cy), "?", font=f, anchor="mm", fill=c)
-    elif icon_word == "CLR":
-        _draw_sun(d, icon_cx, icon_cy, 8, phase / 8.0, icon_color)
-        if isinstance(snap["temp_f"], (int, float)) and snap["temp_f"] >= 95:
-            _draw_heat_shimmer(d, x0 + 10, icon_cy + 10, 80, 14, phase / 2.0, icon_color)
-    elif icon_word == "CLD":
-        _draw_cloud(d, icon_cx, icon_cy, 60, phase / 12.0, icon_color)
-    elif icon_word == "DRIZ":
-        _draw_cloud(d, icon_cx, icon_cy - 6, 60, phase / 12.0, icon_color)
-        _draw_rain(d, x0 + 10, icon_cy + 4, 80, 16, phase / 1.5, 6, icon_color)
-    elif icon_word == "RAIN":
-        _draw_cloud(d, icon_cx, icon_cy - 6, 60, phase / 12.0, icon_color)
-        _draw_rain(d, x0 + 10, icon_cy + 4, 80, 18, phase / 0.8, 10, icon_color)
-    elif icon_word == "TSTM":
-        # Lightning every 1.5s; dark cloud behind.
-        _draw_cloud(d, icon_cx, icon_cy - 8, 60, phase / 12.0, (100, 90, 110))
-        _draw_lightning(d, icon_cx, icon_cy + 4, 18, (phase / 1.5) % 1.0, (255, 220, 80))
-    elif icon_word == "FOG":
-        _draw_fog(d, x0 + 8, icon_cy - 10, 84, 22, phase / 6.0, icon_color)
-    elif icon_word == "SNOW":
-        _draw_snow(d, x0 + 10, icon_cy - 8, 80, 22, phase / 2.0, 8, icon_color)
-    else:
-        # Fallback: short text label.
-        f = ImageFont.truetype(FONT_B, 14)
-        d.text((icon_cx, icon_cy), icon_word[:4], font=f, anchor="mm", fill=icon_color)
-    # ---- temp + condition + city (middle 200px, x=x0+100..x0+300) ----
-    mid_x = x0 + 200
+    # ---- temp + condition + city (centered in left 300px) ----
+    mid_x = x0 + 150
     if not fail and isinstance(snap["temp_f"], (int, float)):
         d.text((mid_x, y0 + 8), "%d°F" % int(snap["temp_f"]),
                font=ImageFont.truetype(FONT_B, 22), anchor="ma", fill=TXT_BRIGHT)
