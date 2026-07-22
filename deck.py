@@ -1150,60 +1150,37 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
     g0 = _tmux_client_count()                    # global fallback when tmux name unknown
     _qdbus(svc, "/konsole/MainWindow_1", "org.kde.KMainWindow.activateAction", action)
 
-    # Wait for currentSession() to change — that signals the split pane got focus.
-    # Only accept a session that is genuinely NEW (not already in `before`).
-    # sessionList ghosts (background D-Bus sessions the visible pane never shows)
-    # are excluded because the split action only focuses VISIBLE panes.
+    # Wait for the new session to appear. Accept whichever signal fires first:
+    #   - currentSession changed to a new session (split pane got focus), OR
+    #   - sessionList grew by one (split created a session even without focus).
+    # D-Bus Session.runCommand targets a specific session by ID, so we don't
+    # need desktop focus to "stick" on the new pane — just the session ID.
+    # This eliminates the focus-stealing false-failure that caused the
+    # split-down-opens-new-window bug under Xfwm4.
     ksid = None
     for _ in range(25):                          # up to ~2.5s
         time.sleep(0.1)
         after_current = _qdbus(svc, "/Windows/1",
                                "org.kde.konsole.Window.currentSession").strip()
+        fresh = set(_session_list(svc)) - before
         if after_current and after_current != before_current and after_current not in before:
             ksid = after_current
             log("split: focused pane is session %s (currentSession changed)", ksid)
             break
-
-    if not ksid:
-        # currentSession didn't move to a new session.  Two sub-cases:
-        # (a) split created no new session at all (duplicate view) — open window
-        # (b) Konsole version keeps focus on original pane after split — try sessionList
-        fresh = set(_session_list(svc)) - before
         if fresh:
             ksid = sorted(fresh)[0]
-            log("split: currentSession unchanged; using sessionList session %s", ksid)
-        else:
-            log("split spawned no new session; opening window")
-            _new_window(cmd, sid=sid); return
+            log("split: new session %s via sessionList (currentSession=%s)",
+                ksid, after_current or "?")
+            break
 
+    if not ksid:
+        log("split spawned no new session; opening window")
+        _new_window(cmd, sid=sid); return
+
+    # Best-effort focus nudge — not required for injection, just UX polish so
+    # the new pane is visible to the user immediately.
+    _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.setCurrentSession", ksid)
     time.sleep(0.3)                              # let the new pane's shell settle
-    # Re-verify focus is STILL on ksid right before injecting. currentSession()
-    # was read up to ~0.3s ago; if real input focus regressed back to the
-    # original pane in that window (observed: command text landing in the
-    # OLD session's prompt instead of the new one), runCommand would inject
-    # into whatever Konsole actually considers focused now, not the stale
-    # ksid we captured earlier. Abort to a safe fresh window rather than risk
-    # typing the attach command into someone else's live session.
-    refocus = _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.currentSession").strip()
-    if refocus != ksid:
-        # Konsole doesn't move currentSession on split when the window itself
-        # lacks input focus (deck spawns arrive with desktop focus anywhere),
-        # which made the sessionList-fallback branch above unreachable — it
-        # always tripped this guard. Nudge focus onto the new pane explicitly;
-        # a ghost sessionList entry has no view, so setCurrentSession no-ops
-        # and we still bail to a fresh window below.
-        _qdbus(svc, "/Windows/1", "org.kde.konsole.Window.setCurrentSession", ksid)
-        for _ in range(5):
-            time.sleep(0.2)
-            refocus = _qdbus(svc, "/Windows/1",
-                             "org.kde.konsole.Window.currentSession").strip()
-            if refocus == ksid:
-                log("split: focus nudged onto session %s via setCurrentSession", ksid)
-                break
-    if refocus != ksid:
-        log("split: focus drifted from %s to %s before inject; closing pane, opening window",
-            ksid, refocus or "?")
-        _close_session(svc, ksid); _new_window(cmd, sid=sid); return
     _run_in_session(svc, ksid, cmd)
 
     def _bound():
