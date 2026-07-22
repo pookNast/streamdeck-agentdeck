@@ -4,7 +4,7 @@
 **Host:** the-host (homelab LAN, user `pooknast`)
 **Source:** `git-host:pook/streamdeck-agentdeck` — `deck.py` is the single-file service
 **Deploy:** `scp deck.py the-host:~/streamdeck-agentdeck/ && ssh the-host "systemctl --user restart streamdeck-agentdeck"`
-**Last updated:** 2026-07-21 (LCD weather+grill zone shipped; knob zone 3 absorbed, system stats merged)
+**Last updated:** 2026-07-22 (LCD panorama modes: normal / Laputa / the coast — long-press key 7 cycles)
 
 ---
 
@@ -83,7 +83,7 @@
 
 | Key | Short tap (preserved) | Long press (new) |
 |---|---|---|
-| **7** (R0 C7) | Focus/toggle session | **Toggle cinema mode** (Laputa Siege panorama on/off) |
+| **7** (R0 C7) | Focus/toggle session | **Cycle LCD panorama mode** (normal → Laputa → Beach → normal) |
 | **17** (R1 C8) | `/super-worker` | **Cycle reply set** (select→keys→type→select) |
 | **18** (R2 C0) | Esc | **Force-kill** active session's foreground process (SIGTERM via tmux `pane_pid`) |
 | **21** (R2 C3) | Go (submit) | **Git push** — sends `git push origin <current-branch>` to the pane |
@@ -94,7 +94,11 @@
 
 ---
 
-## LCD strip layout (1200 × 100 px)
+## LCD strip layout (1200 × 100 px) — 3 panorama modes
+
+Long-press **key 7** cycles: `normal → laputa → beach → normal`. Default boot mode: **beach**.
+
+### Top-half overlays (all modes)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -103,41 +107,76 @@
 │                                                                          │
 │  ❶ 1 Yes     ❷ 2 No     ❸ 3 Don't ask    ❹ 4 —                        │  y=28–42
 │  (OR: ● ● ● ● ●  ● ● ● ●  heartbeat + host dots)                        │
-│                                                                          │
-│ ┌────────┬────────┬────────┬─────────────────────────────┬────────┐      │
-│ │  glm   │select  │ld·cpu·m│ ☀  88°F   [GRILL]           │  60%   │      │  y=44–100
-│ │        │ 1/3    │1.2 23 45│    CLR   ok                │ ▓▓░░░  │      │
-│ └────────┴────────┴────────┴─────────────────────────────┴────────┘      │
-│   ← 200 → ← 200 → ← 200 → ←─────── 400 (weather) ─────→ ← 200 →          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Visual zones (5, was 6):** session · reply · system-merged · **weather+grill (400px)** · brightness.
-The dead `pg 1/1` zone (knob 3) was absorbed into the weather zone; knob 3 hardware still pages the top row if turned, just no on-screen label. Load + CPU + MEM merged into one stacked-bar system zone.
+Top-half text (banner, time, needy badge, reply menu / heartbeat+host dots) renders on top of whatever panorama is showing. Drop-shadows (4-direction black outline) are enabled in `laputa` and `beach` modes so text stays readable over photo-real backgrounds.
 
-### Weather zone (400px, x=600–1000)
+### Mode: `normal`
 
-Polled every 15 min from NWS `api.weather.gov` for the city, FL (grid `TBW/99,43`). Background thread `_weather_loop` mirrors `_host_status_loop` pattern; data lives in `_weather` + `_grill` globals under their locks.
+```
+┌────────┬────────┬────────┬─────────────────────────────┬────────┐
+│  glm   │select  │ld·cpu·m│ ☀  88°F   [GRILL]           │  60%   │   y=44–100
+│        │ 1/3    │1.2 23 45│    CLR   ok                │ ▓▓░░░  │
+└────────┴────────┴────────┴─────────────────────────────┴────────┘
+ ← 200 → ← 200 → ← 200 → ←─────── 400 (weather) ─────→ ← 200 →
+```
 
-- **Left 100px (x=600–700):** animated condition icon — sun rays rotating (CLR), cloud drift (CLD), rain streaks (DRIZ/RAIN), lightning flash (TSTM), fog bands (FOG), snow flakes (SNOW), heat shimmer under sun when temp ≥ 95°F.
-- **Middle 200px (x=700–900):** big temp (`88°F`) + condition word (`CLR`) + `the city` small underneath. Shows `no signal` if `_weather["fail_streak"] > 4` (1 hour without fresh data).
-- **Right 100px (x=900–1000):** grill verdict badge — green `[GRILL ok]` when conditions are safe, red `[GRILL <reason>]` when not. Reasons (precedence ALERT > TSTM > RAIN > WIND > HEAT): NWS alert severity ≥ Moderate, forecast text contains thunderstorm/lightning, heavy rain/downpour, sustained wind ≥ 20 mph, gust ≥ 30 mph, temp ≥ 100°F. **Light rain / drizzle / showers are explicitly OK.**
+Five visual knob zones. System stats merged (load/cpu/mem). Weather + grill zone (400px) with animated condition icon + temp + grill verdict badge.
 
-### Elements
+### Mode: `laputa` — Ghibli Siege panorama (existing)
+
+Full 1200×100 procedural canvas from `ghibli_scenes.render_touchscreen_banner(phase)`. Fantasy airship battle at golden hour. All knob zones hidden.
+
+### Mode: `beach` — the city live-weather panorama (NEW)
+
+Full 1200×100 procedural canvas from `ghibli_beach.render_fort_myers_beach(phase, weather, local_hour)`. Reflects real the city GPS coords + live NWS weather conditions:
+
+**Layered render chain:**
+
+| Layer | Source | Notes |
+|---|---|---|
+| Sky gradient | 5 stop-bands, palette keyed to local hour | Interpolated across night → sunrise → day → sunset → twilight |
+| Celestial body | Sun (day) or moon+stars (night) | Position derived from `local_hour` — arc across the frame |
+| Far clouds | Cumulus (CLR/CLD), stratus (RAIN), heavy dark (TSTM) | Count + tint driven by `icon_word` |
+| Horizon island | Distant landmass silhouette at sky-ocean boundary | Fixed shape, palette-tinted |
+| Ocean gradient | Blue-teal, darker when overcast | |
+| Wave caps + surf line | Animated with `_anim_phase` (20fps) | Small white pixel lines |
+| Sand | Tan/gold trapezoid with per-pixel noise texture | |
+| Palm trees | 3 silhouettes at fixed x positions | Fronds sway with phase |
+
+**Weather overlays (conditional on `icon_word`):**
+- `CLR` (temp<95): bright sun rays, calm waves
+- `CLR` (temp≥95): sun + heat shimmer (wavy lines above sand)
+- `CLD`: overcast gray wash, no sun rays, flat clouds
+- `DRIZ`: sparse slow rain streaks
+- `RAIN`: dense fast rain streaks, choppy wave caps, dark clouds
+- `TSTM`: very dark sky, lightning bolt flash every ~1.4s, heavy rain
+- `FOG`: horizontal translucent bands drifting across frame
+- `SNOW`: drifting flakes with sine-wave x motion
+
+**Palette by time-of-day (5 phases, linear interpolation at boundaries):**
+
+| Hour | Phase | Sky zenith | Sand |
+|---|---|---|---|
+| 0–5 | Night | `(8,12,35)` | `(35,35,45)` |
+| 5–7 | Sunrise | `(50,30,70)` | `(120,90,70)` |
+| 7–17 | Day | `(70,130,200)` | `(220,200,150)` |
+| 17–19 | Sunset | `(60,40,90)` | `(160,110,80)` |
+| 19–24 | Twilight | `(15,20,45)` | `(60,50,70)` |
+
+All knob zones (session/reply/system/brightness) **hidden** when panorama mode is active. Knob hardware still dispatches (turn dial 1 to move cursor, etc.) — only the visual labels are dropped.
+
+### Elements (top-half, all modes)
 
 | Element | Position | When | Description |
 |---|---|---|---|
-| **Banner** | y=6, left | Always | `▶ <session> · <activity>` — activity uses live `_activity` label (e.g., "Wrangling 1m 20s"), not just raw status |
+| **Banner** | y=6, left | Always | `▶ <session> · <activity>` — activity uses live `_activity` label (e.g., "Wrangling 1m 20s") |
 | **Time** | y=8, right-anchored | Always | `Fri 14:32:07` (FONT_R 16) |
 | **Needy badge** | y=9, right of time | When >1 session needs input | `⚠ N waiting` — pulses at 1.0s period (amber sine). Hidden when count ≤ 1 |
-| **Reply preview** | y=28–42, 4 segments | When active session has live menu | Shows 4 menu options: `1 Yes  2 No  3 Don't ask  4 —`. The ❯ cursor option gets bright green; others muted blue; empty zones dim |
+| **Reply preview** | y=28–42, 4 segments | When active session has live menu | Shows 4 menu options. The ❯ cursor option gets bright green; others muted blue; empty zones dim |
 | **Heartbeat dots** | y=28–36, left | When NO live menu | One dot per session (up to MAX_SESSIONS), leftmost=active. Breathing pulse for running, steady red=error, green=done, dim=idle |
 | **Host dots** | y=30–38, right of heartbeats | When NO live menu | Green/red dots for the-deck-host, server-host, nas-host, git-host reachability |
-| **Zone 1** | 0–200px | Board mode | Session name |
-| **Zone 2** | 200–400px | Board mode | Reply set + index (`select 1/3`) |
-| **Zone 3** | 400–600px | Board mode | System: 3 stacked mini-bars (load blue / cpu amber / mem purple) + numeric label `1.2  23%  45%` |
-| **Zone 4** | 600–1000px (400 wide) | Board mode | **Weather + grill** (see above) |
-| **Zone 5** | 1000–1200px | Board mode | Brightness% + bar |
 
 ### Knob behavior (dials)
 

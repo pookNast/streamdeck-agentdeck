@@ -26,6 +26,7 @@ from StreamDeck.ImageHelpers import PILHelper
 from StreamDeck.Devices.StreamDeck import DialEventType, TouchscreenEventType
 from PIL import Image, ImageDraw, ImageFont
 import ghibli_scenes as ghibli
+import ghibli_beach
 
 AD = os.path.expanduser("~/.local/bin/agent-deck")
 
@@ -266,6 +267,16 @@ _grill = {"ok": None, "reason": "", "ts": 0.0}   # ok=None unknown; True/False d
 _grill_lock = threading.Lock()
 _nws_grid = None                                  # cached (gridId, gridX, gridY) tuple; never expires
 
+def _weather_snapshot():
+    """Copy of weather + grill state for render-time use (no lock held during draw)."""
+    with _weather_lock:
+        w = dict(_weather)
+    with _grill_lock:
+        g = dict(_grill)
+    w["grill_ok"] = g.get("ok")
+    w["grill_reason"] = g.get("reason", "")
+    return w
+
 def _save_win_map():
     try:
         os.makedirs(os.path.dirname(_WIN_MAP_PATH), exist_ok=True)
@@ -371,12 +382,12 @@ _touch_frame_cache = None  # last native touchscreen frame bytes (skip dup push)
 _ts_diag_logged = False    # one-shot diagnostic: log touchscreen image size on first render
 _ts_send_logged = False    # one-shot diagnostic: log set_touchscreen_image call result
 _manual_until = 0.0        # monotonic timestamp until which auto-focus is suppressed (knob 1 / sel keys)
-# Cinema mode: the full 4x2 key grid + touchscreen become ONE continuous canvas
-# playing an 8-bit Ghibli battle scene (Laputa Siege at Golden Hour). Sessions
-# needing input "break through" the canvas with a Ghibli-accent wash + pulsing
-# border instead of replacing the tile entirely, so the epic scene is never
-# interrupted. Toggle via key 7 long-press when on the board with no menu open.
-_cinema_mode = True
+# LCD panorama mode: "normal" = dark fill + 5 knob zones; "laputa" = Ghibli
+# Siege panorama; "beach" = the city live-weather beach (sun position by
+# local hour, conditions from NWS poll). Long-press key 7 cycles the order.
+# ponytail: string enum over a class — keeps the 3-way branch readable at
+# every callsite without a new dep; upgrade: enum.Enum if a 4th mode lands.
+_lcd_mode = "beach"
 # Auto-suggest dismissal: "Next" clears the input gate (stop blinking, drop
 # from focus queue) WITHOUT sending keys to the agent. Time-based: holds until
 # the agent goes busy again (spinner detected → rearm) or stops needing input.
@@ -2424,12 +2435,12 @@ def animate_active_keys(deck):
     """Render every key each tick. In cinema mode the full grid is one continuous
     8-bit Ghibli scene; otherwise per-key state animations (pulse/spinner/shimmer)."""
     if IS_XL:
-        if _cinema_mode and _ui_mode == "board":
+        if _lcd_mode != "normal" and _ui_mode == "board":
             _animate_cinema_xl(deck)
         else:
             _animate_xl(deck)
         return
-    if _cinema_mode and _ui_mode == "board":
+    if _lcd_mode != "normal" and _ui_mode == "board":
         _animate_cinema(deck)
         return
     _sync_page_to_active()
@@ -2486,10 +2497,17 @@ def render_touchscreen(deck):
         d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" % _what,
                font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
     else:
-        # Board mode: Ghibli panorama banner (cinema) or flat dark (non-cinema).
-        if _cinema_mode:
+        # Board mode: panorama (laputa or beach) or flat dark (normal).
+        _lcd_drop_shadows = _lcd_mode != "normal"
+        if _lcd_mode == "laputa":
             banner = ghibli.render_touchscreen_banner(_anim_phase)
             img.paste(banner, (0, 0))
+            d = ImageDraw.Draw(img)
+            txt_c = TXT_BANNER
+        elif _lcd_mode == "beach":
+            _hour = time.localtime().tm_hour + time.localtime().tm_min / 60.0
+            beach = ghibli_beach.render_fort_myers_beach(_anim_phase, _weather_snapshot(), _hour)
+            img.paste(beach, (0, 0))
             d = ImageDraw.Draw(img)
             txt_c = TXT_BANNER
         else:
@@ -2497,7 +2515,7 @@ def render_touchscreen(deck):
         s = active_session()
         if s:
             st = s.get("status", "idle")
-            if not _cinema_mode:
+            if not _lcd_drop_shadows:
                 d.rectangle([0, 0, 8, img.height], fill=STATE_COLOR.get(st, (40, 42, 50)))
             # LCD improvement: show live activity label (e.g. "Wrangling 1m 20s")
             # instead of the raw status ("running") when activity data is available.
@@ -2505,18 +2523,23 @@ def render_touchscreen(deck):
             head = "▶ {}  ·  {}".format(s.get("title", "?"), _lbl or st)
             sess_name = s.get("title", "?")
         else:
-            head = "▶ Laputa Siege  ·  cinema" if _cinema_mode else "▶ no session selected"
+            if _lcd_mode == "laputa":
+                head = "▶ Laputa Siege  ·  cinema"
+            elif _lcd_mode == "beach":
+                head = "▶ the coast  ·  live"
+            else:
+                head = "▶ no session selected"
             sess_name = "—"
         # Drop-shadow text when on the banner (JPEG has no alpha; 4-direction
         # shadow makes any text readable over the scene without a backing rect).
-        if _cinema_mode:
+        if _lcd_drop_shadows:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 d.text((16 + dx, 6 + dy), head, font=ImageFont.truetype(FONT_B, 24), fill=(0, 0, 0))
         d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=txt_c)
         # Change 6a — time + date in top-right (replaces the old setinfo draw;
         # reply-set info has moved into knob zone 2 per Change 4).
         _timestr = time.strftime("%a %H:%M:%S")           # "Fri 14:32:07"
-        if _cinema_mode:
+        if _lcd_drop_shadows:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 d.text((img.width - 12 + dx, 8 + dy), _timestr,
                        font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
@@ -2534,7 +2557,7 @@ def render_touchscreen(deck):
             # LCD improvement: pulse the badge (1.0s period) to draw the eye.
             _pulse = 0.5 + 0.5 * math.sin(_anim_phase / 1.0 * 2 * math.pi)
             _bc = tuple(int(c * (0.55 + 0.45 * _pulse)) for c in (220, 180, 60))
-            if _cinema_mode:
+            if _lcd_drop_shadows:
                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     d.text((_bx + dx, 9 + dy), _badge, font=_bf, anchor="ra", fill=(0, 0, 0))
             d.text((_bx, 9), _badge, font=_bf, anchor="ra", fill=_bc)
@@ -2560,7 +2583,7 @@ def render_touchscreen(deck):
                 else:
                     color = (60, 60, 60)      # empty zone: dim
                 f = ImageFont.truetype(FONT_R, 14)
-                if _cinema_mode:
+                if _lcd_drop_shadows:
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                         d.text((x0 + 10 + dx, 28 + dy), label, font=f, fill=(0, 0, 0))
                 d.text((x0 + 10, 28), label, font=f, fill=color)
@@ -2595,60 +2618,63 @@ def render_touchscreen(deck):
             for i, up in enumerate(states):
                 color = (40, 180, 80) if up else (200, 60, 60)
                 d.ellipse([_host_x0 + i * 14, 30, _host_x0 + 8 + i * 14, 38], fill=color)
-        # Load avg read once per frame — used in zone 4 below.
-        try:
-            with open("/proc/loadavg") as _f:
-                load1 = float(_f.read().split()[0])
-        except Exception:
-            load1 = 0.0
-        # Change 4 — board mode: 5 visual zones. Knob 3 hardware (page) keeps
-        # working but its label was dropped; zone 3 was repurposed for the
-        # weather + grill display (400px). System stats (load/cpu/mem) merged
-        # into one zone (was zones 4+5, now zone 2).
-        # ponytail: zone widths non-uniform — pg zone absorbed into weather;
-        # upgrade: re-add pg label if paging becomes a real workflow.
-        setname = REPLY_SETS[_reply_set][0]
-        _cpu_val = _cpu_pct()
-        _mem_val = _mem_pct()
-        sys_label = "%.1f  %d%%  %d%%" % (load1, _cpu_val, _mem_val)
-        knob_labels = [
-            sess_name,
-            "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
-            sys_label,
-            None,                    # zone 3 = weather (drawn separately, no text label)
-            "%d%%" % _brightness,
-        ]
-        half = img.width / 6        # canonical 200px unit (1200 / 6)
-        zone_widths = [half, half, half, half * 2, half]   # [200, 200, 200, 400, 200] = 1200
-        x0 = 0
-        for i, label in enumerate(knob_labels):
-            zw = zone_widths[i]
-            if i:
-                d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
-            # Zone 2 (system): 3 stacked mini-bars — load (blue), cpu (amber), mem (purple).
-            if i == 2:
-                bar_w = zw - 16
-                # load: scale 0..8 to bar width
-                bw_load = int(bar_w * min(load1 / 8.0, 1.0))
-                d.rectangle([x0 + 8, 48, x0 + 8 + bw_load, 53], fill=(95, 140, 180))
-                # cpu
-                bw_cpu = int(bar_w * (_cpu_val / 100.0))
-                d.rectangle([x0 + 8, 55, x0 + 8 + bw_cpu, 60], fill=(180, 140, 60))
-                # mem
-                bw_mem = int(bar_w * (_mem_val / 100.0))
-                d.rectangle([x0 + 8, 62, x0 + 8 + bw_mem, 67], fill=(140, 100, 180))
-            # Zone 3 (weather): animated condition icon + temp/word/city + grill badge.
-            if i == 3:
-                _render_weather_lcd_zone(d, x0, 44, zw, img.height - 44, _anim_phase)
-            # Zone 4 (brightness): single bar.
-            if i == 4:
-                bw = int((zw - 16) * (_brightness / 100.0))
-                d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
-            # Text label (skipped for weather zone — it has its own text).
-            if label is not None:
-                d.text((x0 + zw / 2, 84), label,
-                       font=ImageFont.truetype(FONT_R, 13), anchor="mm", fill=txt_c)
-            x0 += zw
+        # Load avg read once per frame — used in knob zone 2 below (normal mode only).
+        # In panorama modes (laputa/beach) the whole y=44-100 strip is the scene,
+        # so none of the knob zones are drawn.
+        if _lcd_mode == "normal":
+            try:
+                with open("/proc/loadavg") as _f:
+                    load1 = float(_f.read().split()[0])
+            except Exception:
+                load1 = 0.0
+            # Change 4 — board mode: 5 visual zones. Knob 3 hardware (page) keeps
+            # working but its label was dropped; zone 3 was repurposed for the
+            # weather + grill display (400px). System stats (load/cpu/mem) merged
+            # into one zone (was zones 4+5, now zone 2).
+            # ponytail: zone widths non-uniform — pg zone absorbed into weather;
+            # upgrade: re-add pg label if paging becomes a real workflow.
+            setname = REPLY_SETS[_reply_set][0]
+            _cpu_val = _cpu_pct()
+            _mem_val = _mem_pct()
+            sys_label = "%.1f  %d%%  %d%%" % (load1, _cpu_val, _mem_val)
+            knob_labels = [
+                sess_name,
+                "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
+                sys_label,
+                None,                    # zone 3 = weather (drawn separately, no text label)
+                "%d%%" % _brightness,
+            ]
+            half = img.width / 6        # canonical 200px unit (1200 / 6)
+            zone_widths = [half, half, half, half * 2, half]   # [200, 200, 200, 400, 200] = 1200
+            x0 = 0
+            for i, label in enumerate(knob_labels):
+                zw = zone_widths[i]
+                if i:
+                    d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
+                # Zone 2 (system): 3 stacked mini-bars — load (blue), cpu (amber), mem (purple).
+                if i == 2:
+                    bar_w = zw - 16
+                    # load: scale 0..8 to bar width
+                    bw_load = int(bar_w * min(load1 / 8.0, 1.0))
+                    d.rectangle([x0 + 8, 48, x0 + 8 + bw_load, 53], fill=(95, 140, 180))
+                    # cpu
+                    bw_cpu = int(bar_w * (_cpu_val / 100.0))
+                    d.rectangle([x0 + 8, 55, x0 + 8 + bw_cpu, 60], fill=(180, 140, 60))
+                    # mem
+                    bw_mem = int(bar_w * (_mem_val / 100.0))
+                    d.rectangle([x0 + 8, 62, x0 + 8 + bw_mem, 67], fill=(140, 100, 180))
+                # Zone 3 (weather): animated condition icon + temp/word/city + grill badge.
+                if i == 3:
+                    _render_weather_lcd_zone(d, x0, 44, zw, img.height - 44, _anim_phase)
+                # Zone 4 (brightness): single bar.
+                if i == 4:
+                    bw = int((zw - 16) * (_brightness / 100.0))
+                    d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
+                # Text label (skipped for weather zone — it has its own text).
+                if label is not None:
+                    d.text((x0 + zw / 2, 84), label,
+                           font=ImageFont.truetype(FONT_R, 13), anchor="mm", fill=txt_c)
+                x0 += zw
     native = PILHelper.to_native_touchscreen_format(deck, img)
     # Dedup like animate_active_keys does per-key: the touchscreen image is far
     # bigger than a key icon, so pushing it unconditionally every 20fps tick
@@ -2760,10 +2786,14 @@ _long_timers = {}    # key -> threading.Timer handle for the pending long-press
 # the module comment at line 349 described but never wired. M-SD4 adds:
 # key 18 (Esc) → force-kill, key 21 (Go) → git-push, key 17 (/super-worker) →
 # cycle-reply, and all other board slots → tail agentdeck log in a new pane.
-def _toggle_cinema():
-    global _cinema_mode
-    _cinema_mode = not _cinema_mode
-    log("cinema mode -> %s (long-press key 7)", _cinema_mode)
+def _cycle_lcd_mode():
+    """Long-press key 7: cycle normal → laputa → beach → normal."""
+    global _lcd_mode, _touch_frame_cache
+    order = ["normal", "laputa", "beach"]
+    i = order.index(_lcd_mode) if _lcd_mode in order else 0
+    _lcd_mode = order[(i + 1) % len(order)]
+    _touch_frame_cache = None    # force immediate repaint (skip dedup)
+    log("lcd mode -> %s (long-press key 7)", _lcd_mode)
 
 def _force_kill():
     """SIGTERM the foreground process of the active session's tmux pane."""
@@ -2872,7 +2902,7 @@ def _manual_prune():
         log("manual-prune: nothing to prune (%d sessions all healthy)" % len(survivors))
 
 _LONG_PRESS = {
-    7:  (_toggle_cinema,  0.6),
+    7:  (_cycle_lcd_mode, 0.6),
     17: (_cycle_reply,    0.6),   # R1 C8 /super-worker long-press
     18: (_force_kill,     0.6),   # R2 C0 Esc long-press
     21: (_git_push,       0.6),   # R2 C3 Go long-press
@@ -3071,7 +3101,7 @@ def main():
     # Retry HID enumeration+open with backoff (device may not be ready at boot).
     # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
     # settled the HID node yet; this keeps the process alive instead.
-    global IS_XL, HAS_DIALS, _cancel_key, _cinema_mode
+    global IS_XL, HAS_DIALS, _cancel_key, _lcd_mode
     _plus = None
     for _attempt in range(30):
         try:
@@ -3100,9 +3130,10 @@ def main():
         # XL: all input on keys; menu-cancel lives on the first reply key
         # (XL_REPLY0 = key 9). Reply set's 4th label is "4" (was "Go"; the
         # Go action moved to the always-visible quick-control strip at key 18).
-        # Cinema is ON — the Ghibli scene spans the XL's full 9x4 grid via
-        # _animate_cinema_xl. Keys 13-17 are intentionally dead.
-        _cinema_mode = True
+        # LCD panorama default — "beach" boots into the the city live scene.
+        # Long-press key 7 cycles normal → laputa → beach → normal. Keys 13-17
+        # are intentionally dead (slash-key strip is handled on the physical keys).
+        _lcd_mode = "beach"
         _cancel_key = XL_REPLY0
         plus.set_key_callback(on_key_xl)
         if HAS_DIALS:
