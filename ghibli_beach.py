@@ -4,18 +4,20 @@ ghibli_beach — the coast panorama for the Stream Deck XL+ LCD strip.
 
 Procedural PIL renderer producing a 1200×100 RGB image that depicts a
 Gulf-coast beach scene with live weather conditions and a time-of-day
-palette driven by the local hour.
+palette driven by the local hour. Styled for Studio Ghibli watercolor feel:
+soft radial sun glow, painterly 3-tier clouds, organic curved palm trunks
+with leaflet-bearing fronds, banded ocean with swell lines, wispy foam
+surf, sand with wet strip + tide lines + warm sparkle grain.
 
 Composition (back → front), chained per frame:
   1. Banded sky gradient (5 phases: night / sunrise / day / sunset / twilight)
-  2. Celestial body: sun by day, moon + stars by night (position from local hour)
-  3. Clouds: count/tint from weather (few fluffy for CLR, blanket stratus for CLD,
-     dark overcast for RAIN/TSTM, none for heavy fog)
+  2. Celestial body: sun by day, moon + stars by night — multi-layer soft glow
+  3. Clouds: 3-tier painterly puffs (shadow / body / crest) — count + tint from weather
   4. Distant barrier-island silhouette at the sky/ocean boundary
-  5. Ocean gradient (darker when overcast) with animated wave caps
-  6. White surf line where waves meet sand
-  7. Sand foreground with slight pixel noise texture
-  8. Palm-tree silhouettes at fixed anchor x positions, fronds sway with phase
+  5. Ocean: 4-band depth gradient + swell lines + animated wave caps
+  6. Wispy foam surf line with gaps + secondary backwash
+  7. Sand: wet strip near water + horizontal tide lines + warm sparkle grain
+  8. Palm-tree silhouettes: curved tapering trunk + 7 fronds each with leaflets
   9. Conditional weather overlay: rain streaks / lightning bolt / fog bands /
      snow flurries / heat shimmer
  10. Optional grill verdict chip top-right (drawn by deck.py, not here)
@@ -40,6 +42,7 @@ SAND_BASE_Y = 86        # where sand trapezoid starts
 # ---- palette by time-of-day phase ------------------------------------------
 # Each phase is a full palette dict. _pal_for_hour() interpolates between
 # adjacent phases on the hour boundary (e.g., 6.5 = sunrise/day 50/50).
+# Day palette warmed slightly toward cream/gold for Ghibli watercolor feel.
 PAL_BEACH = {
     "night": {
         "sky_zenith":  (8, 12, 35),
@@ -84,23 +87,23 @@ PAL_BEACH = {
         "fog":         (200, 175, 170),
     },
     "day": {
-        "sky_zenith":  (70, 130, 200),
-        "sky_mid":     (130, 175, 220),
-        "horizon":     (190, 220, 240),
-        "celestial":   (255, 240, 180),   # high pale-yellow sun
-        "celestial_glow": (255, 220, 140),
+        "sky_zenith":  (78, 138, 198),    # warmed slightly from (70,130,200)
+        "sky_mid":     (140, 182, 218),   # warmer mid
+        "horizon":     (205, 228, 240),
+        "celestial":   (255, 244, 188),   # warm pale-yellow sun
+        "celestial_glow": (255, 224, 148),
         "star":        (255, 255, 255),
-        "cloud_hi":    (250, 250, 255),
-        "cloud_lo":    (200, 210, 225),
-        "island":      (50, 75, 90),
-        "ocean_deep":  (35, 95, 140),
-        "ocean_shal":  (90, 165, 195),
-        "wave_cap":    (230, 245, 250),
-        "surf":        (245, 250, 252),
-        "sand":        (220, 200, 150),
-        "sand_hi":     (240, 225, 180),
-        "palm_trunk":  (70, 45, 30),
-        "palm_frond":  (40, 85, 50),
+        "cloud_hi":    (254, 250, 242),   # cream tint (was 250,250,255)
+        "cloud_lo":    (198, 208, 222),
+        "island":      (55, 80, 92),
+        "ocean_deep":  (32, 88, 132),
+        "ocean_shal":  (96, 168, 192),
+        "wave_cap":    (232, 246, 250),
+        "surf":        (248, 252, 252),
+        "sand":        (222, 202, 152),   # warm tan
+        "sand_hi":     (244, 228, 182),   # warm cream
+        "palm_trunk":  (74, 48, 32),
+        "palm_frond":  (52, 102, 56),     # lush green (was 40,85,50)
         "rain":        (180, 200, 225),
         "fog":         (220, 225, 230),
     },
@@ -186,27 +189,23 @@ def _hash(n):
 def _pal_for_hour(hour):
     """Return an interpolated palette dict for the given local hour (0-24 float).
     Boundary hours (e.g., 6.0) split the difference between adjacent phases."""
-    # Wrap hour into [0, 24)
     hour = hour % 24.0
-    # Find which band we're in
     for i, (name, t0, t1) in enumerate(_PHASE_BANDS):
         if t0 <= hour < t1:
             span = t1 - t0
             local_t = (hour - t0) / span if span > 0 else 0.0
-            # Blend toward the NEXT phase in the last 30% of this band
             blend_window = 0.3
             if local_t > (1.0 - blend_window):
                 bt = (local_t - (1.0 - blend_window)) / blend_window
                 nxt_name = _PHASE_BANDS[(i + 1) % len(_PHASE_BANDS)][0]
                 return _lerp_pal(PAL_BEACH[name], PAL_BEACH[nxt_name], _ease(bt))
             return dict(PAL_BEACH[name])
-    # Fallback (shouldn't hit)
     return dict(PAL_BEACH["day"])
 
 
-# ---- per-pixel helpers (used by sun glow + sand noise) ---------------------
+# ---- per-pixel helpers -----------------------------------------------------
 def _pixel_circle_blend(img, cx, cy, r, color, blend):
-    """Radial-falloff alpha blend a disc onto img. Used for celestial glows."""
+    """Radial-falloff alpha blend a disc onto img. Used for soft celestial glow."""
     r2 = r * r
     px = img.load()
     x0 = max(0, int(cx - r))
@@ -223,13 +222,35 @@ def _pixel_circle_blend(img, cx, cy, r, color, blend):
                 px[x, y] = _lerp(px[x, y], color, falloff)
 
 
+def _band_blend(img, y_center, half_h, color, alpha_peak, x0=0, x1=None):
+    """Soft horizontal band with linear falloff in y. Peaks at y_center.
+    Used for atmospheric haze, tide bands, wet-sand transitions."""
+    if x1 is None:
+        x1 = BEACH_W
+    if half_h <= 0 or alpha_peak <= 0.0:
+        return
+    px = img.load()
+    y_lo = max(0, int(y_center - half_h))
+    y_hi = min(BEACH_H, int(y_center + half_h + 1))
+    inv_half = 1.0 / float(half_h)
+    for y in range(y_lo, y_hi):
+        dist = abs(y - y_center)
+        alpha = alpha_peak * max(0.0, 1.0 - dist * inv_half)
+        if alpha <= 0.0:
+            continue
+        for x in range(x0, x1):
+            px[x, y] = _lerp(px[x, y], color, alpha)
+
+
 # ---- base layers -----------------------------------------------------------
 def _draw_sky(d, pal, weather):
-    """Three-band sky gradient: zenith → mid → horizon."""
+    """Four-band sky gradient with eased transitions for watercolor feel.
+    Overcast wash mutes the whole sky toward cloud_lo when CLD."""
     bands = [
-        (0.0, pal["sky_zenith"]),
-        (0.55, pal["sky_mid"]),
-        (1.0, pal["horizon"]),
+        (0.00, pal["sky_zenith"]),
+        (0.35, pal["sky_mid"]),
+        (0.75, pal["horizon"]),
+        (1.00, _lerp(pal["horizon"], pal["cloud_hi"], 0.20)),  # warm haze at very bottom
     ]
     for i in range(len(bands) - 1):
         t0, c0 = bands[i]
@@ -238,24 +259,21 @@ def _draw_sky(d, pal, weather):
         y1 = int(t1 * HORIZON_Y)
         for y in range(y0, y1):
             tt = (y - y0) / max(1, y1 - y0)
-            d.line([(0, y), (BEACH_W, y)], fill=_lerp(c0, c1, tt))
+            d.line([(0, y), (BEACH_W, y)], fill=_lerp(c0, c1, _ease(tt)))
     # Overcast wash: when CLD, mute the whole sky toward cloud_lo
     if weather == "CLD":
         wash = pal["cloud_lo"]
         for y in range(0, HORIZON_Y):
             tt = y / HORIZON_Y
-            wash_t = 0.45 * (1.0 - abs(tt - 0.4))  # strongest at upper-mid
-            cur = d  # placeholder; we apply via line overwrite
+            wash_t = 0.50 * (1.0 - abs(tt - 0.4))  # strongest at upper-mid
             d.line([(0, y), (BEACH_W, y)],
                    fill=_lerp(pal["sky_zenith"], wash, wash_t))
 
 
 def _draw_stars(d, pal, hour):
-    """30 hand-picked star positions; visible when hour < 6 or >= 19. Fade in/out
-    across the twilight bands."""
+    """30 hand-picked star positions; visible when hour < 6 or >= 19."""
     if 6.0 <= hour < 19.0:
         return
-    # Fade strength: full at deep night, 0 at the boundary
     if hour < 6.0:
         strength = _ease((6.0 - hour) / 2.0) if hour >= 4.0 else 1.0
     else:
@@ -263,38 +281,30 @@ def _draw_stars(d, pal, hour):
     if strength < 0.05:
         return
     base = pal["star"]
-    # 30 deterministic star positions via hash
     for i in range(30):
         sx = int(_hash(i + 1) * BEACH_W)
         sy = int(_hash(i + 100) * (HORIZON_Y - 8))
-        # Twinkle: each star pulses at its own phase
         tw = 0.6 + 0.4 * math.sin(_hash(i + 200) * 6.28 + time.time() * 2.0)
         c = _lerp((10, 10, 30), base, strength * tw)
         d.point([(sx, sy)], fill=c)
-        # Brighter stars get a 4-neighbour halo
         if _hash(i + 300) > 0.7:
             for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
                 d.point([(sx + dx, sy + dy)], fill=_lerp((10, 10, 30), base, strength * tw * 0.5))
 
 
 def _draw_celestial(img, d, phase, hour, pal, weather):
-    """Sun (day) or moon (night) positioned by hour. Cloud cover hides it partly."""
-    # Decide celestial kind and position
-    # Day arc: hour 6 → 18, sun rises east (x=0) sets west (x=1200)
-    # Night arc: hour 18 → 30 (== 6 next day), moon mirrors
+    """Sun (day) or moon (night) — soft multi-layer radial glow, no hard disc.
+    Ghibli sun = wide warm halo with bright core bloom. Weather hides it partly."""
     if 6.0 <= hour < 18.0:
-        # Day sun
-        day_t = (hour - 6.0) / 12.0  # 0..1
+        day_t = (hour - 6.0) / 12.0
         cx = int(BEACH_W * day_t)
-        # Parabolic arc: y = 4*t*(1-t) peaks at t=0.5 → y minimum (highest)
         arc = 4.0 * day_t * (1.0 - day_t)
-        cy = int(HORIZON_Y - 6 - arc * 30)  # sun rises up to 30px above horizon
+        cy = int(HORIZON_Y - 6 - arc * 30)
         body = pal["celestial"]
         glow = pal["celestial_glow"]
         r_body = 9
         r_glow = 22
     elif hour >= 18.0 or hour < 6.0:
-        # Night moon
         if hour >= 18.0:
             night_t = (hour - 18.0) / 12.0
         else:
@@ -307,20 +317,18 @@ def _draw_celestial(img, d, phase, hour, pal, weather):
         r_body = 7
         r_glow = 16
     else:
-        return  # gap phase
-
-    # Weather hide: heavy overcast / storm / fog hides celestial
-    if weather in ("CLD", "RAIN", "TSTM", "FOG"):
-        # Heavily muted: draw a faint glow disc only
-        _pixel_circle_blend(img, cx, cy, r_glow, glow, 0.15)
         return
 
-    # Glow halo first (behind)
-    _pixel_circle_blend(img, cx, cy, r_glow, glow, 0.45)
-    _pixel_circle_blend(img, cx, cy, r_body + 2, body, 0.7)
+    # Weather hide: heavy overcast / storm / fog — only faint glow disc
+    if weather in ("CLD", "RAIN", "TSTM", "FOG"):
+        _pixel_circle_blend(img, cx, cy, r_glow, glow, 0.18)
+        return
 
-    # Solid disc
-    d.ellipse([cx - r_body, cy - r_body, cx + r_body, cy + r_body], fill=body)
+    # Three-tier soft halo (Ghibli watercolor bloom): wide soft → middle → bright core
+    _pixel_circle_blend(img, cx, cy, int(r_glow * 1.5), glow, 0.12)   # outermost wide soft
+    _pixel_circle_blend(img, cx, cy, r_glow, glow, 0.28)              # middle halo
+    _pixel_circle_blend(img, cx, cy, r_body + 4, body, 0.55)          # inner bright corona
+    _pixel_circle_blend(img, cx, cy, r_body, body, 0.95)              # core bloom (replaces hard disc)
 
     # Moon crater detail (subtle)
     if hour >= 18.0 or hour < 6.0:
@@ -330,45 +338,53 @@ def _draw_celestial(img, d, phase, hour, pal, weather):
 
 
 def _draw_clouds(d, phase, pal, weather):
-    """Drifting cloud layer. Count and tint depend on weather."""
-    # Cloud params per condition
+    """Painterly 3-tier clouds (shadow base → body → crest highlight).
+    Each cloud = cluster of overlapping ellipses with volume + light direction."""
     presets = {
-        "CLR":  {"count": 3, "tint": "cloud_hi", "shadow": "cloud_lo", "opacity": 0.85, "drift": 0.6},
-        "CLD":  {"count": 8, "tint": "cloud_hi", "shadow": "cloud_lo", "opacity": 0.95, "drift": 0.4},
-        "DRIZ": {"count": 6, "tint": "cloud_lo", "shadow": "cloud_lo", "opacity": 0.92, "drift": 0.5},
-        "RAIN": {"count": 7, "tint": "cloud_lo", "shadow": "cloud_lo", "opacity": 0.97, "drift": 0.7},
-        "TSTM": {"count": 8, "tint": "cloud_lo", "shadow": "cloud_lo", "opacity": 0.99, "drift": 0.9},
-        "FOG":  {"count": 0, "tint": "cloud_hi", "shadow": "cloud_lo", "opacity": 0.0,  "drift": 0.0},
-        "SNOW": {"count": 5, "tint": "cloud_hi", "shadow": "cloud_lo", "opacity": 0.90, "drift": 0.3},
+        "CLR":  {"count": 3, "scale_mu": 1.0, "hi": "cloud_hi", "lo": "cloud_lo", "drift": 0.6},
+        "CLD":  {"count": 7, "scale_mu": 1.4, "hi": "cloud_hi", "lo": "cloud_lo", "drift": 0.4},
+        "DRIZ": {"count": 5, "scale_mu": 1.2, "hi": "cloud_lo", "lo": "cloud_lo", "drift": 0.5},
+        "RAIN": {"count": 7, "scale_mu": 1.5, "hi": "cloud_lo", "lo": "cloud_lo", "drift": 0.7},
+        "TSTM": {"count": 8, "scale_mu": 1.6, "hi": "cloud_lo", "lo": "cloud_lo", "drift": 0.9},
+        "FOG":  {"count": 0, "scale_mu": 1.0, "hi": "cloud_hi", "lo": "cloud_lo", "drift": 0.0},
+        "SNOW": {"count": 5, "scale_mu": 1.2, "hi": "cloud_hi", "lo": "cloud_lo", "drift": 0.3},
     }
     p = presets.get(weather, presets["CLR"])
     if p["count"] == 0:
         return
 
+    hi = pal[p["hi"]]
+    lo = pal[p["lo"]]
+    body_c = _lerp(lo, hi, 0.55)     # mid-tone between shadow + crest
     drift_speed = p["drift"]
-    hi = pal[p["tint"]]
-    lo = pal[p["shadow"]]
 
-    # Each cloud = cluster of overlapping ellipses, drifting left with wrap
     for i in range(p["count"]):
-        # Anchors spread across 1.5x canvas width for natural spacing
         anchor_x = (i * (BEACH_W * 1.4) / p["count"]) - (phase * drift_speed * 12.0)
         anchor_x = anchor_x % (BEACH_W + 300) - 150
-        # Vary cloud y position a bit
         cy_base = 12 + int(_hash(i + 7) * 22)
-        # Scale varies slightly per cloud
-        scale = 0.8 + 0.5 * _hash(i + 31)
+        scale = (p["scale_mu"] - 0.2) + 0.5 * _hash(i + 31)
 
-        # Draw shadow first (slightly below + darker)
-        for dx, dy, rx, ry in [(-20, 4, 22, 7), (0, 2, 28, 9), (22, 4, 20, 7), (-8, -2, 18, 6)]:
+        # Shadow tier (bottom, widest, darkest) — drawn first
+        sh = lo
+        for dx, dy, rx, ry in [(-28, 5, 30, 9), (-8, 7, 36, 11), (16, 5, 32, 10), (32, 7, 24, 8)]:
             d.ellipse([
                 anchor_x + dx * scale - rx * scale,
                 cy_base + dy * scale - ry * scale,
                 anchor_x + dx * scale + rx * scale,
                 cy_base + dy * scale + ry * scale,
-            ], fill=lo)
-        # Then highlight (slightly above + brighter)
-        for dx, dy, rx, ry in [(-18, 0, 18, 6), (2, -2, 24, 8), (20, 0, 17, 6)]:
+            ], fill=sh)
+
+        # Body tier (middle) — mid-tone, overlapping shadow
+        for dx, dy, rx, ry in [(-22, 0, 26, 8), (0, -2, 32, 10), (22, 0, 25, 8)]:
+            d.ellipse([
+                anchor_x + dx * scale - rx * scale,
+                cy_base + dy * scale - ry * scale,
+                anchor_x + dx * scale + rx * scale,
+                cy_base + dy * scale + ry * scale,
+            ], fill=body_c)
+
+        # Crest tier (top, smaller, brightest) — catches the light
+        for dx, dy, rx, ry in [(-16, -4, 18, 6), (4, -6, 22, 7), (20, -3, 16, 5)]:
             d.ellipse([
                 anchor_x + dx * scale - rx * scale,
                 cy_base + dy * scale - ry * scale,
@@ -378,155 +394,294 @@ def _draw_clouds(d, phase, pal, weather):
 
 
 def _draw_horizon_island(d, pal):
-    """Thin barrier-island silhouette at the horizon line."""
+    """Thin barrier-island silhouette at the horizon line. Atmospheric perspective:
+    color is faded toward horizon sky for distant feel."""
     base_y = HORIZON_Y + 1
     pts = [(0, base_y + 4)]
     x = 0
     while x <= BEACH_W:
-        # Two islands with valleys between
         h = 0
         if 150 < x < 380:
-            # Left island
             t = (x - 150) / 230.0
             h = int(7 * math.sin(t * math.pi))
         elif 700 < x < 1050:
-            # Right island
             t = (x - 700) / 350.0
             h = int(9 * math.sin(t * math.pi))
         pts.append((x, base_y - h))
         x += 6
     pts.append((BEACH_W, base_y + 4))
-    d.polygon(pts, fill=pal["island"])
+    # Fade island color toward horizon for atmospheric depth
+    island_faded = _lerp(pal["island"], pal["horizon"], 0.35)
+    d.polygon(pts, fill=island_faded)
 
 
 def _draw_ocean(d, pal, weather, phase):
-    """Ocean gradient + animated wave caps. Choppy when raining/stormy."""
-    # Gradient from HORIZON_Y down to SURF_Y
+    """4-band depth ocean gradient + horizontal swell lines + animated wave caps.
+    Wave caps biased toward surf (closer = denser). Choppy when raining/stormy."""
+    deep = pal["ocean_deep"]
+    shal = pal["ocean_shal"]
+    # Banded depth gradient: 4 tiers with eased transitions
+    band_count = 4
     for y in range(HORIZON_Y, SURF_Y):
         tt = (y - HORIZON_Y) / max(1, SURF_Y - HORIZON_Y)
-        d.line([(0, y), (BEACH_W, y)], fill=_lerp(pal["ocean_deep"], pal["ocean_shal"], tt))
+        band_t = tt * band_count
+        band_idx = min(band_count - 1, int(band_t))
+        local_t = band_t - band_idx
+        t0 = band_idx / band_count
+        t1 = (band_idx + 1) / band_count
+        c0 = _lerp(deep, shal, t0)
+        c1 = _lerp(deep, shal, t1)
+        d.line([(0, y), (BEACH_W, y)], fill=_lerp(c0, c1, _ease(local_t)))
 
-    # Wave caps: short white-ish horizontal segments, animated by phase
+    # Long swell lines: 3 subtle horizontal lines across ocean (painterly depth)
+    swell_c = _lerp(deep, pal["wave_cap"], 0.18)
+    for swell_t in (0.20, 0.50, 0.78):
+        sy = HORIZON_Y + int((SURF_Y - HORIZON_Y) * swell_t)
+        # Slight phase-driven horizontal shift on each end for living water
+        shift = int(2 * math.sin(phase * 0.6 + swell_t * 4))
+        d.line([(shift, sy), (BEACH_W, sy)], fill=swell_c, width=1)
+
+    # Wave caps: short bright horizontal segments, biased toward surf
     cap = pal["wave_cap"]
     if weather in ("RAIN", "TSTM"):
-        cap_density = 80
-        cap_len = (3, 8)
-    elif weather in ("DRIZ",):
-        cap_density = 40
-        cap_len = (2, 5)
+        cap_density, cap_len_range = 80, (3, 8)
+    elif weather == "DRIZ":
+        cap_density, cap_len_range = 40, (2, 5)
     else:
-        cap_density = 22
-        cap_len = (4, 10)
-
+        cap_density, cap_len_range = 30, (4, 12)
     for i in range(cap_density):
-        # Deterministic positions with phase-driven drift
-        bx = int((_hash(i + 500) * BEACH_W * 1.3) - (phase * 18.0) % BEACH_W) % BEACH_W
-        by = HORIZON_Y + 2 + int(_hash(i + 600) * (SURF_Y - HORIZON_Y - 4))
-        seg_len = int(cap_len[0] + _hash(i + 700) * (cap_len[1] - cap_len[0]))
-        d.line([(bx, by), (bx + seg_len, by)], fill=cap)
+        bx = int((_hash(i + 500) * BEACH_W * 1.3) - (phase * 18.0)) % BEACH_W
+        # y biased toward surf (lower = closer = more visible)
+        y_bias = _hash(i + 600) ** 1.4
+        by = HORIZON_Y + 2 + int(y_bias * (SURF_Y - HORIZON_Y - 4))
+        seg_len = int(cap_len_range[0] + _hash(i + 700) * (cap_len_range[1] - cap_len_range[0]))
+        d.line([(bx, by), (bx + seg_len, by)], fill=cap, width=1)
 
 
-def _draw_surf_line(d, pal):
-    """Thin white foam strip at the surf line."""
+def _draw_surf_line(d, pal, phase):
+    """Wispy irregular foam line with gaps + secondary backwash.
+    Ghibli surf isn't a straight line — it's broken foam with wet tendrils."""
     foam = pal["surf"]
-    # Slightly wavy foam line
-    pts = []
-    for x in range(0, BEACH_W + 4, 4):
-        y = SURF_Y + int(2 * math.sin(x * 0.04 + time.time() * 1.5))
-        pts.append((x, y))
-    for i in range(len(pts) - 1):
-        d.line([pts[i], pts[i + 1]], fill=foam, width=2)
+    foam_dim = _lerp(foam, _lerp(pal["sand"], (0, 0, 0), 0.10), 0.40)
+
+    # Main foam line with irregular gaps (hash-driven gap placement)
+    x = 0
+    seg_id = 0
+    while x < BEACH_W:
+        gap_seed = _hash(seg_id + 11)
+        if gap_seed > 0.88:
+            # Skip a small gap (wave recession)
+            x += int(4 + gap_seed * 8)
+            seg_id += 1
+            continue
+        seg_len = 6 + int(_hash(seg_id + 23) * 12)
+        seg_y = SURF_Y + int(2 * math.sin(x * 0.04 + phase * 1.5))
+        d.line([(x, seg_y), (min(BEACH_W, x + seg_len), seg_y)], fill=foam, width=2)
+        x += seg_len + int(_hash(seg_id + 31) * 4)
+        seg_id += 1
+
+    # Secondary thinner foam line above (backwash retracting)
+    backwash_y = SURF_Y - 3 + int(1.0 * math.sin(phase * 1.2))
+    for x in range(0, BEACH_W, 6):
+        gap_seed = _hash(x + 41)
+        if gap_seed > 0.55:
+            seg_len = 3 + int(_hash(x + 53) * 4)
+            d.line([(x, backwash_y), (min(BEACH_W, x + seg_len), backwash_y)],
+                   fill=foam_dim, width=1)
 
 
 def _draw_sand(img, d, pal):
-    """Sand trapezoid with pixel noise for texture."""
-    # Base sand fill from SURF_Y+2 down to BEACH_H
-    for y in range(SAND_BASE_Y, BEACH_H):
-        tt = (y - SAND_BASE_Y) / max(1, BEACH_H - SAND_BASE_Y)
-        d.line([(0, y), (BEACH_W, y)], fill=_lerp(pal["sand"], pal["sand_hi"], tt * 0.6))
+    """Sand: wet-sand strip just below surf + horizontal tide lines +
+    warm sparkle grain (denser than before). Painterly Ghibli beach foreground."""
+    sand = pal["sand"]
+    sand_hi = pal["sand_hi"]
+    wet_band_h = 5
 
-    # Pixel noise: ~5% of sand pixels get a slight highlight variation
+    # Wet sand strip (dark, damp)
+    wet_c = _lerp(sand, pal["palm_trunk"], 0.35)
+    for y in range(SAND_BASE_Y, min(BEACH_H, SAND_BASE_Y + wet_band_h)):
+        d.line([(0, y), (BEACH_W, y)], fill=wet_c)
+
+    # Main dry sand gradient
+    dry_start = SAND_BASE_Y + wet_band_h
+    for y in range(dry_start, BEACH_H):
+        tt = (y - dry_start) / max(1, BEACH_H - dry_start)
+        d.line([(0, y), (BEACH_W, y)], fill=_lerp(sand, sand_hi, tt * 0.7))
+
+    # Tide lines: 2 subtle darker horizontal bands (waterline history)
+    tide_c = _lerp(sand, pal["palm_trunk"], 0.20)
+    for tide_off in (wet_band_h + 2, wet_band_h + 6):
+        ty = SAND_BASE_Y + tide_off
+        if ty < BEACH_H:
+            d.line([(0, ty), (BEACH_W, ty)], fill=tide_c, width=1)
+
+    # Warm sparkle grain (denser + variable alpha for painterly texture)
     px = img.load()
-    for _ in range(400):
-        sx = int(_hash(_ * 13 + 1) * BEACH_W)
-        sy = SAND_BASE_Y + int(_hash(_ * 17 + 2) * (BEACH_H - SAND_BASE_Y))
+    grain_count = 700
+    dry_h = BEACH_H - dry_start
+    if dry_h <= 0:
+        return
+    for n in range(grain_count):
+        sx = int(_hash(n * 13 + 1) * BEACH_W)
+        sy = dry_start + int(_hash(n * 17 + 2) * dry_h)
         if 0 <= sx < BEACH_W and 0 <= sy < BEACH_H:
             base = px[sx, sy]
-            px[sx, sy] = _lerp(base, pal["sand_hi"], 0.35)
+            # Half bright sparkle, half darker grain — reads as sand texture
+            if _hash(n * 19 + 3) > 0.5:
+                px[sx, sy] = _lerp(base, sand_hi, 0.40)
+            else:
+                px[sx, sy] = _lerp(base, _lerp(sand, (0, 0, 0), 0.20), 0.25)
 
 
 def _draw_palm_tree(d, x_anchor, base_y, phase, pal, scale=1.0):
-    """Single palm silhouette. Trunk + 7 fronds swaying with phase."""
-    trunk = pal["palm_trunk"]
-    frond = pal["palm_frond"]
+    """Organic curved-trunk palm with rib-and-leaflet fronds.
+    Trunk: curved tapering polygon with highlight + shadow stripes + ring bands.
+    Fronds: 7 ribs each with paired leaflets along the length, plus 2 drooping accents."""
+    trunk_c = pal["palm_trunk"]
+    trunk_hi = _lerp(trunk_c, (255, 240, 200), 0.20)   # warm sunlit side
+    trunk_sh = _lerp(trunk_c, (0, 0, 0), 0.40)          # dark shadow side
+    frond_c = pal["palm_frond"]
+    frond_sh = _lerp(frond_c, (0, 0, 0), 0.30)
 
-    # Trunk: slightly curved tapering line from base up to crown
-    trunk_h = int(40 * scale)
-    trunk_top_x = x_anchor + int(3 * math.sin(phase * 0.3 + x_anchor))  # gentle sway
-    trunk_top_y = base_y - trunk_h
-    # Draw trunk as stacked rectangles (tapering)
-    for i in range(trunk_h):
-        t = i / trunk_h
-        w = max(1, int((4 - 2 * t) * scale))
-        # Slight curve: x drifts by sin
-        offset_x = int(3 * math.sin(t * 3.0 + phase * 0.2))
-        seg_x = x_anchor + offset_x
-        seg_y = base_y - i
-        d.rectangle([seg_x - w, seg_y - 1, seg_x + w, seg_y + 1], fill=trunk)
+    trunk_h = int(38 * scale)
+    # Gentle lean bias + phase sway
+    sway = math.sin(phase * 0.4 + x_anchor * 0.013)
+    crown_x = x_anchor + int(3 * scale * sway + 2 * scale)
+    crown_y = base_y - trunk_h
 
-    # Fronds: 7 fronds radiating from crown, each an elongated triangle
-    cx = trunk_top_x
-    cy = trunk_top_y
-    sway = math.sin(phase * 0.8 + x_anchor * 0.01)  # fronds sway
-    frond_len = int(22 * scale)
-    for i in range(7):
-        # Angles spread across the top half-circle: -150° to -30° (in degrees from horizontal)
-        # Convert to radians, fan from 180° (left) to 360° (right) through 270° (up)
-        base_angle = math.radians(180.0 + i * (180.0 / 6.0))  # 180..360
-        # Sway modifies the angle slightly per frond
-        angle = base_angle + sway * 0.15 * (1 if i % 2 == 0 else -1)
-        # Tip of frond
-        tx = cx + int(frond_len * math.cos(angle))
-        ty = cy + int(frond_len * math.sin(angle))
-        # Frond as a curved line of varying width (a few stacked segments)
+    # --- Trunk as curved polygon with taper ---
+    N = 12
+    left_edge = []
+    right_edge = []
+    for i in range(N + 1):
+        t = i / N
+        y = base_y - int(t * trunk_h)
+        # S-curve: gentle bow
+        curve = math.sin(t * math.pi * 0.85 + 0.3) * 3.5 * scale
+        taper = (1.0 - t * 0.55) * 2.8 * scale
+        cx_seg = x_anchor + curve
+        left_edge.append((cx_seg - taper, y))
+        right_edge.append((cx_seg + taper, y))
+    poly = left_edge + list(reversed(right_edge))
+    d.polygon(poly, fill=trunk_c)
+
+    # Highlight stripe on sunlit side (1px inside left edge)
+    for i in range(N):
+        lx0 = int(left_edge[i][0] + 1)
+        lx1 = int(left_edge[i + 1][0] + 1)
+        y0 = int(left_edge[i][1])
+        y1 = int(left_edge[i + 1][1])
+        if 0 <= lx0 < BEACH_W and 0 <= lx1 < BEACH_W:
+            d.line([(lx0, y0), (lx1, y1)], fill=trunk_hi, width=1)
+    # Shadow stripe on right edge
+    for i in range(N):
+        rx0 = int(right_edge[i][0] - 1)
+        rx1 = int(right_edge[i + 1][0] - 1)
+        y0 = int(right_edge[i][1])
+        y1 = int(right_edge[i + 1][1])
+        if 0 <= rx0 < BEACH_W and 0 <= rx1 < BEACH_W:
+            d.line([(rx0, y0), (rx1, y1)], fill=trunk_sh, width=1)
+
+    # Trunk ring bands (segmentation every 3 segs)
+    for i in range(2, N - 1, 3):
+        t = i / N
+        y = base_y - int(t * trunk_h)
+        curve = math.sin(t * math.pi * 0.85 + 0.3) * 3.5 * scale
+        taper = (1.0 - t * 0.55) * 2.8 * scale
+        cx_seg = int(x_anchor + curve)
+        d.line([(int(cx_seg - taper + 1), y), (int(cx_seg + taper - 1), y)],
+               fill=trunk_sh, width=1)
+
+    # Crown bulge (organic ellipse where fronds meet trunk)
+    d.ellipse([crown_x - 5, crown_y - 3, crown_x + 5, crown_y + 3], fill=trunk_c)
+
+    # --- Fronds: 7 ribs with paired leaflets + 2 drooping accents ---
+    frond_count = 7
+    frond_len = int(26 * scale)
+    # Fan from 170° (left-horizontal) through 270° (straight up) to 370° (right-horizontal)
+    for i in range(frond_count):
+        base_angle = math.radians(170.0 + i * (200.0 / (frond_count - 1)))
+        per_frond_sway = math.sin(phase * 0.9 + i * 0.7 + x_anchor * 0.01) * 0.18
+        angle = base_angle + per_frond_sway
+
+        # Build curved rib: 6 points from crown to tip with progressive droop
         steps = 6
-        prev_x, prev_y = cx, cy
+        rib_points = [(crown_x, crown_y)]
         for s in range(1, steps + 1):
             t = s / steps
-            # Curved frond: ease the angle slightly toward vertical (droop)
-            droop = math.sin(t * math.pi) * 0.25
-            ang = angle + droop * (1 if angle < math.radians(270) else -1)
-            mx = cx + int(frond_len * t * math.cos(ang))
-            my = cy + int(frond_len * t * math.sin(ang)) + int(droop * 4 * scale)
+            droop = math.sin(t * math.pi) * 4 * scale
+            mx = crown_x + int(frond_len * t * math.cos(angle))
+            my = crown_y + int(frond_len * t * math.sin(angle)) + int(droop)
+            rib_points.append((mx, my))
+
+        # Draw rib spine with tapering width
+        for s in range(len(rib_points) - 1):
+            t = s / max(1, len(rib_points) - 1)
             w = max(1, int((3 - 2 * t) * scale))
-            d.line([(prev_x, prev_y), (mx, my)], fill=frond, width=w)
-            prev_x, prev_y = mx, my
-        # Frond tip: small cluster of leaflets
-        d.ellipse([prev_x - 2, prev_y - 2, prev_x + 2, prev_y + 2], fill=frond)
+            d.line([rib_points[s], rib_points[s + 1]], fill=frond_c, width=w)
 
-    # Crown bulge
-    d.ellipse([cx - 4, cy - 3, cx + 4, cy + 3], fill=trunk)
+        # Leaflets: small angled lines along the rib (alternating sides)
+        for s in range(1, len(rib_points) - 1):
+            if s % 2 == 0:  # halve leaflet count for perf
+                continue
+            base_x, base_y_seg = rib_points[s]
+            next_x, next_y_seg = rib_points[s + 1]
+            prev_x, prev_y_seg = rib_points[s - 1]
+            # Rib direction
+            rib_dx = next_x - prev_x
+            rib_dy = next_y_seg - prev_y_seg
+            rib_len = math.hypot(rib_dx, rib_dy) + 0.001
+            # Perpendicular unit
+            perp_x = -rib_dy / rib_len
+            perp_y = rib_dx / rib_len
+            t = s / max(1, len(rib_points) - 1)
+            leaf_len = int((5 - 3 * t) * scale)
+            if leaf_len < 1:
+                continue
+            # One side (top)
+            tip_x = int(base_x + perp_x * leaf_len)
+            tip_y = int(base_y_seg + perp_y * leaf_len)
+            if 0 <= tip_x < BEACH_W and 0 <= tip_y < BEACH_H:
+                d.line([(base_x, base_y_seg), (tip_x, tip_y)], fill=frond_c, width=1)
+            # Other side (bottom)
+            tip_x2 = int(base_x - perp_x * leaf_len)
+            tip_y2 = int(base_y_seg - perp_y * leaf_len)
+            if 0 <= tip_x2 < BEACH_W and 0 <= tip_y2 < BEACH_H:
+                d.line([(base_x, base_y_seg), (tip_x2, tip_y2)], fill=frond_sh, width=1)
 
-    # A couple of coconuts
-    for dx, dy in [(-3, 3), (2, 4)]:
-        d.ellipse([cx + dx - 1, cy + dy - 1, cx + dx + 1, cy + dy + 1],
-                  fill=_lerp(trunk, (0, 0, 0), 0.2))
+        # Frond tip tuft (small cluster)
+        tip_x, tip_y = rib_points[-1]
+        d.ellipse([tip_x - 2, tip_y - 2, tip_x + 2, tip_y + 2], fill=frond_c)
+
+    # Drooping accent fronds (2 lower-angle, longer, drooping down)
+    for sign, ang_deg in [(-1, 225), (1, 315)]:
+        ang = math.radians(ang_deg) + sway * 0.08
+        tip_x = crown_x + int(20 * scale * math.cos(ang))
+        tip_y = crown_y + int(20 * scale * math.sin(ang)) + int(7 * scale)
+        if 0 <= tip_x < BEACH_W:
+            d.line([(crown_x, crown_y), (tip_x, tip_y)], fill=frond_c,
+                   width=max(1, int(2 * scale)))
+            # Small drooping leaflets
+            mid_x = (crown_x + tip_x) // 2
+            mid_y = (crown_y + tip_y) // 2
+            d.line([(mid_x, mid_y), (mid_x + sign * 3, mid_y + 3)], fill=frond_sh, width=1)
+
+    # Coconuts (2-3 small dark spheres)
+    for dx, dy in [(-3, 3), (2, 4), (-1, 5)]:
+        d.ellipse([crown_x + dx - 1, crown_y + dy - 1, crown_x + dx + 1, crown_y + dy + 1],
+                  fill=_lerp(trunk_c, (0, 0, 0), 0.30))
 
 
 # ---- weather overlays ------------------------------------------------------
 def _draw_rain_overlay(d, phase, density, color):
     """Vertical rain streaks. Density = streaks per frame."""
     for i in range(density):
-        # Position via hash, animated fall via phase
         seed_x = _hash(i + 1000)
         seed_v = _hash(i + 2000)
         bx = int(seed_x * BEACH_W * 1.2) % BEACH_W
-        # Fall speed: 200-400 px/sec depending on seed
         speed = 200 + seed_v * 200
-        # Cycle through a 1.0s period
         t = (phase * speed / 100.0 + seed_v * 100.0) % 100.0
         by = int(t)
-        # Skip if outside visible band
         if by < 0 or by > BEACH_H + 10:
             continue
         seg_len = 6 + int(seed_v * 6)
@@ -540,12 +695,9 @@ def _draw_lightning_bolt(d, phase, color):
     cycle_t = phase % period
     if cycle_t > flash_len:
         return
-    # Full-frame white wash, strongest at flash start
-    intensity = 1.0 - (cycle_t / flash_len)  # 1.0 → 0
+    intensity = 1.0 - (cycle_t / flash_len)
     flash_c = _lerp((0, 0, 0), color, intensity * 0.6)
     d.rectangle([0, 0, BEACH_W, HORIZON_Y], fill=flash_c)
-
-    # Jagged bolt down the middle (deterministic via phase-rounded hash)
     bolt_seed = int(phase / period)
     bx_start = 300 + int(_hash(bolt_seed) * 600)
     by_start = 0
@@ -555,7 +707,6 @@ def _draw_lightning_bolt(d, phase, color):
     for s in range(1, steps + 1):
         t = s / steps
         ny = by_start + int(t * (by_end - by_start))
-        # Jagged x offset, decreasing amplitude near the end
         amp = 25 * (1.0 - t * 0.4)
         nx = bx_start + int((_hash(bolt_seed * 17 + s) - 0.5) * 2 * amp)
         d.line([(prev_x, prev_y), (nx, ny)], fill=color, width=2)
@@ -567,14 +718,10 @@ def _draw_fog_bands(d, phase, color):
     bands = 5
     for i in range(bands):
         seed = _hash(i + 5000)
-        # Y position: spread across sky+ocean
         by = int(seed * (BEACH_H - 10))
-        # Drift x via phase
         drift = (phase * (15.0 + seed * 10.0)) % (BEACH_W + 200) - 100
-        # Band shape: elongated ellipse, very wide and short
         band_w = 250 + int(seed * 200)
         band_h = 4 + int(_hash(i + 5100) * 4)
-        # Draw multiple overlapping ellipses for soft edge
         for off in range(-3, 4):
             a = 0.18 - abs(off) * 0.04
             c = _lerp((0, 0, 0), color, a)
@@ -593,16 +740,12 @@ def _draw_snow_overlay(d, phase, color):
         seed_x = _hash(i + 6000)
         seed_v = _hash(i + 6100)
         bx_base = seed_x * BEACH_W
-        # Fall speed: 30-80 px/sec (slower than rain)
         speed = 30 + seed_v * 50
-        # Cycle through 3.0s period
         t = (phase * speed / 100.0 + seed_v * 100.0) % 100.0
         by = int(t)
         if by < 0 or by > BEACH_H + 5:
             continue
-        # Sine-wave horizontal drift
         bx = int(bx_base + math.sin(phase * 1.5 + seed_v * 6.28) * 15) % BEACH_W
-        # Flake as 1-2 pixel dot
         d.point([(bx, by)], fill=color)
         if _hash(i + 6200) > 0.6:
             d.point([(bx + 1, by)], fill=color)
@@ -615,11 +758,9 @@ def _draw_heat_shimmer(img, d, phase, y_top, y_bot, color):
     for r in range(rows):
         y = y_top + int((y_bot - y_top) * r / max(1, rows - 1))
         for x in range(0, BEACH_W, 3):
-            # Sine wave vertical displacement
             offset = int(2 * math.sin(x * 0.06 + phase * 2.0 + r * 0.5))
             ty = y + offset
             if 0 <= ty < BEACH_H:
-                # Blend with color at low alpha
                 falloff = 0.18 + 0.1 * math.sin(x * 0.02 + phase)
                 px[x, ty] = _lerp(px[x, ty], color, falloff)
 
@@ -655,7 +796,7 @@ def render_fort_myers_beach(phase, weather, local_hour):
     _draw_clouds(d, phase, pal, icon)
     _draw_horizon_island(d, pal)
     _draw_ocean(d, pal, icon, phase)
-    _draw_surf_line(d, pal)
+    _draw_surf_line(d, pal, phase)
     _draw_sand(img, d, pal)
 
     # Palms — fixed anchors

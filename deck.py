@@ -2618,63 +2618,65 @@ def render_touchscreen(deck):
             for i, up in enumerate(states):
                 color = (40, 180, 80) if up else (200, 60, 60)
                 d.ellipse([_host_x0 + i * 14, 30, _host_x0 + 8 + i * 14, 38], fill=color)
-        # Load avg read once per frame — used in knob zone 2 below (normal mode only).
-        # In panorama modes (laputa/beach) the whole y=44-100 strip is the scene,
-        # so none of the knob zones are drawn.
-        if _lcd_mode == "normal":
-            try:
-                with open("/proc/loadavg") as _f:
-                    load1 = float(_f.read().split()[0])
-            except Exception:
-                load1 = 0.0
-            # Change 4 — board mode: 5 visual zones. Knob 3 hardware (page) keeps
-            # working but its label was dropped; zone 3 was repurposed for the
-            # weather + grill display (400px). System stats (load/cpu/mem) merged
-            # into one zone (was zones 4+5, now zone 2).
-            # ponytail: zone widths non-uniform — pg zone absorbed into weather;
-            # upgrade: re-add pg label if paging becomes a real workflow.
-            setname = REPLY_SETS[_reply_set][0]
-            _cpu_val = _cpu_pct()
-            _mem_val = _mem_pct()
-            sys_label = "%.1f  %d%%  %d%%" % (load1, _cpu_val, _mem_val)
-            knob_labels = [
-                sess_name,
-                "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
-                sys_label,
-                None,                    # zone 3 = weather (drawn separately, no text label)
-                "%d%%" % _brightness,
-            ]
-            half = img.width / 6        # canonical 200px unit (1200 / 6)
-            zone_widths = [half, half, half, half * 2, half]   # [200, 200, 200, 400, 200] = 1200
-            x0 = 0
-            for i, label in enumerate(knob_labels):
-                zw = zone_widths[i]
-                if i:
-                    d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
-                # Zone 2 (system): 3 stacked mini-bars — load (blue), cpu (amber), mem (purple).
-                if i == 2:
-                    bar_w = zw - 16
-                    # load: scale 0..8 to bar width
-                    bw_load = int(bar_w * min(load1 / 8.0, 1.0))
-                    d.rectangle([x0 + 8, 48, x0 + 8 + bw_load, 53], fill=(95, 140, 180))
-                    # cpu
-                    bw_cpu = int(bar_w * (_cpu_val / 100.0))
-                    d.rectangle([x0 + 8, 55, x0 + 8 + bw_cpu, 60], fill=(180, 140, 60))
-                    # mem
-                    bw_mem = int(bar_w * (_mem_val / 100.0))
-                    d.rectangle([x0 + 8, 62, x0 + 8 + bw_mem, 67], fill=(140, 100, 180))
-                # Zone 3 (weather): animated condition icon + temp/word/city + grill badge.
-                if i == 3:
-                    _render_weather_lcd_zone(d, x0, 44, zw, img.height - 44, _anim_phase)
-                # Zone 4 (brightness): single bar.
-                if i == 4:
-                    bw = int((zw - 16) * (_brightness / 100.0))
-                    d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
-                # Text label (skipped for weather zone — it has its own text).
-                if label is not None:
-                    d.text((x0 + zw / 2, 84), label,
-                           font=ImageFont.truetype(FONT_R, 13), anchor="mm", fill=txt_c)
-                x0 += zw
+        # Load avg read once per frame — used in knob zone 2.
+        # Knob zones always render (all LCD modes) per user request — text gets
+        # drop-shadows in panorama modes for readability over photo-real backgrounds.
+        try:
+            with open("/proc/loadavg") as _f:
+                load1 = float(_f.read().split()[0])
+        except Exception:
+            load1 = 0.0
+        # Change 4 — board mode: 5 visual zones. Knob 3 hardware (page) keeps
+        # working but its label was dropped; zone 3 was repurposed for the
+        # weather + grill display (400px). System stats (load/cpu/mem) merged
+        # into one zone (was zones 4+5, now zone 2).
+        # ponytail: zone widths non-uniform — pg zone absorbed into weather;
+        # upgrade: re-add pg label if paging becomes a real workflow.
+        setname = REPLY_SETS[_reply_set][0]
+        _cpu_val = _cpu_pct()
+        _mem_val = _mem_pct()
+        sys_label = "%.1f  %d%%  %d%%" % (load1, _cpu_val, _mem_val)
+        knob_labels = [
+            sess_name,
+            "%s %d/%d" % (setname, _reply_set + 1, len(REPLY_SETS)),
+            sys_label,
+            None,                    # zone 3 = weather (drawn separately, no text label)
+            "%d%%" % _brightness,
+        ]
+        half = img.width / 6        # canonical 200px unit (1200 / 6)
+        zone_widths = [half, half, half, half * 2, half]   # [200, 200, 200, 400, 200] = 1200
+        x0 = 0
+        for i, label in enumerate(knob_labels):
+            zw = zone_widths[i]
+            if i:
+                d.line([(x0, 44), (x0, img.height)], fill=(20, 22, 28), width=2)
+            # Zone 2 (system): 3 stacked mini-bars — load (blue), cpu (amber), mem (purple).
+            if i == 2:
+                bar_w = zw - 16
+                bw_load = int(bar_w * min(load1 / 8.0, 1.0))
+                d.rectangle([x0 + 8, 48, x0 + 8 + bw_load, 53], fill=(95, 140, 180))
+                bw_cpu = int(bar_w * (_cpu_val / 100.0))
+                d.rectangle([x0 + 8, 55, x0 + 8 + bw_cpu, 60], fill=(180, 140, 60))
+                bw_mem = int(bar_w * (_mem_val / 100.0))
+                d.rectangle([x0 + 8, 62, x0 + 8 + bw_mem, 67], fill=(140, 100, 180))
+            # Zone 3 (weather): animated condition icon + temp/word/city + grill badge.
+            if i == 3:
+                _render_weather_lcd_zone(d, x0, 44, zw, img.height - 44, _anim_phase)
+            # Zone 4 (brightness): single bar.
+            if i == 4:
+                bw = int((zw - 16) * (_brightness / 100.0))
+                d.rectangle([x0 + 8, 48, x0 + 8 + bw, 56], fill=(95, 140, 180))
+            # Text label (skipped for weather zone — it has its own text).
+            # Drop-shadow in panorama modes so text reads over photo-real backgrounds.
+            if label is not None:
+                _lbl_font = ImageFont.truetype(FONT_R, 13)
+                if _lcd_drop_shadows:
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        d.text((x0 + zw / 2 + dx, 84 + dy), label,
+                               font=_lbl_font, anchor="mm", fill=(0, 0, 0))
+                d.text((x0 + zw / 2, 84), label,
+                       font=_lbl_font, anchor="mm", fill=txt_c)
+            x0 += zw
     native = PILHelper.to_native_touchscreen_format(deck, img)
     # Dedup like animate_active_keys does per-key: the touchscreen image is far
     # bigger than a key icon, so pushing it unconditionally every 20fps tick

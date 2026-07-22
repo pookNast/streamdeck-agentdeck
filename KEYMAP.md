@@ -4,7 +4,7 @@
 **Host:** the-host (homelab LAN, user `pooknast`)
 **Source:** `git-host:pook/streamdeck-agentdeck` — `deck.py` is the single-file service
 **Deploy:** `scp deck.py the-host:~/streamdeck-agentdeck/ && ssh the-host "systemctl --user restart streamdeck-agentdeck"`
-**Last updated:** 2026-07-22 (LCD panorama modes: normal / Laputa / the coast — long-press key 7 cycles)
+**Last updated:** 2026-07-22 (Ghibli-style painterly beach + knob zones always visible with drop-shadows)
 
 ---
 
@@ -126,7 +126,7 @@ Five visual knob zones. System stats merged (load/cpu/mem). Weather + grill zone
 
 ### Mode: `laputa` — Ghibli Siege panorama (existing)
 
-Full 1200×100 procedural canvas from `ghibli_scenes.render_touchscreen_banner(phase)`. Fantasy airship battle at golden hour. All knob zones hidden.
+Full 1200×100 procedural canvas from `ghibli_scenes.render_touchscreen_banner(phase)`. Fantasy airship battle at golden hour. Knob zones render on top with drop-shadows.
 
 ### Mode: `beach` — the city live-weather panorama (NEW)
 
@@ -165,7 +165,7 @@ Full 1200×100 procedural canvas from `ghibli_beach.render_fort_myers_beach(phas
 | 17–19 | Sunset | `(60,40,90)` | `(160,110,80)` |
 | 19–24 | Twilight | `(15,20,45)` | `(60,50,70)` |
 
-All knob zones (session/reply/system/brightness) **hidden** when panorama mode is active. Knob hardware still dispatches (turn dial 1 to move cursor, etc.) — only the visual labels are dropped.
+All knob zones (session/reply/system/weather/brightness) **always render** — in panorama modes they overlay the scene with drop-shadows on text labels for readability.
 
 ### Elements (top-half, all modes)
 
