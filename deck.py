@@ -635,6 +635,30 @@ def _prune_dead(sessions):
             dead_ids.add(sid)
             log("prune dead '%s' (konsole D-Bus session %s gone)",
                 s.get("title"), ksid_tracked)
+    # Expire stale prune cache entries (session could be re-created with same id)
+    for sid in list(_pruned):
+        if sid not in {s["id"] for s in sessions} and now - _pruned[sid] > 60:
+            del _pruned[sid]
+
+    # Reconcile caches: remove stale entries from _win_map and _pane_order for
+    # sessions that disappeared from agent-deck between polls (no prune signal
+    # fired because we missed the death event). This prevents ghost entries from
+    # accumulating in pane_order.json and windows.json.
+    live_ids = {s["id"] for s in sessions}
+    stale_win = [sid for sid in list(_win_map) if sid not in live_ids]
+    if stale_win:
+        for sid in stale_win:
+            _win_map.pop(sid, None)
+            _forget_pane(sid)
+            log("cache prune: stale win_map entry %s", sid[:8])
+        _save_win_map()
+    # Also prune _dbus_map entries for vanished sessions
+    stale_dbus = [sid for sid in list(_dbus_map) if sid not in live_ids]
+    if stale_dbus:
+        for sid in stale_dbus:
+            _dbus_map.pop(sid, None)
+        _save_dbus_map()
+
     if not dead_ids:
         return sessions
     for sid in dead_ids:
@@ -649,12 +673,10 @@ def _prune_dead(sessions):
         _dismissed.pop(sid, None)
         _suggest_sticky.pop(sid, None)
         _dbus_map.pop(sid, None)
-        _save_dbus_map()
+        _win_map.pop(sid, None)
         _forget_pane(sid)
-    # Expire stale prune cache entries (session could be re-created with same id)
-    for sid in list(_pruned):
-        if sid not in {s["id"] for s in sessions} and now - _pruned[sid] > 60:
-            del _pruned[sid]
+    _save_dbus_map()
+    _save_win_map()
     return [s for s in sessions if s["id"] not in dead_ids]
 
 def tmux_send(sess, keys):
