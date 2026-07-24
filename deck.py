@@ -27,6 +27,9 @@ from StreamDeck.Devices.StreamDeck import DialEventType, TouchscreenEventType
 from PIL import Image, ImageDraw, ImageFont
 import ghibli_scenes as ghibli
 import ghibli_beach
+from core.config import Config
+
+cfg = Config()
 
 AD = os.path.expanduser("~/.local/bin/agent-deck")
 
@@ -35,9 +38,9 @@ TXT_DIM = (205, 210, 220)      # secondary / label text
 TXT_BRIGHT = (220, 225, 235)   # primary text
 TXT_BANNER = (255, 230, 180)   # banner / menu highlight text
 NEW_SESSION_DIR = os.path.expanduser("~")
-_WIN_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/windows.json")
-_PANE_ORDER_PATH = os.path.expanduser("~/.cache/agentdeck/pane_order.json")
-_DBUS_MAP_PATH = os.path.expanduser("~/.cache/agentdeck/dbus_sessions.json")
+_WIN_MAP_PATH = os.path.join(cfg.cache_dir, "windows.json")
+_PANE_ORDER_PATH = os.path.join(cfg.cache_dir, "pane_order.json")
+_DBUS_MAP_PATH = os.path.join(cfg.cache_dir, "dbus_sessions.json")
 FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_R = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 if not os.path.exists(FONT_R):
@@ -51,14 +54,12 @@ SLEEP_SECS = 3600         # idle seconds before the OLEDs blank (wake on any inp
 # agent process runs on the-deck-host where every tool's stack is installed. A login
 # shell (`bash -lc`) puts ~/bin and ~/.local/bin on the remote PATH.
 # ponytail: hardcoded tool list — upgrade: read from config.toml when it grows.
-SSH_HOST = "the-deck-host"
 
 # Weather + grilling display keys (keys 27 + 28, R3 far-left).
 # ponytail: single city hardcoded — upgrade: list + tap-cycle when a 2nd location matters.
 # NWS (api.weather.gov): free, no API key, US-gov, the-host-reachable.
 # ponytail: 15-min cadence — NWS updates hourly; upgrade: adaptive on alert severity.
-FORT_MYERS_LATLON = (0.0, 0.0)
-WEATHER_REFRESH_SEC = 900       # 15 min
+
 WEATHER_TIMEOUT_SEC = 8
 NWS_USER_AGENT = "streamdeck-agentdeck (git-host:pook/streamdeck-agentdeck)"
 GRILL_HORIZON_HOURS = 6
@@ -66,24 +67,17 @@ GRILL_WIND_MPH = 20             # sustained wind no-go threshold
 GRILL_GUST_MPH = 30             # ponytail: NWS hourly often omits windGust — sustained is main guard
 GRILL_HEAT_F = 100              # extreme heat no-go threshold
 
-def _remote(tool):
-    return "ssh -t %s bash -lc %s" % (SSH_HOST, tool)
-
 # label doubles as the session title AND the tmux name slug:
 # `-t glm` -> session "glm" -> tmux "agentdeck_glm_<rand>". Keep labels short so
 # the deck button and the tmux session name correlate (agent-deck adds " (2)" for
 # duplicates -> agentdeck_glm-2_<rand>).
-TOOLS = [("claude", _remote("claude")),
-         ("glm",    _remote("claude-glm")),
-         ("gpt",    _remote("claude-gpt")),
-         ("local",  _remote("oc-start"))]
+TOOLS = [(label, cfg.remote_command(cmd)) for label, cmd in cfg.tools]
 
 # (label, mode). Tab/split act INSIDE the focused konsole window via D-Bus;
 # "window" opens a fresh konsole. Konsole places the new split pane on the right
 # (split-view-left-right) or bottom (split-view-top-bottom) — top/left placement
 # isn't exposed by Konsole's API, so we offer right (→) and down (↓).
-PLACEMENTS = [("Window", "window"), ("Tab", "tab"),
-              ("Split →", "split-right"), ("Split ↓", "split-down")]
+PLACEMENTS = [(label, mode) for label, mode in cfg.placements]
 CANCEL_KEY = 7             # last key cancels any open menu
 
 # Bottom-row reply sets: (name, [(label, tmux-keys-or-None) x4]). Pushing knob N
@@ -92,17 +86,9 @@ CANCEL_KEY = 7             # last key cancels any open menu
 # (digits don't work) — send nav+Enter as ONE contiguous send-keys (a lone Enter
 # or a long burst gets dropped by the TUI; Up resets to the top option).
 # "type" types the literal digit (for plain text input fields). "keys" = misc.
-REPLY_SETS = [
-    ("select", [("1", ["Up", "Enter"]),
-                ("2", ["Down", "Enter"]),
-                ("3", ["Down", "Down", "Enter"]),
-                ("4", ["Tab", "~0.5", "Enter"])]),
-    ("keys",   [("Esc", ["Escape"]), ("Space", ["Space"]),
-                ("S-Tab", ["BTab"]),
-                ("Voice", ["!voice"])]),
-    ("type",   [("1", ["1", "Enter"]), ("2", ["2", "Enter"]),
-                ("3", ["3", "Enter"]), ("Esc", ["Escape"])]),
-]
+REPLY_SETS = [(name, [(label, keys) for label, keys in zone])
+              for rs in cfg.reply_sets
+              for name, zone in [(rs["name"], rs["zones"])] ]
 
 STATE_COLOR = {"waiting": (140, 90, 15), "running": (24, 88, 38),
                "idle": (32, 36, 44), "starting": (24, 56, 100),
@@ -439,7 +425,7 @@ def _env_ready(label):
     # Pass probe as a single ssh arg so the REMOTE shell expands any $vars
     # (a local `bash -c` wrapper mangled quoting and expanded $ZAI_API_KEY here).
     r = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
-              SSH_HOST, probe], timeout=10)
+              cfg.ssh_host, probe], timeout=10)
     ok = bool(r and r.returncode == 0)
     if not ok:
         log("env check FAILED for '%s' — skipping auto-restart", label)
@@ -741,13 +727,13 @@ def _voice_toggle(sess):
     """Voice dictation via the-deck-host (mic is there). First press starts recording;
     second press stops, transcribes on the-deck-host, and injects the result into the
     session via tmux send-keys -l (no Enter, so the user reviews before submit)."""
-    ssh = ["ssh", "-o", "ConnectTimeout=5", SSH_HOST]
+    ssh = ["ssh", "-o", "ConnectTimeout=5", cfg.ssh_host]
     # Are we currently recording? (PID file exists on the-deck-host)
     r = _run(ssh + ["test -f /tmp/voice-glm-rec.pid"], timeout=8)
     if r and r.returncode != 0:
         # Not recording — start
         _run(ssh + ["~/.local/bin/voice-glm.sh"], timeout=10)
-        log("voice: recording started on %s", SSH_HOST); return
+        log("voice: recording started on %s", cfg.ssh_host); return
     # Recording — stop + transcribe (konsole-send will fail harmlessly on the-deck-host;
     # the transcript is written before that call)
     _run(ssh + ["~/.local/bin/voice-glm.sh"], timeout=90)
@@ -1318,7 +1304,7 @@ def _weather_poll():
     fail_streak, log, preserve last good state."""
     global _nws_grid
     try:
-        lat, lon = FORT_MYERS_LATLON
+        lat, lon = cfg.weather_lat, cfg.weather_lon
         if _nws_grid is None:
             pts = _nws_get(f"https://api.weather.gov/points/{lat},{lon}")
             props = pts["properties"]
@@ -1370,7 +1356,7 @@ def _weather_loop():
     """Background weather poller: refresh every WEATHER_REFRESH_SEC."""
     while True:
         _weather_poll()
-        time.sleep(WEATHER_REFRESH_SEC)
+        time.sleep(cfg.weather_refresh_sec)
 
 def _cpu_pct():
     """Aggregate CPU% since the last sample. Cached at most every 1s — the
