@@ -124,6 +124,11 @@ class Config:
         """Terminal integration mode: 'konsole', 'tmux', or 'none'."""
         return self._get("terminal.mode", "konsole")
 
+    @property
+    def win_miss_threshold(self):
+        """Number of missed checks before declaring a konsole window dead."""
+        return self._get("terminal.win_miss_threshold", 2)
+
     # --- Pruning section ---
     @property
     def win_miss_threshold(self):
