@@ -790,16 +790,21 @@ def session_activity(sess):
     # the full 20-line scrollback means stale completion markers / old menus
     # higher up can't mask the prompt that's actually on screen right now.
     footer = "\n".join(pane.splitlines()[-10:])
-    # Spinner anywhere in the pane = agent is actively working, regardless of
-    # what agent-deck reports (it flickers running↔waiting mid-turn). Never
-    # blink a spinning pane. A spinner also means any prior "Next" dismissal is
-    # stale (the agent acted) → rearm so the next prompt blinks normally.
-    # (Safe to scan the full pane: a completed turn's marker has no trailing
-    # '…', so SPIN_RE won't false-match it.)
-    m = SPIN_RE.search(pane)
+    # Spinner in the FOOTER = agent is actively working right now. Never blink
+    # a spun pane, and rearm any prior "Next" dismissal (the agent acted → the
+    # next prompt should blink normally).
+    # IMPORTANT: scan only the footer, NOT the full pane. Claude Code leaves
+    # the `✻ Verb… (Xs · Yk tokens)` status line visible in scrollback AFTER
+    # the agent pauses to ask permission, so a full-pane scan false-matches
+    # the stale status and hides the live `❯ 1. Yes` menu below (this was
+    # glm-5 never entering the focus queue despite a real permission prompt).
+    # The footer always contains the spinner line while the agent is actively
+    # working, so footer-only scan keeps live spinners detected while letting
+    # menu/prompt detection take over once the spinner status scrolls above.
+    m = SPIN_RE.search(footer)
     if m:
         _dismissed.pop(sess.get("id"), None)
-        el = ELAPSED_RE.search(pane)
+        el = ELAPSED_RE.search(footer)
         return ("%s %s" % (m.group(1), el.group(1)) if el else m.group(1), False, None)
     # Pane-driven prompt detection. agent-deck's status is NOT trusted here —
     # it reports "running" for Claude Code sessions sitting at an idle ❯ prompt,
