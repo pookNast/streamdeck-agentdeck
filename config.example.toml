@@ -1,0 +1,107 @@
+# streamdeck-agentdeck — generic config example
+# Copy to ~/.config/streamdeck-agentdeck/config.toml or ~/.streamdeck-agentdeck.toml
+
+[deck]
+# SSH host for agent sessions (omit for local-only; agent runs locally).
+# This must match a Host entry in your ~/.ssh/config. Run `./install.sh --configure`
+# to set it interactively, or edit directly below.
+ssh_host = "your-ssh-host"
+
+# Tool definitions: list of (display_label, shell_command) tuples.
+# When ssh_host is set, each command is wrapped:
+#   ssh -t <ssh_host> bash -lc '<command>'
+# Labels must be short (fit on a Stream Deck key).
+# To run locally (no SSH), leave ssh_host empty and put the raw command here.
+tools = [
+    ["claude", "claude"],
+    ["glm",    "claude-glm"],
+    ["gpt",    "claude-gpt"],
+    ["local",  "oc-start"],
+]
+
+# Placement options: how new sessions are placed in the terminal.
+# For Konsole D-Bus mode: "window", "tab", "split-right", "split-down"
+# For tmux-only mode: "window" (new tmux window) or "split-right" / "split-down"
+placements = [
+    ["Window", "window"],
+    ["Tab",    "tab"],
+    ["Split →", "split-right"],
+    ["Split ↓", "split-down"],
+]
+
+# Reply sets for bottom row: (name, [4 zones of (label, tmux_key_sequence)])
+# Key sequences: "Up", "Down", "Enter", "Escape", "Tab", "BTab", "Space"
+# Pause token: "~0.5" means sleep 0.5s before next key
+reply_sets = [
+    { name = "select",
+      zones = [
+          ["1",      ["Up",      "Enter"]],
+          ["2",      ["Down",    "Enter"]],
+          ["3",      ["Down", "Down", "Enter"]],
+          ["4",      ["Tab", "~0.5", "Enter"]],
+      ]
+    },
+    { name = "keys",
+      zones = [
+          ["Esc",    ["Escape"]],
+          ["Space",  ["Space"]],
+          ["S-Tab",  ["BTab"]],
+          ["Voice",  ["!voice"]],
+      ]
+    },
+    { name = "type",
+      zones = [
+          ["1",      ["1", "Enter"]],
+          ["2",      ["2", "Enter"]],
+          ["3",      ["3", "Enter"]],
+          ["Esc",    ["Escape"]],
+      ]
+    },
+]
+
+[terminal]
+# Terminal integration mode.
+# "konsole" — use Konsole D-Bus for window management (Linux/KDE only)
+# "tmux"      — tmux-only mode (portable; no X11/D-Bus dependency)
+# "none"      — no terminal integration (session order not visual-mapped)
+mode = "konsole"
+
+# Konsole-specific settings (only used when mode = "konsole")
+# [terminal.konsole]
+# exec = "konsole"           # path to konsole binary
+# dbus_service = "org.kde.konsole"
+
+# tmux-specific settings (only used when mode = "tmux")
+# [terminal.tmux]
+# split_direction_default = "vertical"
+
+[pruning]
+# Session pruning settings
+win_miss_threshold = 2        # consecutive misses before pruning a window
+idle_timeout_sec = 0          # seconds of idle before pruning (0 = disabled)
+prune_cooldown_sec = 60       # seconds before a pruned session ID can be reused
+
+[weather]
+# NWS weather display. Defaults to Denver, CO as a neutral placeholder.
+# Run `./install.sh --configure` to set your own location, or edit lat/lon/city_name.
+# Set enabled = false to disable.
+enabled = true
+lat = 39.74
+lon = -104.99
+city_name = "Your City"
+refresh_sec = 900             # 15 minutes
+
+[monitor]
+# SSH host aliases to health-check on the touchscreen (empty = disable monitoring).
+# These must match Host entries in your ~/.ssh/config.
+# Example: hosts = ["server-a", "server-b"]
+hosts = []
+
+[animations]
+# LCD panorama mode: "normal" | "laputa" | "beach"
+lcd_mode = "beach"
+
+[paths]
+# Override default paths (usually not needed)
+# agent_deck_bin = "/home/username/.local/bin/agent-deck"
+# cache_dir = "/home/username/.cache/agentdeck"

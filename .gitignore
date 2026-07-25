@@ -1,0 +1,15 @@
+# secrets & local state — never commit
+secrets
+*.secret
+.config/
+__pycache__/
+*.pyc
+
+# runtime / local-session state
+logs/
+.claude/
+
+# internal ops docs — never publish
+HANDOFF*.md
+FORK-PLAN.md
+MILESTONE-CONTRACT*.md
