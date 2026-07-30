@@ -1,9 +1,9 @@
 # Stream Deck XL+ Keymap — agentdeck v3
 
 **Hardware:** Elgato Stream Deck XL+ (36 keys: 9 cols × 4 rows + LCD strip)
-**Host:** the-host (homelab LAN, user `pooknast`)
-**Source:** `git-host:pook/streamdeck-agentdeck` — `deck.py` is the single-file service
-**Deploy:** `scp deck.py the-host:~/streamdeck-agentdeck/ && ssh the-host "systemctl --user restart streamdeck-agentdeck"`
+**Host:** any Linux host with USB + graphical session (systemd --user)
+**Source:** `deck.py` — the single-file service
+**Deploy:** `./install.sh` (copies `deck.py` to `~/streamdeck-agentdeck/` + registers the systemd --user unit)
 **Last updated:** 2026-07-22 (Ghibli-style painterly beach + knob zones always visible with drop-shadows)
 
 ---
@@ -75,7 +75,7 @@
 | 32 | `Swap` | Cycle active session's tool: claude→glm→gpt→local→claude (10s cooldown) |
 | 33 | `/goal` | Fire `/goal` Enter — initiate goal-tracked loop |
 | 34 | `/goal complete` | Fire `/goal complete` Enter — close active goal loop |
-| 35 | `Status` | Open tmux split with homelab status (the-host/the-deck-host/server-host uptime+mem+disk+services) |
+| 35 | `Status` | Open tmux split with homelab status (configured hosts uptime+mem+disk+services) |
 
 ---
 
@@ -128,9 +128,9 @@ Five visual knob zones. System stats merged (load/cpu/mem). Weather + grill zone
 
 Full 1200×100 procedural canvas from `ghibli_scenes.render_touchscreen_banner(phase)`. Fantasy airship battle at golden hour. Knob zones render on top with drop-shadows.
 
-### Mode: `beach` — the city live-weather panorama (NEW)
+### Mode: `beach` — live-weather panorama (NEW)
 
-Full 1200×100 procedural canvas from `ghibli_beach.render_fort_myers_beach(phase, weather, local_hour)`. Reflects real the city GPS coords + live NWS weather conditions:
+Full 1200×100 procedural canvas from `ghibli_beach.render_beach_panorama(phase, weather, local_hour)`. Reflects real GPS coords (set via `./install.sh --configure`) + live NWS weather conditions:
 
 **Layered render chain:**
 
@@ -176,7 +176,7 @@ All knob zones (session/reply/system/weather/brightness) **always render** — i
 | **Needy badge** | y=9, right of time | When >1 session needs input | `⚠ N waiting` — pulses at 1.0s period (amber sine). Hidden when count ≤ 1 |
 | **Reply preview** | y=28–42, 4 segments | When active session has live menu | Shows 4 menu options. The ❯ cursor option gets bright green; others muted blue; empty zones dim |
 | **Heartbeat dots** | y=28–36, left | When NO live menu | One dot per session (up to MAX_SESSIONS), leftmost=active. Breathing pulse for running, steady red=error, green=done, dim=idle |
-| **Host dots** | y=30–38, right of heartbeats | When NO live menu | Green/red dots for the-deck-host, server-host, nas-host, git-host reachability |
+| **Host dots** | y=30–38, right of heartbeats | When NO live menu | Green/red dots for each host in `monitor.hosts` (config) |
 
 ### Knob behavior (dials)
 
