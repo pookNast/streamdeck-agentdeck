@@ -368,19 +368,30 @@ def _record_pane(pid, sid):
     Moves `sid` out of any other window's list first, so a session that got
     reopened elsewhere doesn't appear in two places."""
     pid = str(pid)
+    changed = False
     with _lock:
         for p, sids in list(_pane_order.items()):
             if sid in sids and p != pid:
                 sids.remove(sid)
+                changed = True
                 if not sids:
                     del _pane_order[p]
         lst = _pane_order.setdefault(pid, [])
         if sid not in lst:
             lst.append(sid)
+            changed = True
+    # Save OUTSIDE _lock: _save_pane_order() re-acquires _lock for its snapshot,
+    # so calling it while _lock is held is a non-reentrant self-deadlock that
+    # freezes the render thread. Mutations stay under the lock; only the disk
+    # write is deferred. (Concurrency fix: _lock is NON-reentrant.)
+    if changed:
         _save_pane_order()
 
 def _forget_pane_locked(sid):
-    """Remove sid from _pane_order. Caller MUST hold _lock."""
+    """Remove sid from _pane_order. Caller MUST hold _lock. Returns True if the
+    pane order changed; the CALLER persists _pane_order OUTSIDE the lock (this
+    helper must not call _save_pane_order() — _lock is already held by the
+    caller and _save_pane_order() re-acquires it => non-reentrant deadlock)."""
     changed = False
     for p, sids in list(_pane_order.items()):
         if sid in sids:
@@ -388,12 +399,14 @@ def _forget_pane_locked(sid):
             changed = True
             if not sids:
                 del _pane_order[p]
-    if changed:
-        _save_pane_order()
+    return changed
 
 def _forget_pane(sid):
+    changed = False
     with _lock:
-        _forget_pane_locked(sid)
+        changed = _forget_pane_locked(sid)
+    if changed:
+        _save_pane_order()
 _reply_set = 0             # index into REPLY_SETS (no longer cycled — Set key removed); default "select" 1/2/3/4
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
@@ -685,10 +698,13 @@ def _prune_dead(sessions):
             # scope as the pop. Between the read above and this pop, a
             # _new_window/place_* thread could have remapped _win_map[sid] to
             # a fresh konsole; popping blindly would drop that new mapping.
+            popped = False
             with _lock:
                 if _win_map.get(sid) == konsole_pid:
                     _win_map.pop(sid, None)
-                    _save_win_map()
+                    popped = True
+            if popped:
+                _save_win_map()
             log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
         # Signal 4: tracked Konsole D-Bus session path no longer exists in
         # sessionList. Catches per-tab close: closing one tab in a multi-tab
@@ -730,22 +746,28 @@ def _prune_dead(sessions):
         # fired because we missed the death event). This prevents ghost entries from
         # accumulating in pane_order.json and windows.json.
         live_ids = {s["id"] for s in sessions}
+        pane_changed = False
         with _lock:
-            # Mutations + saves under the lock: _new_window/place_* write these same
-            # maps from other threads; an unlocked read-modify-write raced them.
+            # Mutations under the lock: _new_window/place_* write these same maps
+            # from other threads; an unlocked read-modify-write raced them. Saves
+            # are deferred to AFTER the lock — _save_*() re-acquire _lock for
+            # their snapshot, so saving here would self-deadlock (non-reentrant).
             stale_win = [sid for sid in list(_win_map) if sid not in live_ids]
             for sid in stale_win:
                 _win_map.pop(sid, None)
-                _forget_pane_locked(sid)
+                if _forget_pane_locked(sid):
+                    pane_changed = True
                 log("cache prune: stale win_map entry %s", sid[:8])
-            if stale_win:
-                _save_win_map()
             # Also prune _dbus_map entries for vanished sessions
             stale_dbus = [sid for sid in list(_dbus_map) if sid not in live_ids]
             for sid in stale_dbus:
                 _dbus_map.pop(sid, None)
-            if stale_dbus:
-                _save_dbus_map()
+        if stale_win:
+            _save_win_map()
+        if pane_changed:
+            _save_pane_order()
+        if stale_dbus:
+            _save_dbus_map()
 
         if not dead_ids:
             return sessions
@@ -769,6 +791,7 @@ def _prune_dead(sessions):
     # Cache mutations + saves INSIDE _lock — same maps are written by
     # _new_window/place_* from other threads. _prune_lock keeps the two callers
     # from interleaving this pop-pass with a detection phase.
+    pane_changed = False
     with _prune_lock:
         with _lock:
             for sid in dead_ids:
@@ -779,9 +802,17 @@ def _prune_dead(sessions):
                 _suggest_sticky.pop(sid, None)
                 _dbus_map.pop(sid, None)
                 _win_map.pop(sid, None)
-                _forget_pane_locked(sid)
-            _save_dbus_map()
-            _save_win_map()
+                if _forget_pane_locked(sid):
+                    pane_changed = True
+    # Cache saves OUTSIDE both locks: _save_*() re-acquire _lock for their
+    # snapshot, so calling them inside the `with _lock:` above is a
+    # non-reentrant self-deadlock (regression from the snapshot-under-lock
+    # refactor). Mutations stayed under the lock; only the writes are deferred.
+    if dead_ids:
+        _save_dbus_map()
+        _save_win_map()
+    if pane_changed:
+        _save_pane_order()
     return [s for s in sessions if s["id"] not in dead_ids]
 
 def tmux_send(sess, keys):
@@ -1227,7 +1258,7 @@ def _new_window(cmd, sid=None):
                 pid = _xrun(["xdotool", "getwindowpid", wid]).strip()
                 with _lock:
                     _win_map[sid] = pid
-                    _save_win_map()
+                _save_win_map()
                 _record_pane(pid, sid)
                 log("opened+tracked konsole pid %s (win %s) for session %s",
                     pid, wid, sid[:8]); return
@@ -1257,8 +1288,10 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
             if sid:
                 pid = svc.rsplit("-", 1)[-1]
                 with _lock:
-                    _win_map[sid] = pid; _save_win_map()
-                    _dbus_map[sid] = ksid; _save_dbus_map()
+                    _win_map[sid] = pid
+                    _dbus_map[sid] = ksid
+                _save_win_map()
+                _save_dbus_map()
                 _record_pane(pid, sid)
         else:
             _new_window(cmd, sid=sid)
@@ -1335,8 +1368,10 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
         if sid:
             pid = svc.rsplit("-", 1)[-1]
             with _lock:
-                _win_map[sid] = pid; _save_win_map()
-                _dbus_map[sid] = ksid; _save_dbus_map()
+                _win_map[sid] = pid
+                _dbus_map[sid] = ksid
+            _save_win_map()
+            _save_dbus_map()
             _record_pane(pid, sid)
         return
     log("split didn't hold for %s; closing pane %s, opening window",
