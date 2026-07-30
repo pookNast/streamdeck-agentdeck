@@ -3207,8 +3207,11 @@ def on_dial(deck, dial, event, value):
         elif dial == 5:                                 # knob 6: brightness (dimmer)
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
             # Defer the set_brightness to the render loop — writing from this HID
-            # read thread races the render thread's own device writes.
-            _brightness_pending = _brightness
+            # read thread races the render thread's own device writes. Set under
+            # _lock so a render-loop read+clear can't race between read and clear
+            # and drop the change (FIX D).
+            with _lock:
+                _brightness_pending = _brightness
             log("knob 6 (brightness) -> %d", _brightness)
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
         # Knob N push = reply slot N (knobs 1-4 only; knobs 5-6 have no reply slot).
@@ -3359,9 +3362,12 @@ def main():
                     log("wake brightness restore failed: %s", e)
             # Brightness change deferred from on_dial knob 6 (StreamDeck read
             # thread): apply here so set_brightness runs on the render thread.
-            if _brightness_pending is not None:
+            # Read+clear atomically under _lock so an on_dial write between the
+            # read and the clear can't be dropped (FIX D).
+            with _lock:
                 _b = _brightness_pending
                 _brightness_pending = None
+            if _b is not None:
                 try:
                     plus.set_brightness(_b)
                 except OSError as e:
