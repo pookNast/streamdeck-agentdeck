@@ -1676,6 +1676,21 @@ def _attach_cmd(sid):
     if not re.fullmatch(r"[A-Za-z0-9_-]+", sid or ""):
         log("attach: refusing sid %r (invalid chars)", sid)
         return None
+    # ponytail: the flock path hardcodes $HOME/.cache/agentdeck (the default
+    # paths.cache_dir) rather than cfg.cache_dir. This is a SHELL fragment run
+    # on the (possibly remote, via ssh -t bash -lc) host, where $HOME expands
+    # to the REMOTE user's home — so a local absolute cfg.cache_dir can't be
+    # reliably mapped onto the remote shell's $HOME. Overriding paths.cache_dir
+    # to a non-default location therefore splits the cache (lock files land in
+    # the default dir). Acceptable: the default is the documented location and
+    # remote/local path reconciliation is out of scope. — upgrade: resolve a
+    # $HOME-relative remote path from cfg.cache_dir if remote attach ever needs
+    # a custom cache dir.
+    # ponytail: flock lockfiles are empty 0-byte files, one per session ever
+    # attached, never unlinked on detach — they slowly accumulate in the cache
+    # dir but are harmless (tiny, inert). — upgrade: unlink on detach, or extend
+    # the cache-reconcile-on-cycle to sweep stale attach-*.lock files if the
+    # cache dir grows. No complexity added now (YAGNI).
     lock = "$HOME/.cache/agentdeck/attach-%s.lock" % sid
     return ("mkdir -p $HOME/.cache/agentdeck; flock -n %s -c "
             "'%s session start %s >/dev/null 2>&1; %s session attach %s' "
