@@ -334,17 +334,21 @@ def _record_pane(pid, sid):
             lst.append(sid)
         _save_pane_order()
 
+def _forget_pane_locked(sid):
+    """Remove sid from _pane_order. Caller MUST hold _lock."""
+    changed = False
+    for p, sids in list(_pane_order.items()):
+        if sid in sids:
+            sids.remove(sid)
+            changed = True
+            if not sids:
+                del _pane_order[p]
+    if changed:
+        _save_pane_order()
+
 def _forget_pane(sid):
     with _lock:
-        changed = False
-        for p, sids in list(_pane_order.items()):
-            if sid in sids:
-                sids.remove(sid)
-                changed = True
-                if not sids:
-                    del _pane_order[p]
-        if changed:
-            _save_pane_order()
+        _forget_pane_locked(sid)
 _reply_set = 0             # index into REPLY_SETS (no longer cycled — Set key removed); default "select" 1/2/3/4
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
@@ -422,6 +426,8 @@ def _env_ready(label):
     probe = TOOL_READY.get(label)
     if not probe:
         return True                       # unknown tool — don't block a restart
+    if not cfg.ssh_host:
+        return True                       # local-only setup — no remote probe possible
     # Pass probe as a single ssh arg so the REMOTE shell expands any $vars
     # (a local `bash -c` wrapper mangled quoting and expanded $ZAI_API_KEY here).
     r = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
@@ -490,7 +496,10 @@ def _run(cmd, timeout=30):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except Exception as e:
-        log("! %s failed: %s", " ".join(cmd), e); return None
+        # repr(cmd) — never raise from the handler itself: cmd can hold a None
+        # element (e.g. cfg.ssh_host on a local-only setup) which would make
+        # " ".join(cmd) itself raise TypeError and escape into the main loop.
+        log("! %s failed: %s", repr(cmd), e); return None
 
 def fetch_sessions():
     r = _run([AD, "list", "--json"], timeout=10)
@@ -591,7 +600,7 @@ def _prune_dead(sessions):
         _win_miss.pop(sid, None)
         with _lock:
             _win_map.pop(sid, None)
-        _save_win_map()
+            _save_win_map()
         log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
     # Signal 4: tracked Konsole D-Bus session path no longer exists in
     # sessionList. Catches per-tab close: closing one tab in a multi-tab
@@ -631,38 +640,47 @@ def _prune_dead(sessions):
     # fired because we missed the death event). This prevents ghost entries from
     # accumulating in pane_order.json and windows.json.
     live_ids = {s["id"] for s in sessions}
-    stale_win = [sid for sid in list(_win_map) if sid not in live_ids]
-    if stale_win:
+    with _lock:
+        # Mutations + saves under the lock: _new_window/place_* write these same
+        # maps from other threads; an unlocked read-modify-write raced them.
+        stale_win = [sid for sid in list(_win_map) if sid not in live_ids]
         for sid in stale_win:
             _win_map.pop(sid, None)
-            _forget_pane(sid)
+            _forget_pane_locked(sid)
             log("cache prune: stale win_map entry %s", sid[:8])
-        _save_win_map()
-    # Also prune _dbus_map entries for vanished sessions
-    stale_dbus = [sid for sid in list(_dbus_map) if sid not in live_ids]
-    if stale_dbus:
+        if stale_win:
+            _save_win_map()
+        # Also prune _dbus_map entries for vanished sessions
+        stale_dbus = [sid for sid in list(_dbus_map) if sid not in live_ids]
         for sid in stale_dbus:
             _dbus_map.pop(sid, None)
-        _save_dbus_map()
+        if stale_dbus:
+            _save_dbus_map()
 
     if not dead_ids:
         return sessions
+    # Slow agent-deck stop+remove runs OUTSIDE the lock — never hold _lock across
+    # a subprocess call (it would stall every writer for up to 10s per session).
     for sid in dead_ids:
         if sid not in _pruned:
             _run([AD, "session", "stop", sid], timeout=10)
             _run([AD, "session", "remove", sid, "--force"], timeout=10)
             _pruned[sid] = now
             log("prune: stop+remove %s", sid[:8])
-        _activity.pop(sid, None)
-        _urgency.pop(sid, None)
-        _needed_since.pop(sid, None)
-        _dismissed.pop(sid, None)
-        _suggest_sticky.pop(sid, None)
-        _dbus_map.pop(sid, None)
-        _win_map.pop(sid, None)
-        _forget_pane(sid)
-    _save_dbus_map()
-    _save_win_map()
+    # Cache mutations + saves INSIDE the lock — same maps are written by
+    # _new_window/place_* from other threads.
+    with _lock:
+        for sid in dead_ids:
+            _activity.pop(sid, None)
+            _urgency.pop(sid, None)
+            _needed_since.pop(sid, None)
+            _dismissed.pop(sid, None)
+            _suggest_sticky.pop(sid, None)
+            _dbus_map.pop(sid, None)
+            _win_map.pop(sid, None)
+            _forget_pane_locked(sid)
+        _save_dbus_map()
+        _save_win_map()
     return [s for s in sessions if s["id"] not in dead_ids]
 
 def tmux_send(sess, keys):
@@ -2739,6 +2757,9 @@ def on_key(deck, key, pressed):
 _press_ts = {}       # key -> monotonic timestamp of key-down edge
 _long_fired = set()  # keys whose long-press action already fired (cleared on key-up)
 _long_timers = {}    # key -> threading.Timer handle for the pending long-press
+# Guards _long_fired between the StreamDeck read thread (key-up) and the Timer
+# thread (_fire) — a check-then-act on the shared set raced them.
+_longpress_lock = threading.Lock()
 
 # Keys with a long-press action. key index -> (action callable, threshold seconds).
 # M-SD3 seeds key 7 (last slot of row 0) with cinema-mode toggle — the feature
@@ -2896,7 +2917,8 @@ def _track_press(key, pressed):
         action, threshold = spec
         _long_fired.discard(key)
         def _fire():
-            _long_fired.add(key)
+            with _longpress_lock:
+                _long_fired.add(key)
             try:
                 action()
             except Exception:
@@ -2910,10 +2932,10 @@ def _track_press(key, pressed):
     t = _long_timers.pop(key, None)
     if t is not None:
         t.cancel()
-    if key in _long_fired:
+    with _longpress_lock:
+        hit = key in _long_fired
         _long_fired.discard(key)
-        return True
-    return False
+    return hit
 
 @_safe_callback
 def on_key_xl(deck, key, pressed):
