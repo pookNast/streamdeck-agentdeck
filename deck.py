@@ -1492,11 +1492,13 @@ def _attach_cmd(sid):
     # mirrored the original agent into fresh panes (observed 2026-07-04). The
     # lock is held for the attach's lifetime, so an inherited re-run fails `-n`
     # and degrades to a plain shell instead of a mirror.
-    if re.search(r"[^\w.-]", sid or ""):
-        # sid feeds a shell fragment + lock filename; agent-deck ids are hex-dash
-        # today — if that ever changes, skip the guard rather than break quoting.
-        log("attach: sid %r has unexpected chars; skipping flock guard", sid)
-        return "%s session start %s >/dev/null 2>&1; %s session attach %s" % (AD, sid, AD, sid)
+    # SECURITY: sid is interpolated raw into a shell fragment + a lock filename,
+    # so it must NEVER contain shell/PATH metacharacters. The old regex "guard"
+    # only picked a branch on bad input — it did not sanitize. Hard-reject here:
+    # agent-deck ids are hex+dash, so [A-Za-z0-9_-]+ admits every real id.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", sid or ""):
+        log("attach: refusing sid %r (invalid chars)", sid)
+        return None
     lock = "$HOME/.cache/agentdeck/attach-%s.lock" % sid
     return ("mkdir -p $HOME/.cache/agentdeck; flock -n %s -c "
             "'%s session start %s >/dev/null 2>&1; %s session attach %s' "
@@ -1506,7 +1508,11 @@ def _attach_cmd(sid):
 
 def open_existing(s, mode):
     """(Re)open an existing session in the chosen placement (window/tab/split)."""
-    place_konsole(_attach_cmd(s["id"]), mode, sid=s["id"], tmux=s.get("tmux_session"))
+    cmd = _attach_cmd(s["id"])
+    if not cmd:
+        log("open_existing: bad sid %r, skipping", s.get("id"))
+        return
+    place_konsole(cmd, mode, sid=s["id"], tmux=s.get("tmux_session"))
 
 def toggle_or_place(deck, s):
     """If this session's konsole window is alive: minimize it when visible,
@@ -1562,7 +1568,9 @@ def spawn(tool, mode):
     except Exception as e:
         log("spawn parse error: %s", e); return
     if sid:
-        place_konsole(_attach_cmd(sid), mode, sid=sid, tmux=tmux_name)
+        cmd = _attach_cmd(sid)
+        if cmd:
+            place_konsole(cmd, mode, sid=sid, tmux=tmux_name)
 
 def select_delta(n):
     global _active_id
