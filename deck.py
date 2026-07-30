@@ -329,55 +329,47 @@ def _atomic_json_dump(path, obj):
             except OSError:
                 pass
 
-def _save_win_map():
-    # Snapshot under _lock (values are immutable pids -> shallow copy is a
-    # complete point-in-time view), then write atomically OUTSIDE _lock so
-    # other threads waiting on _lock aren't stalled on disk I/O.
+def _save_locked(path, snapshot_fn):
+    # Snapshot under _lock, then write atomically OUTSIDE _lock so other
+    # threads waiting on _lock aren't stalled on disk I/O. (Callers pass a
+    # snapshot_fn so the lock is held only for the copy, not the disk write.)
     with _lock:
-        data = dict(_win_map)
-    _atomic_json_dump(_WIN_MAP_PATH, data)
+        data = snapshot_fn()
+    _atomic_json_dump(path, data)
+
+def _save_win_map():
+    # Values are immutable pids -> shallow dict() is a complete point-in-time view.
+    _save_locked(_WIN_MAP_PATH, lambda: dict(_win_map))
+
+def _load_json(path, target, label):
+    # FileNotFoundError: first run / no cache yet — silently start empty.
+    # Other exceptions (corrupt JSON, permission error) — log and continue; a
+    # bad cache file must never brick the service (F12, same as _atomic_json_dump).
+    try:
+        with open(path) as f:
+            target.update(json.load(f))
+        logging.info("%s loaded: %d entries", label, len(target))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning("%s load failed: %s", label, e)
 
 def _load_win_map():
-    try:
-        with open(_WIN_MAP_PATH) as f:
-            _win_map.update(json.load(f))
-        logging.info("win_map loaded: %d entries", len(_win_map))
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning("win_map load failed: %s", e)
+    _load_json(_WIN_MAP_PATH, _win_map, "win_map")
 
 def _save_dbus_map():
-    with _lock:
-        data = dict(_dbus_map)
-    _atomic_json_dump(_DBUS_MAP_PATH, data)
+    _save_locked(_DBUS_MAP_PATH, lambda: dict(_dbus_map))
 
 def _load_dbus_map():
-    try:
-        with open(_DBUS_MAP_PATH) as f:
-            _dbus_map.update(json.load(f))
-        logging.info("dbus_map loaded: %d entries", len(_dbus_map))
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning("dbus_map load failed: %s", e)
+    _load_json(_DBUS_MAP_PATH, _dbus_map, "dbus_map")
 
 def _save_pane_order():
-    # Nested mutable lists: copy the outer dict AND each inner list so a
-    # concurrent append on another thread can't mutate the view mid-serialize.
-    with _lock:
-        data = {k: list(v) for k, v in _pane_order.items()}
-    _atomic_json_dump(_PANE_ORDER_PATH, data)
+    # Nested mutable lists: copy outer dict AND each inner list so a concurrent
+    # append on another thread can't mutate the view mid-serialize.
+    _save_locked(_PANE_ORDER_PATH, lambda: {k: list(v) for k, v in _pane_order.items()})
 
 def _load_pane_order():
-    try:
-        with open(_PANE_ORDER_PATH) as f:
-            _pane_order.update(json.load(f))
-        logging.info("pane_order loaded: %d windows", len(_pane_order))
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning("pane_order load failed: %s", e)
+    _load_json(_PANE_ORDER_PATH, _pane_order, "pane_order")
 
 def _record_pane(pid, sid):
     """Note that session `sid` now lives in konsole window `pid`, at the end
