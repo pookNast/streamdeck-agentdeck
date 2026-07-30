@@ -45,7 +45,7 @@ FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_R = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 if not os.path.exists(FONT_R):
     FONT_R = FONT_B
-# Font cache: ImageFont.truetype re-parses the TTF on every call (~23 sites,
+# Font cache: PIL's truetype() re-parses the TTF on every call (~23 sites,
 # many in the 20fps render path). Cache by (path, size) — FreeTypeFont objects
 # are immutable and safe to reuse across frames.
 _FONT_CACHE = {}
