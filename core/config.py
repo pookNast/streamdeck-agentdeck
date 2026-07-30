@@ -5,6 +5,7 @@ Missing keys fall back to built-in defaults — the file is optional.
 """
 import os
 import shlex
+import logging
 
 def _load_toml(path):
     """Load a TOML file, returning dict. Falls back to built-in tomllib (3.11+).
@@ -84,13 +85,31 @@ class Config:
 
     @property
     def tools(self):
-        """List of (label, command) tuples for tool spawn."""
-        return self._get("deck.tools", [
+        """List of (label, command) tuples for tool spawn.
+
+        Validates structure: a row must be a 2-element list/tuple so the
+        module-scope TOOLS comprehension's tuple-unpack can't crash on a
+        malformed [deck.tools] entry. Malformed rows are skipped+logged; if
+        none survive, the well-formed default is returned (F12: never brick
+        import over a structural config error)."""
+        default = [
             ["claude", "claude"],
             ["glm",    "claude-glm"],
             ["gpt",    "claude-gpt"],
             ["local",  "oc-start"],
-        ])
+        ]
+        raw = self._get("deck.tools", None)
+        if raw is None:
+            return default
+        valid = []
+        for entry in raw:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                valid.append([entry[0], entry[1]])
+            else:
+                logging.warning(
+                    "config: skipping malformed deck.tools entry %r "
+                    "(need [label, command])", entry)
+        return valid if valid else default
 
     @property
     def placements(self):
@@ -104,8 +123,13 @@ class Config:
 
     @property
     def reply_sets(self):
-        """List of reply set dicts: [{name, zones: [[label, keys]]}]."""
-        return self._get("deck.reply_sets", [
+        """List of reply set dicts: [{name, zones: [[label, keys]]}].
+
+        Validates structure: each entry must be a dict with a 'name' and a
+        non-empty list 'zones', so the module-scope REPLY_SETS comprehension's
+        rs['name']/rs['zones'] access can't crash on schema drift. Malformed
+        entries are skipped+logged; if none survive, the default is returned."""
+        default = [
             {
                 "name": "select",
                 "zones": [
@@ -133,7 +157,20 @@ class Config:
                     ["Esc",    ["Escape"]],
                 ],
             },
-        ])
+        ]
+        raw = self._get("deck.reply_sets", None)
+        if raw is None:
+            return default
+        valid = []
+        for rs in raw:
+            if (isinstance(rs, dict) and "name" in rs
+                    and isinstance(rs.get("zones"), list) and rs["zones"]):
+                valid.append(rs)
+            else:
+                logging.warning(
+                    "config: skipping malformed deck.reply_sets entry %r "
+                    "(need {name, zones: [...non-empty...]})", rs)
+        return valid if valid else default
 
     # --- Pruning section ---
     @property
