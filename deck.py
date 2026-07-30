@@ -418,6 +418,14 @@ _asleep = False            # True when the OLEDs are blanked
 # the main render loop performs the actual brightness restore + repaint so no
 # device write happens from the callback thread.
 _wake_pending = False
+# Single-writer invariant: the deck HID device is written ONLY from the render
+# loop. These flags defer device-touching requests made from the StreamDeck read
+# thread (on_dial brightness, on_key repaints) and _bg daemon threads
+# (toggle_or_place repaint) to the render loop, so set_brightness/set_key_image
+# never race the render thread's own writes. # ponytail: flag-per-request over a
+# queue — the render loop is the sole consumer, one in-flight slot each is enough.
+_brightness_pending = None   # new brightness to apply, or None
+_repaint_pending = False     # menu repaint requested from a callback/bg thread
 
 # Auto-remediation: when a session is in `error` state, verify the tool's
 # prerequisites are met on the live environment and restart it. Cooldown per
@@ -1554,7 +1562,7 @@ def toggle_or_place(deck, s):
     menu for it (window / tab / split), just like spawning a new one — so an
     existing session can be dropped into a split of your konsole too.
     Re-resolves the window from the tracked pid, so an X-close can't desync it."""
-    global _pending_session, _pending_tool
+    global _pending_session, _pending_tool, _repaint_pending
     if not s:
         return
     with _lock:
@@ -1571,7 +1579,9 @@ def toggle_or_place(deck, s):
         _pending_tool = None
         _pending_session = s
         open_menu("place")
-        repaint(deck)
+        # This runs on a _bg daemon thread; defer the repaint to the render loop
+        # (single-writer invariant — see _repaint_pending comment).
+        _repaint_pending = True
 
 def _unique_title(label, sessions):
     """Append -2, -3, … so multiple sessions of the same tool can coexist. agent-deck's
@@ -2762,13 +2772,13 @@ def on_key(deck, key, pressed):
         return
     if _wake_and_note(deck):
         return
-    global _active_id, _pending_tool
+    global _active_id, _pending_tool, _repaint_pending
     if _ui_mode == "tool":
         if key == CANCEL_KEY:
             close_menu()
         elif key < len(TOOLS):
             _pending_tool = TOOLS[key]; open_menu("place")
-        repaint(deck); return
+        _repaint_pending = True; return
     if _ui_mode == "place":
         if key == CANCEL_KEY:
             close_menu()
@@ -2780,7 +2790,7 @@ def on_key(deck, key, pressed):
                 s = _pending_session; close_menu(); _bg(open_existing, s, mode)
             else:
                 close_menu()
-        repaint(deck); return
+        _repaint_pending = True; return
     # board mode. Top row (0-3) = paginated session picks; bottom row (4-7) =
     # always the 4 reply zones, mirroring the touchscreen strip.
     if key >= PAGE_SIZE:
@@ -2797,7 +2807,7 @@ def on_key(deck, key, pressed):
             with _lock:
                 _active_id = s["id"]
     else:
-        open_menu("tool"); repaint(deck)
+        open_menu("tool"); _repaint_pending = True
 
 # M-SD3: long-press detection — state + helper.
 _press_ts = {}       # key -> monotonic timestamp of key-down edge
@@ -3008,13 +3018,13 @@ def on_key_xl(deck, key, pressed):
         if key not in _LONG_PRESS:
             return                         # non-long-press: handled on key-down
         # brief tap on long-press-aware key → fall through to dispatch
-    global _active_id, _pending_tool, _reply_set
+    global _active_id, _pending_tool, _reply_set, _repaint_pending
     if _ui_mode == "tool":
         if key == _cancel_key:
             close_menu()
         elif key < len(TOOLS):
             _pending_tool = TOOLS[key]; open_menu("place")
-        repaint(deck); return
+        _repaint_pending = True; return
     if _ui_mode == "place":
         if key == _cancel_key:
             close_menu()
@@ -3026,7 +3036,7 @@ def on_key_xl(deck, key, pressed):
                 s = _pending_session; close_menu(); _bg(open_existing, s, mode)
             else:
                 close_menu()
-        repaint(deck); return
+        _repaint_pending = True; return
     # board mode — reply strip, slash row, quick controls, then board slots.
     if XL_REPLY0 <= key <= XL_REPLY0 + 3:
         # allow_dismiss=False: slot 2 sends a real "3".
@@ -3077,14 +3087,14 @@ def on_key_xl(deck, key, pressed):
             with _lock:
                 _active_id = s["id"]
     else:
-        open_menu("tool"); repaint(deck)            # empty board slot = new session
+        open_menu("tool"); _repaint_pending = True  # empty board slot = new session
 
 @_safe_callback
 def on_dial(deck, dial, event, value):
     if _wake_and_note(deck):
         return
     log("on_dial: dial=%d event=%s value=%s active_id=%s", dial, event, value, _active_id[:8] if _active_id else None)
-    global _brightness, _reply_set, _page
+    global _brightness, _reply_set, _page, _brightness_pending
     if event == DialEventType.TURN:
         if _ui_mode != "board":
             return
@@ -3107,7 +3117,9 @@ def on_dial(deck, dial, event, value):
             pass
         elif dial == 5:                                 # knob 6: brightness (dimmer)
             _brightness = max(10, min(100, _brightness + (5 if value > 0 else -5)))
-            deck.set_brightness(_brightness)
+            # Defer the set_brightness to the render loop — writing from this HID
+            # read thread races the render thread's own device writes.
+            _brightness_pending = _brightness
             log("knob 6 (brightness) -> %d", _brightness)
     elif event == DialEventType.PUSH and value and _ui_mode == "board":
         # Knob N push = reply slot N (knobs 1-4 only; knobs 5-6 have no reply slot).
@@ -3128,6 +3140,7 @@ def on_touch(deck, evt, value):
 def main():
     global _sessions, _active_id, _activity, _anim_phase, _last_input, _asleep
     global _reply_set, _needed_since, _urgency, _wake_pending
+    global _repaint_pending, _brightness_pending
     # Retry HID enumeration+open with backoff (device may not be ready at boot).
     # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
     # settled the HID node yet; this keeps the process alive instead.
@@ -3225,6 +3238,15 @@ def main():
                     plus.set_brightness(_brightness)
                 except Exception as e:
                     log("wake brightness restore failed: %s", e)
+            # Brightness change deferred from on_dial knob 6 (StreamDeck read
+            # thread): apply here so set_brightness runs on the render thread.
+            if _brightness_pending is not None:
+                _b = _brightness_pending
+                _brightness_pending = None
+                try:
+                    plus.set_brightness(_b)
+                except OSError as e:
+                    log("brightness write failed: %s", e)
             # idle sleep: blank the OLEDs after SLEEP_SECS with no input; a callback
             # (key/dial/touch) wakes it back up via _wake_and_note().
             if not _asleep and (time.monotonic() - _last_input) > SLEEP_SECS:
@@ -3338,9 +3360,12 @@ def main():
                     # bounded even though we render all 8 keys every tick.
                     animate_active_keys(plus)
                     render_touchscreen(plus)
-                elif do_refresh:
+                elif do_refresh or _repaint_pending:
                     # Menus are static between interactions — only repaint on the
-                    # slow cadence (or when a callback forces it via repaint()).
+                    # slow cadence, or immediately when a callback/bg thread set
+                    # _repaint_pending (single-writer: repaint runs here, not in
+                    # the HID read thread / _bg daemon that requested it).
+                    _repaint_pending = False
                     repaint(plus)
                 _write_fail = 0   # any device write above succeeded — reset the streak
             except OSError as e:
