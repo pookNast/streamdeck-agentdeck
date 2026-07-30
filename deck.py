@@ -2962,7 +2962,10 @@ def _track_press(key, pressed):
             try:
                 action()
             except Exception:
-                log.exception("long-press action failed for key %d", key)
+                # log is the bound .info method (no .exception attr) — use the
+                # proven traceback.format_exc() pattern so this error path can't
+                # itself raise and kill the Timer thread. Matches _safe_callback.
+                log("long-press action failed for key %d: %s", key, traceback.format_exc())
         t = threading.Timer(threshold, _fire)
         t.daemon = True
         _long_timers[key] = t
