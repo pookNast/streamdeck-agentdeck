@@ -2,8 +2,10 @@
 # Copy to ~/.config/streamdeck-agentdeck/config.toml or ~/.streamdeck-agentdeck.toml
 
 [deck]
-# SSH host for agent sessions (omit for local-only; agent runs locally)
-ssh_host = "the-deck-host"
+# SSH host for agent sessions (omit for local-only; agent runs locally).
+# This must match a Host entry in your ~/.ssh/config. Run `./install.sh --configure`
+# to set it interactively, or edit directly below.
+ssh_host = "your-ssh-host"
 
 # Tool definitions: list of (display_label, shell_command) tuples.
 # When ssh_host is set, each command is wrapped:
@@ -62,12 +64,20 @@ zones = [
 win_miss_threshold = 2        # consecutive misses before pruning a window
 
 [weather]
-# NWS weather display (the coast area by default)
-# Set enabled = false to disable
+# NWS weather display. Defaults to Denver, CO as a neutral placeholder.
+# Run `./install.sh --configure` to set your own location, or edit lat/lon/city_name.
+# Set enabled = false to disable.
 enabled = true
-lat = 0.0
-lon = 0.0
+lat = 39.74
+lon = -104.99
+city_name = "Your City"
 refresh_sec = 900             # 15 minutes
+
+[monitor]
+# SSH host aliases to health-check on the touchscreen (empty = disable monitoring).
+# These must match Host entries in your ~/.ssh/config.
+# Example: hosts = ["server-a", "server-b"]
+hosts = []
 
 [animations]
 # LCD panorama mode: "normal" | "laputa" | "beach"

@@ -66,19 +66,19 @@ SLEEP_SECS = 3600         # idle seconds before the OLEDs blank (wake on any inp
 # crash-prevention exempt from minimization — explicit robust version.
 WRITE_FAIL_LIMIT = 12
 
-# All agent commands run on the-deck-host over `ssh -t` (PTY): the agent-deck session
-# lives on the-host (so it's on the board and you reply via tmux send-keys), but the
-# agent process runs on the-deck-host where every tool's stack is installed. A login
+# All agent commands run on the SSH host over `ssh -t` (PTY): the agent-deck session
+# lives on the deck host (so it's on the board and you reply via tmux send-keys), but the
+# agent process runs on the SSH host where every tool's stack is installed. A login
 # shell (`bash -lc`) puts ~/bin and ~/.local/bin on the remote PATH.
 # ponytail: hardcoded tool list — upgrade: read from config.toml when it grows.
 
 # Weather + grilling display keys (keys 27 + 28, R3 far-left).
 # ponytail: single city hardcoded — upgrade: list + tap-cycle when a 2nd location matters.
-# NWS (api.weather.gov): free, no API key, US-gov, the-host-reachable.
+# NWS (api.weather.gov): free, no API key, US-gov, reachable from the deck host.
 # ponytail: 15-min cadence — NWS updates hourly; upgrade: adaptive on alert severity.
 
 WEATHER_TIMEOUT_SEC = 8
-NWS_USER_AGENT = "streamdeck-agentdeck (git-host:pook/streamdeck-agentdeck)"
+NWS_USER_AGENT = "streamdeck-agentdeck/1.0"
 GRILL_HORIZON_HOURS = 6
 GRILL_WIND_MPH = 20             # sustained wind no-go threshold
 GRILL_GUST_MPH = 30             # ponytail: NWS hourly often omits windGust — sustained is main guard
@@ -262,8 +262,10 @@ _pane_order = {}
 
 # Host health + system load — populated by background threads, read by
 # render_touchscreen at 20fps. ponytail: globals + a daemon thread each — no
-# psutil dep, no new config — upgrade: psutil if the-host already has it.
-_host_status = {"the-deck-host": True, "server-host": True, "nas-host": True, "git-host": True}
+# psutil dep, no new config — upgrade: psutil if the deck host already has it.
+# Seeded from cfg.monitor_hosts at startup (see main entrypoint); empty by
+# default, so no host dots render unless the user configures [monitor].hosts.
+_host_status = {}
 _host_status_ts = 0.0
 _host_status_lock = threading.Lock()
 _cpu_prev = None              # (idle_cum, total_cum) last /proc/stat sample
@@ -433,7 +435,7 @@ _ts_diag_logged = False    # one-shot diagnostic: log touchscreen image size on 
 _ts_send_logged = False    # one-shot diagnostic: log set_touchscreen_image call result
 _manual_until = 0.0        # monotonic timestamp until which auto-focus is suppressed (knob 1 / sel keys)
 # LCD panorama mode: "normal" = dark fill + 5 knob zones; "laputa" = Ghibli
-# Siege panorama; "beach" = the city live-weather beach (sun position by
+# Siege panorama; "beach" = live-weather beach (sun position by
 # local hour, conditions from NWS poll). Long-press key 7 cycles the order.
 # ponytail: string enum over a class — keeps the 3-way branch readable at
 # every callsite without a new dep; upgrade: enum.Enum if a 4th mode lands.
@@ -877,19 +879,19 @@ def _fire_action(sess, spec):
     return False
 
 def _voice_toggle(sess):
-    """Voice dictation via the-deck-host (mic is there). First press starts recording;
-    second press stops, transcribes on the-deck-host, and injects the result into the
+    """Voice dictation via the configured SSH host (mic is there). First press starts recording;
+    second press stops, transcribes remotely, and injects the result into the
     session via tmux send-keys -l (no Enter, so the user reviews before submit)."""
     if not cfg.ssh_host:
         log("voice: unavailable — no ssh_host configured (local-only)"); return
     ssh = ["ssh", "-o", "ConnectTimeout=5", cfg.ssh_host]
-    # Are we currently recording? (PID file exists on the-deck-host)
+    # Are we currently recording? (PID file exists on the remote host)
     r = _run(ssh + ["test -f /tmp/voice-glm-rec.pid"], timeout=8)
     if r and r.returncode != 0:
         # Not recording — start
         _run(ssh + ["~/.local/bin/voice-glm.sh"], timeout=10)
         log("voice: recording started on %s", cfg.ssh_host); return
-    # Recording — stop + transcribe (konsole-send will fail harmlessly on the-deck-host;
+    # Recording — stop + transcribe (konsole-send will fail harmlessly on the SSH host;
     # the transcript is written before that call)
     _run(ssh + ["~/.local/bin/voice-glm.sh"], timeout=90)
     r = _run(ssh + ["cat /tmp/voice-glm-transcript.txt"], timeout=8)
@@ -1526,7 +1528,7 @@ def _cpu_pct():
     """Aggregate CPU% since the last sample. Cached at most every 1s — the
     render loop calls this at 20fps, but /proc/stat only updates at the kernel
     tick rate, so faster sampling is noise. ponytail: 4-line global + timestamp
-    — no thread, no psutil dep — upgrade: psutil if the-host already has it."""
+    — no thread, no psutil dep — upgrade: psutil if the deck host already has it."""
     global _cpu_prev, _cpu_ts, _cpu_pct_cached
     now = time.monotonic()
     if now - _cpu_ts < 1.0:
@@ -1914,7 +1916,7 @@ def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
                font=_font(FONT_B, 22), anchor="ma", fill=TXT_BRIGHT)
         d.text((mid_x, y0 + 32), icon_word or snap["short"][:8] or "—",
                font=_font(FONT_R, 13), anchor="ma", fill=TXT_DIM)
-        d.text((mid_x, y0 + 46), "the city",
+        d.text((mid_x, y0 + 46), cfg.weather_city_name,
                font=_font(FONT_R, 10), anchor="ma", fill=(140, 140, 140))
     else:
         d.text((mid_x, y0 + h/2), "no signal",
@@ -2555,7 +2557,7 @@ def render_touchscreen(deck):
             if _lcd_mode == "laputa":
                 head = "▶ Laputa Siege  ·  cinema"
             elif _lcd_mode == "beach":
-                head = "▶ the coast  ·  live"
+                head = f"▶ {cfg.weather_city_name}  ·  live"
             else:
                 head = "▶ no session selected"
             sess_name = "—"
@@ -2640,7 +2642,7 @@ def render_touchscreen(deck):
                 if sid == active:
                     d.rectangle([x - 1, 27, x + 9, 37], outline=(220, 220, 220))
             # Change 6b — SSH host health dots at y=30.
-            _hosts = ["the-deck-host", "server-host", "nas-host", "git-host"]
+            _hosts = cfg.monitor_hosts
             with _host_status_lock:
                 states = [_host_status[h] for h in _hosts]
             _host_x0 = 16 + len(sess_snapshot) * 12 + 8
@@ -3195,7 +3197,7 @@ def main():
         # (XL_REPLY0 = key 9). Reply set's 4th label is "4" (was "Go"; the
         # Go action moved to the always-visible quick-control strip at key 18).
         # LCD panorama default — set from animations.lcd_mode (beach boots into
-        # the the city live scene). Long-press key 7 cycles normal → laputa →
+        # the live-weather beach scene). Long-press key 7 cycles normal → laputa →
         # beach → normal. Keys 13-17 are intentionally dead (slash-key strip is
         # handled on the physical keys).
         _lcd_mode = cfg.lcd_mode
@@ -3232,6 +3234,10 @@ def main():
         _active_id = None
         _activity = {}
     _last_input = time.monotonic()
+    # Seed _host_status from the configured monitor list so the background ping
+    # loop has hosts to refresh; empty by default (no [monitor].hosts = no dots).
+    for _h in cfg.monitor_hosts:
+        _host_status[_h] = True
     _bg(_host_status_loop)
     _bg(_weather_loop)
     # FIX: startup repaint runs BEFORE the render loop's try/finally (whose
@@ -3443,7 +3449,7 @@ def main():
 if __name__ == "__main__":
     if os.environ.get("_SMOKE"):
         # Smoke test: exercise weather HTTP + parse + decision without the Stream
-        # Deck attached. Run on the-host: `_SMOKE=1 python3 deck.py`. Verifies NWS
+        # Deck attached. Run on the deck host: `_SMOKE=1 python3 deck.py`. Verifies NWS
         # reachability, JSON schema drift, and grilling logic; prints state.
         _weather_poll()
         print("weather:", _weather)

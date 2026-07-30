@@ -263,17 +263,56 @@ class Config:
     def weather_lat(self):
         # Used only in f-strings inside _weather_poll's try/except — a bad
         # value just fails the NWS fetch (logged), never crashes the loop.
-        return self._get("weather.lat", 0.0)
+        # Default Denver, CO — neutral placeholder, not tied to any real deployment.
+        return self._get("weather.lat", 39.74)
 
     @property
     def weather_lon(self):
         # See weather_lat — same inherent safety (f-string inside try).
-        return self._get("weather.lon", 0.0)
+        # Default Denver, CO — neutral placeholder.
+        return self._get("weather.lon", -104.99)
+
+    @property
+    def weather_city_name(self):
+        """Display label for the weather tile (e.g. 'Denver', 'Your City').
+        Coerced to str so the f-string render sites (banner head + tile label)
+        can't TypeError on a non-string config value. Default 'Your City'."""
+        val = self._get("weather.city_name", "Your City")
+        if not isinstance(val, str):
+            logging.warning("config: weather.city_name %r is not a string; coercing", val)
+            return str(val)
+        return val
 
     @property
     def weather_refresh_sec(self):
         # Consumer (_weather_loop) wraps float(self) in try/except — safe.
         return self._get("weather.refresh_sec", 900)
+
+    # --- Monitor section ---
+    @property
+    def monitor_hosts(self):
+        """SSH host aliases to health-check on the touchscreen. Empty list
+        disables monitoring (no host dots rendered).
+
+        Validates structure mirroring tools/placements: each entry must be a
+        str so the render-site comprehension `[_host_status[h] for h in _hosts]`
+        and the ping subprocess argv can't crash on a non-string entry.
+        Malformed entries are skipped+logged; never bricks import (F12)."""
+        default = []
+        raw = self._get("monitor.hosts", None)
+        if raw is None:
+            return default
+        if not isinstance(raw, list):
+            logging.warning("config: monitor.hosts %r is not a list; using []", raw)
+            return default
+        valid = []
+        for entry in raw:
+            if isinstance(entry, str):
+                valid.append(entry)
+            else:
+                logging.warning(
+                    "config: skipping malformed monitor.hosts entry %r (need str)", entry)
+        return valid
 
     # --- Animations section ---
     @property
