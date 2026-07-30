@@ -2783,8 +2783,16 @@ def render_touchscreen(deck):
         if not _ts_send_logged:
             log("set_touchscreen_image OK: %d bytes, geom=%dx%d", len(native), img.width, img.height)
             _ts_send_logged = True
+    except OSError:
+        # Propagate to the render loop's WRITE_FAIL_LIMIT handler. In static-board
+        # / non-cinema LCD mode this touchscreen write is the ONLY recurring
+        # device write (per-key writes are dedup-suppressed), so swallowing its
+        # OSError here = silent permanent outage that defeats the bounded-fail
+        # exit. Tolerating non-OSError render glitches locally is still correct
+        # (PIL/decode errors are not a dead-device signal).
+        raise
     except Exception as e:
-        log("set_touchscreen_image ERROR: %s", e)
+        log("touchscreen render error: %s", e)
 
 def repaint(deck):
     if _ui_mode == "tool":
