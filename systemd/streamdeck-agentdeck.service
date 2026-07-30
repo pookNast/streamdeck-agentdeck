@@ -1,9 +1,15 @@
 [Unit]
 Description=Stream Deck Plus -> agent-deck headless bridge
 After=graphical-session.target
+# Forgive transient start races (USB not ready at boot) without locking the unit
+# out permanently. If a persistent lockout does occur, clear it with:
+#   systemctl --user reset-failed streamdeck-agentdeck.service
+StartLimitIntervalSec=300
+StartLimitBurst=30
 
 [Service]
 ExecStart=/usr/bin/python3 %h/streamdeck-agentdeck/deck.py
+WorkingDirectory=%h/streamdeck-agentdeck
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
