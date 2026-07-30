@@ -35,6 +35,22 @@ if ! "$PY" -c 'import StreamDeck' 2>/dev/null; then
     || { echo "!! install 'streamdeck' manually (pip/pipx) — import StreamDeck failed" >&2; exit 1; }
 fi
 
+echo "==> Verify runtime deps (PIL + tmux — distro-agnostic)"
+# The apt branch above installs python3-pil + tmux, but a non-Debian host (or
+# one where apt-get isn't in PATH) silently skips them and the enabled service
+# can't import PIL / can't drive tmux sessions. Verify against the SAME python
+# the unit ExecStarts ($PY) and fail loudly BEFORE enabling the unit — mirrors
+# the StreamDeck import gate above. Distro-flexible: no apt hardcode, just the
+# import/availability check. F12: never let the service start import-blind.
+if ! "$PY" -c 'import PIL' 2>/dev/null; then
+  echo "!! PIL (Pillow) not importable by $PY — install python3-pil / python-pillow for this distro" >&2
+  exit 1
+fi
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "!! tmux not found on PATH — install it for this distro" >&2
+  exit 1
+fi
+
 echo "==> udev rule (uaccess for Stream Deck, vendor 0fd9)"
 sudo install -m 0644 "$SRC/udev/70-streamdeck.rules" /etc/udev/rules.d/70-streamdeck.rules
 sudo udevadm control --reload-rules
