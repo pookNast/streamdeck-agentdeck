@@ -774,6 +774,8 @@ def _voice_toggle(sess):
     """Voice dictation via the-deck-host (mic is there). First press starts recording;
     second press stops, transcribes on the-deck-host, and injects the result into the
     session via tmux send-keys -l (no Enter, so the user reviews before submit)."""
+    if not cfg.ssh_host:
+        log("voice: unavailable — no ssh_host configured (local-only)"); return
     ssh = ["ssh", "-o", "ConnectTimeout=5", cfg.ssh_host]
     # Are we currently recording? (PID file exists on the-deck-host)
     r = _run(ssh + ["test -f /tmp/voice-glm-rec.pid"], timeout=8)
@@ -2891,10 +2893,11 @@ def _status_blast():
     _run(["tmux", "split-window", "-p", "40", "-t", t, cmd], timeout=5)
     log("status-blast -> new pane in %s", t)
 
-# M-SD6: tool swap — cycle the focused session's CLI tool.
-_TOOL_CYCLE = ["claude", "glm", "gpt", "local"]
-_TOOL_CMDS = {t: c for t, c in [(l, cfg.remote_command(cmd)) for l, cmd in
-    [("claude", "claude"), ("glm", "claude-glm"), ("gpt", "claude-gpt"), ("local", "oc-start")]]}
+# M-SD6: tool swap — cycle the focused session's CLI tool. Derived from TOOLS
+# (built from cfg.tools) so user config is the single source of truth; a
+# hardcoded list here would silently ignore a custom [deck.tools] table.
+_TOOL_CYCLE = [label for label, _ in TOOLS]
+_TOOL_CMDS = {label: cmd for label, cmd in TOOLS}
 _tool_swap_at = {}  # session id -> monotonic ts of last swap (10s cooldown)
 
 def _cycle_tool():
