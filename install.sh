@@ -21,9 +21,12 @@ fi
 echo "==> Python StreamDeck library"
 if ! python3 -c 'import StreamDeck' 2>/dev/null; then
   # PEP 668 systems (Ubuntu 24.04+) need an explicit override or a venv.
+  # FATAL: without this library deck.py can't import StreamDeck and the enabled
+  # service hits its start-limit lockout. Abort here (set -e) BEFORE enabling
+  # the unit, instead of exiting 0 via a trailing `|| echo`.
   pip install --user streamdeck 2>/dev/null \
     || pip install --user --break-system-packages streamdeck \
-    || echo "!! install 'streamdeck' manually (pip/pipx) — import StreamDeck failed"
+    || { echo "!! install 'streamdeck' manually (pip/pipx) — import StreamDeck failed" >&2; exit 1; }
 fi
 
 echo "==> udev rule (uaccess for Stream Deck, vendor 0fd9)"
