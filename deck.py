@@ -408,6 +408,10 @@ _WIN_MISS_THRESHOLD = cfg.win_miss_threshold    # documented [pruning] knob (def
 DISMISS_TIMEOUT = 300.0    # safety max before a dismissed session auto-rearms
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
+# Set by _wake_and_note (on the StreamDeck read thread) when a wake happens;
+# the main render loop performs the actual brightness restore + repaint so no
+# device write happens from the callback thread.
+_wake_pending = False
 
 # Auto-remediation: when a session is in `error` state, verify the tool's
 # prerequisites are met on the live environment and restart it. Cooldown per
@@ -2718,13 +2722,17 @@ def repaint(deck):
 # ---- callbacks ------------------------------------------------------------
 def _wake_and_note(deck):
     """Record input time; if the display is asleep, wake it and report True so the
-    caller consumes this event (the waking press/turn just wakes, no action)."""
-    global _last_input, _asleep
+    caller consumes this event (the waking press/turn just wakes, no action).
+
+    The brightness restore + repaint are deferred to the main render loop via
+    _wake_pending: this runs on the StreamDeck read thread, and writing to the
+    device / repainting here races the render thread's own device writes."""
+    global _last_input, _asleep, _wake_pending
     _last_input = time.monotonic()
     if _asleep:
         _asleep = False
-        deck.set_brightness(_brightness)
-        log("display wake"); repaint(deck)
+        _wake_pending = True
+        log("display wake")
         return True
     return False
 
@@ -3110,7 +3118,7 @@ def on_touch(deck, evt, value):
 # ---- main -----------------------------------------------------------------
 def main():
     global _sessions, _active_id, _activity, _anim_phase, _last_input, _asleep
-    global _reply_set, _needed_since, _urgency
+    global _reply_set, _needed_since, _urgency, _wake_pending
     # Retry HID enumeration+open with backoff (device may not be ready at boot).
     # Replaces crash-loop: 33 systemd restarts were observed when udev hadn't
     # settled the HID node yet; this keeps the process alive instead.
@@ -3195,123 +3203,142 @@ def main():
     per_refresh = max(1, round(REFRESH_SECS / ANIM))   # 40 ticks per state poll
     tick = 0
     global _anim_phase
-    while not stop.wait(ANIM):
-        # idle sleep: blank the OLEDs after SLEEP_SECS with no input; a callback
-        # (key/dial/touch) wakes it back up via _wake_and_note().
-        if not _asleep and (time.monotonic() - _last_input) > SLEEP_SECS:
-            _asleep = True; plus.set_brightness(0)
-            log("display asleep (idle %d min)", SLEEP_SECS // 60)
-        if _asleep:
-            continue
-        tick += 1
-        _anim_phase += ANIM                              # seconds, monotonic
-        do_refresh = (tick % per_refresh == 0)
-        if do_refresh:
-            new = _prune_dead(fetch_sessions())
-            act = {s["id"]: session_activity(s) for s in new[:MAX_SESSIONS]}
-            maybe_remediate(new)                    # auto-restart errored sessions
-            now = time.monotonic()
-            # Apply "Next" dismissals: a session dismissed via the "Next" zone
-            # stops blinking (need forced False) until the agent next goes busy
-            # (spinner clears the dismissal inside session_activity), stops
-            # needing input, or DISMISS_TIMEOUT elapses. Time-based, not content
-            # based — the pane footer drifts every refresh and would clear a
-            # fingerprint match instantly.
-            for sid in list(act.keys()):
-                lbl, need, rec = act[sid]
-                ts = _dismissed.get(sid)
-                if ts and (not need or now - ts > DISMISS_TIMEOUT):
-                    _dismissed.pop(sid, None)
-                elif ts and need:
-                    act[sid] = (lbl, False, None)
-            # Refresh sticky-suggest timestamps so active_is_suggest() bridges
-            # the agent-deck running↔waiting status flicker (5s window).
-            for sid, (lbl, _n, _r) in act.items():
-                if lbl == "suggest…":
-                    _suggest_sticky[sid] = now
-            # Track when sessions first started needing input (for 10s slow-blink).
-            for sid, (label, need, _r) in act.items():
-                if need:
-                    _needed_since.setdefault(sid, now)
-                else:
-                    _needed_since.pop(sid, None)
-            # Classify urgency:
-            #   "menu"    = numbered choice → fast blink, top focus priority
-            #   "suggest" = auto-suggest/text prompt → slow blink immediately
-            #               (differentiates from fast-blink menus; the "Go"
-            #               zone blinks as the recommended accept action)
-            #   "urgent"  = text input < 10s → fast blink, secondary focus
-            #   "patient" = text input > 10s → slow blink, lowest focus priority
-            urg = {}
-            for sid, (label, need, _r) in act.items():
-                if not need:
-                    continue
-                if label in ("choose…", "input…"):
-                    urg[sid] = "menu"
-                elif label == "suggest…":
-                    urg[sid] = "patient"
-                elif (now - _needed_since.get(sid, now)) < INPUT_TIMEOUT:
-                    urg[sid] = "urgent"
-                else:
-                    urg[sid] = "patient"
-            _urgency.clear(); _urgency.update(urg)
-            # Auto-focus priority queue: menus → urgent text → patient text.
-            # Strict priority: if the currently focused session is needy but at
-            # a LOWER priority than the top of the queue, we upgrade instantly.
-            # Equal-priority competitors do NOT yank focus (avoids jitter when
-            # two menus appear in the same poll). Lower rank number = higher
-            # priority. The selector snaps on the next 20fps frame (~50ms).
-            focus_order = sorted(
-                [sid for sid in act if act[sid][1]],
-                key=lambda sid: URG_RANK.get(urg.get(sid), 99),
-            )
-            choice_id = focus_order[0] if focus_order else None
-            # NOT auto-switching the touchscreen to "select" here anymore: the
-            # bottom-row keys are permanently pinned to the select set (see
-            # act_reply's reply_set override), so menus are always answerable
-            # regardless of what the touchscreen shows. Auto-switching used to
-            # yank the touchscreen back to "select" on almost every poll (this
-            # board fields menu prompts constantly), which looked like it was
-            # mirroring the bottom row instead of staying on its own default.
-            with _lock:
-                _sessions = new; _activity = act
-                if _active_id not in [s["id"] for s in new]:
-                    _active_id = new[0]["id"] if new else None
-                # NOT gated on `manual`: manual is a single global 2s timer
-                # re-armed on every interaction anywhere on the board, so
-                # during active multi-session use (replies firing every few
-                # seconds) it never expires — that silently blocked this
-                # entire escalation, starving genuinely higher-priority needs
-                # (e.g. a live menu) indefinitely. The strict `choice_rank <
-                # cur_rank` inequality below is already the anti-jitter guard
-                # the comment describes; `manual` added nothing but the bug.
-                if choice_id and _ui_mode == "board" and time.monotonic() > _manual_until:
-                    cur_needs = act.get(_active_id, (None, False))[1]
-                    cur_rank = URG_RANK.get(urg.get(_active_id), 99) if cur_needs else 99
-                    choice_rank = URG_RANK.get(urg.get(choice_id), 99)
-                    if choice_rank < cur_rank:
-                        _active_id = choice_id
-                        log("auto-select session %s (priority %d < %d)",
-                            choice_id[:8], choice_rank, cur_rank)
-            if _ui_mode != "board" and time.monotonic() > _menu_deadline:
-                close_menu()
-        try:
-            if _ui_mode == "board":
-                # 20fps render of every key + touchscreen. animate_active_keys
-                # dedupes static frames via _frame_cache so the wire cost stays
-                # bounded even though we render all 8 keys every tick.
-                animate_active_keys(plus)
-                render_touchscreen(plus)
-            elif do_refresh:
-                # Menus are static between interactions — only repaint on the
-                # slow cadence (or when a callback forces it via repaint()).
-                repaint(plus)
-        except Exception as e:
-            log("repaint error: %s", e)
     try:
-        plus.reset(); plus.close()
-    except Exception:
-        pass
+        while not stop.wait(ANIM):
+            # Wake restore deferred from _wake_and_note (StreamDeck read thread): the
+            # brightness restore runs here so no device write happens from the
+            # callback thread. The normal render path repaints ~50ms later.
+            if _wake_pending:
+                _wake_pending = False
+                _asleep = False
+                try:
+                    plus.set_brightness(_brightness)
+                except Exception as e:
+                    log("wake brightness restore failed: %s", e)
+            # idle sleep: blank the OLEDs after SLEEP_SECS with no input; a callback
+            # (key/dial/touch) wakes it back up via _wake_and_note().
+            if not _asleep and (time.monotonic() - _last_input) > SLEEP_SECS:
+                _asleep = True
+                try:
+                    plus.set_brightness(0)
+                except Exception as e:
+                    log("sleep brightness set failed: %s", e)
+                log("display asleep (idle %d min)", SLEEP_SECS // 60)
+            if _asleep:
+                continue
+            tick += 1
+            _anim_phase += ANIM                              # seconds, monotonic
+            do_refresh = (tick % per_refresh == 0)
+            if do_refresh:
+                try:
+                    new = _prune_dead(fetch_sessions())
+                    act = {s["id"]: session_activity(s) for s in new[:MAX_SESSIONS]}
+                    maybe_remediate(new)                    # auto-restart errored sessions
+                    now = time.monotonic()
+                    # Apply "Next" dismissals: a session dismissed via the "Next" zone
+                    # stops blinking (need forced False) until the agent next goes busy
+                    # (spinner clears the dismissal inside session_activity), stops
+                    # needing input, or DISMISS_TIMEOUT elapses. Time-based, not content
+                    # based — the pane footer drifts every refresh and would clear a
+                    # fingerprint match instantly.
+                    for sid in list(act.keys()):
+                        lbl, need, rec = act[sid]
+                        ts = _dismissed.get(sid)
+                        if ts and (not need or now - ts > DISMISS_TIMEOUT):
+                            _dismissed.pop(sid, None)
+                        elif ts and need:
+                            act[sid] = (lbl, False, None)
+                    # Refresh sticky-suggest timestamps so active_is_suggest() bridges
+                    # the agent-deck running↔waiting status flicker (5s window).
+                    for sid, (lbl, _n, _r) in act.items():
+                        if lbl == "suggest…":
+                            _suggest_sticky[sid] = now
+                    # Track when sessions first started needing input (for 10s slow-blink).
+                    for sid, (label, need, _r) in act.items():
+                        if need:
+                            _needed_since.setdefault(sid, now)
+                        else:
+                            _needed_since.pop(sid, None)
+                    # Classify urgency:
+                    #   "menu"    = numbered choice → fast blink, top focus priority
+                    #   "suggest" = auto-suggest/text prompt → slow blink immediately
+                    #               (differentiates from fast-blink menus; the "Go"
+                    #               zone blinks as the recommended accept action)
+                    #   "urgent"  = text input < 10s → fast blink, secondary focus
+                    #   "patient" = text input > 10s → slow blink, lowest focus priority
+                    urg = {}
+                    for sid, (label, need, _r) in act.items():
+                        if not need:
+                            continue
+                        if label in ("choose…", "input…"):
+                            urg[sid] = "menu"
+                        elif label == "suggest…":
+                            urg[sid] = "patient"
+                        elif (now - _needed_since.get(sid, now)) < INPUT_TIMEOUT:
+                            urg[sid] = "urgent"
+                        else:
+                            urg[sid] = "patient"
+                    _urgency.clear(); _urgency.update(urg)
+                    # Auto-focus priority queue: menus → urgent text → patient text.
+                    # Strict priority: if the currently focused session is needy but at
+                    # a LOWER priority than the top of the queue, we upgrade instantly.
+                    # Equal-priority competitors do NOT yank focus (avoids jitter when
+                    # two menus appear in the same poll). Lower rank number = higher
+                    # priority. The selector snaps on the next 20fps frame (~50ms).
+                    focus_order = sorted(
+                        [sid for sid in act if act[sid][1]],
+                        key=lambda sid: URG_RANK.get(urg.get(sid), 99),
+                    )
+                    choice_id = focus_order[0] if focus_order else None
+                    # NOT auto-switching the touchscreen to "select" here anymore: the
+                    # bottom-row keys are permanently pinned to the select set (see
+                    # act_reply's reply_set override), so menus are always answerable
+                    # regardless of what the touchscreen shows. Auto-switching used to
+                    # yank the touchscreen back to "select" on almost every poll (this
+                    # board fields menu prompts constantly), which looked like it was
+                    # mirroring the bottom row instead of staying on its own default.
+                    with _lock:
+                        _sessions = new; _activity = act
+                        if _active_id not in [s["id"] for s in new]:
+                            _active_id = new[0]["id"] if new else None
+                        # NOT gated on `manual`: manual is a single global 2s timer
+                        # re-armed on every interaction anywhere on the board, so
+                        # during active multi-session use (replies firing every few
+                        # seconds) it never expires — that silently blocked this
+                        # entire escalation, starving genuinely higher-priority needs
+                        # (e.g. a live menu) indefinitely. The strict `choice_rank <
+                        # cur_rank` inequality below is already the anti-jitter guard
+                        # the comment describes; `manual` added nothing but the bug.
+                        if choice_id and _ui_mode == "board" and time.monotonic() > _manual_until:
+                            cur_needs = act.get(_active_id, (None, False))[1]
+                            cur_rank = URG_RANK.get(urg.get(_active_id), 99) if cur_needs else 99
+                            choice_rank = URG_RANK.get(urg.get(choice_id), 99)
+                            if choice_rank < cur_rank:
+                                _active_id = choice_id
+                                log("auto-select session %s (priority %d < %d)",
+                                    choice_id[:8], choice_rank, cur_rank)
+                    if _ui_mode != "board" and time.monotonic() > _menu_deadline:
+                        close_menu()
+                except Exception as e:
+                    log("refresh poll error: %s", e)
+            try:
+                if _ui_mode == "board":
+                    # 20fps render of every key + touchscreen. animate_active_keys
+                    # dedupes static frames via _frame_cache so the wire cost stays
+                    # bounded even though we render all 8 keys every tick.
+                    animate_active_keys(plus)
+                    render_touchscreen(plus)
+                elif do_refresh:
+                    # Menus are static between interactions — only repaint on the
+                    # slow cadence (or when a callback forces it via repaint()).
+                    repaint(plus)
+            except Exception as e:
+                log("repaint error: %s", e)
+    finally:
+        try:
+            plus.reset(); plus.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     if os.environ.get("_SMOKE"):
@@ -3323,3 +3350,4 @@ if __name__ == "__main__":
         print("grill:", _grill)
         sys.exit(0)
     main()
+
