@@ -388,7 +388,7 @@ _manual_until = 0.0        # monotonic timestamp until which auto-focus is suppr
 # local hour, conditions from NWS poll). Long-press key 7 cycles the order.
 # ponytail: string enum over a class — keeps the 3-way branch readable at
 # every callsite without a new dep; upgrade: enum.Enum if a 4th mode lands.
-_lcd_mode = "beach"
+_lcd_mode = cfg.lcd_mode
 # Auto-suggest dismissal: "Next" clears the input gate (stop blinking, drop
 # from focus queue) WITHOUT sending keys to the agent. Time-based: holds until
 # the agent goes busy again (spinner detected → rearm) or stops needing input.
@@ -1253,7 +1253,13 @@ def place_konsole(cmd, mode, sid=None, tmux=None):
 
 # ---- actions --------------------------------------------------------------
 def _bg(fn, *a, **kw):
-    threading.Thread(target=fn, args=a, kwargs=kw, daemon=True).start()
+    def _runner():
+        try:
+            fn(*a, **kw)
+        except Exception:
+            log("! background thread %s crashed:\n%s",
+                getattr(fn, "__name__", fn), traceback.format_exc())
+    threading.Thread(target=_runner, daemon=True).start()
 
 def active_session():
     with _lock:
@@ -1387,10 +1393,17 @@ def _weather_poll():
         logging.warning("weather poll failed (#%d): %s", _weather["fail_streak"], e)
 
 def _weather_loop():
-    """Background weather poller: refresh every WEATHER_REFRESH_SEC."""
+    """Background weather poller: refresh every weather.refresh_sec."""
+    if not cfg.weather_enabled:
+        return
     while True:
         _weather_poll()
-        time.sleep(cfg.weather_refresh_sec)
+        try:
+            interval = float(cfg.weather_refresh_sec)
+        except (TypeError, ValueError):
+            interval = 900.0
+            log("bad weather.refresh_sec %r, using 900", cfg.weather_refresh_sec)
+        time.sleep(interval)
 
 def _cpu_pct():
     """Aggregate CPU% since the last sample. Cached at most every 1s — the
@@ -3130,10 +3143,11 @@ def main():
         # XL: all input on keys; menu-cancel lives on the first reply key
         # (XL_REPLY0 = key 9). Reply set's 4th label is "4" (was "Go"; the
         # Go action moved to the always-visible quick-control strip at key 18).
-        # LCD panorama default — "beach" boots into the the city live scene.
-        # Long-press key 7 cycles normal → laputa → beach → normal. Keys 13-17
-        # are intentionally dead (slash-key strip is handled on the physical keys).
-        _lcd_mode = "beach"
+        # LCD panorama default — set from animations.lcd_mode (beach boots into
+        # the the city live scene). Long-press key 7 cycles normal → laputa →
+        # beach → normal. Keys 13-17 are intentionally dead (slash-key strip is
+        # handled on the physical keys).
+        _lcd_mode = cfg.lcd_mode
         _cancel_key = XL_REPLY0
         plus.set_key_callback(on_key_xl)
         if HAS_DIALS:
