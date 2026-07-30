@@ -19,7 +19,13 @@ if command -v apt-get >/dev/null; then
 fi
 
 echo "==> Python StreamDeck library"
-if ! python3 -c 'import StreamDeck' 2>/dev/null; then
+# Match the interpreter the unit ExecStart hardcodes (/usr/bin/python3): a bare
+# PATH `python3` check could pass against a different interpreter (e.g. a pyenv
+# shim) while the service still fails to import. Fall back to PATH python3 only
+# if /usr/bin/python3 isn't present (non-FHS distros). (FIX E2)
+PY=/usr/bin/python3
+command -v "$PY" >/dev/null 2>&1 || PY=python3
+if ! "$PY" -c 'import StreamDeck' 2>/dev/null; then
   # PEP 668 systems (Ubuntu 24.04+) need an explicit override or a venv.
   # FATAL: without this library deck.py can't import StreamDeck and the enabled
   # service hits its start-limit lockout. Abort here (set -e) BEFORE enabling
@@ -41,16 +47,32 @@ mkdir -p "$DEST"
 # Full runtime set: deck.py imports ghibli_scenes/ghibli_beach at module load
 # and core/config.py at startup — a fresh install that copied only deck.py
 # could not import (C2). Seed config.example.toml too (L2).
-install -m 0755 "$SRC/deck.py" "$SRC/ghibli_scenes.py" "$SRC/ghibli_beach.py" "$DEST/"
-cp -r "$SRC/core" "$DEST/"
-install -m 0644 "$SRC/config.example.toml" "$DEST/"
+# Guard the whole copy block: when run from the install target itself
+# (SRC == DEST — the obvious clone path the unit hardcodes) `install` aborts
+# on same-file. Skip the self-copy; files are already in place. (FIX E3)
+if ! [[ "$SRC" -ef "$DEST" ]]; then
+  install -m 0755 "$SRC/deck.py" "$SRC/ghibli_scenes.py" "$SRC/ghibli_beach.py" "$DEST/"
+  cp -r "$SRC/core" "$DEST/"
+  install -m 0644 "$SRC/config.example.toml" "$DEST/"
+else
+  echo "   SRC == DEST ($SRC); self-copy skipped (files already in place)"
+fi
 
 echo "==> systemd --user service"
 mkdir -p "$USER_UNIT_DIR"
 install -m 0644 "$SRC/systemd/$UNIT" "$USER_UNIT_DIR/$UNIT"
-loginctl enable-linger "$USER" 2>/dev/null || true
+# enable-linger keeps the --user service alive after logout (survive-reboot
+# guarantee). It can need root on some systems; keep it non-fatal but VISIBLE
+# so a silent failure doesn't mask the survive-reboot guarantee. (FIX E4)
+loginctl enable-linger "$USER" \
+  || echo "  warn: enable-linger failed (may need sudo / root); service won't survive logout until enabled" >&2
 systemctl --user daemon-reload
-systemctl --user enable --now "$UNIT"
+# enable --now only STARTS when not already running, so re-running install.sh
+# to deploy a code fix would leave the OLD process live. `restart` both starts
+# a freshly-installed (inactive) unit and restarts an already-running one, so
+# a re-install picks up the new code. (FIX E1)
+systemctl --user enable "$UNIT"
+systemctl --user restart "$UNIT"
 
 echo
 echo "Done. Status:"
