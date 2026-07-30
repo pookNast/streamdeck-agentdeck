@@ -2971,7 +2971,8 @@ def _track_press(key, pressed):
         if spec is None:
             return False
         action, threshold = spec
-        _long_fired.discard(key)
+        with _longpress_lock:
+            _long_fired.discard(key)
         def _fire():
             with _longpress_lock:
                 _long_fired.add(key)
@@ -3319,7 +3320,9 @@ def main():
                             urg[sid] = "urgent"
                         else:
                             urg[sid] = "patient"
-                    _urgency.clear(); _urgency.update(urg)
+                    # _urgency is swapped INSIDE _lock below so it transitions
+                    # atomically with _sessions/_activity (readers holding _lock
+                    # see a consistent triple). `urg` itself is a local.
                     # Auto-focus priority queue: menus → urgent text → patient text.
                     # Strict priority: if the currently focused session is needy but at
                     # a LOWER priority than the top of the queue, we upgrade instantly.
@@ -3340,6 +3343,7 @@ def main():
                     # mirroring the bottom row instead of staying on its own default.
                     with _lock:
                         _sessions = new; _activity = act
+                        _urgency.clear(); _urgency.update(urg)
                         if _active_id not in [s["id"] for s in new]:
                             _active_id = new[0]["id"] if new else None
                         # NOT gated on `manual`: manual is a single global 2s timer
