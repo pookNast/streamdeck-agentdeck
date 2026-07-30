@@ -19,7 +19,7 @@ Config = the TOOLS / PLACEMENTS / REPLY_ZONES lists below. ponytail: state in
 module globals + a lock, no config file — upgrade: external file only if these
 must change without a restart.
 """
-import os, re, sys, json, time, math, signal, shutil, subprocess, threading, logging, traceback, urllib.request, gzip
+import os, re, sys, json, time, math, signal, shutil, subprocess, tempfile, threading, logging, traceback, urllib.request, gzip
 
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.ImageHelpers import PILHelper
@@ -289,13 +289,36 @@ def _weather_snapshot():
     w["grill_reason"] = g.get("reason", "")
     return w
 
-def _save_win_map():
+def _atomic_json_dump(path, obj):
+    """Write JSON atomically: dump to a unique temp file in the same dir, then
+    os.replace onto the target. POSIX rename is atomic, so a SIGTERM/SIGKILL
+    mid-write leaves either the previous complete file or the new one — never a
+    truncated stub the loader would silently treat as empty. A unique temp name
+    (not a fixed path+'.tmp') is required because callers snapshot under _lock
+    but write OUTSIDE it, so concurrent saves of the same map could race on a
+    shared temp filename. SECURITY/data-integrity boundary — explicit, not
+    minimizable (ponytail: no reduction here)."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".save-", suffix=".tmp")
     try:
-        os.makedirs(os.path.dirname(_WIN_MAP_PATH), exist_ok=True)
-        with open(_WIN_MAP_PATH, "w") as f:
-            json.dump(_win_map, f)
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
     except Exception as e:
-        logging.warning("win_map save failed: %s", e)
+        logging.warning("atomic save to %s failed: %s", path, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+def _save_win_map():
+    # Snapshot under _lock (values are immutable pids -> shallow copy is a
+    # complete point-in-time view), then write atomically OUTSIDE _lock so
+    # other threads waiting on _lock aren't stalled on disk I/O.
+    with _lock:
+        data = dict(_win_map)
+    _atomic_json_dump(_WIN_MAP_PATH, data)
 
 def _load_win_map():
     try:
@@ -308,12 +331,9 @@ def _load_win_map():
         logging.warning("win_map load failed: %s", e)
 
 def _save_dbus_map():
-    try:
-        os.makedirs(os.path.dirname(_DBUS_MAP_PATH), exist_ok=True)
-        with open(_DBUS_MAP_PATH, "w") as f:
-            json.dump(_dbus_map, f)
-    except Exception as e:
-        logging.warning("dbus_map save failed: %s", e)
+    with _lock:
+        data = dict(_dbus_map)
+    _atomic_json_dump(_DBUS_MAP_PATH, data)
 
 def _load_dbus_map():
     try:
@@ -326,12 +346,11 @@ def _load_dbus_map():
         logging.warning("dbus_map load failed: %s", e)
 
 def _save_pane_order():
-    try:
-        os.makedirs(os.path.dirname(_PANE_ORDER_PATH), exist_ok=True)
-        with open(_PANE_ORDER_PATH, "w") as f:
-            json.dump(_pane_order, f)
-    except Exception as e:
-        logging.warning("pane_order save failed: %s", e)
+    # Nested mutable lists: copy the outer dict AND each inner list so a
+    # concurrent append on another thread can't mutate the view mid-serialize.
+    with _lock:
+        data = {k: list(v) for k, v in _pane_order.items()}
+    _atomic_json_dump(_PANE_ORDER_PATH, data)
 
 def _load_pane_order():
     try:
