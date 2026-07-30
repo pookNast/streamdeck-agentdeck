@@ -299,18 +299,35 @@ def _atomic_json_dump(path, obj):
     shared temp filename. SECURITY/data-integrity boundary — explicit, not
     minimizable (ponytail: no reduction here)."""
     directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".save-", suffix=".tmp")
+    # Whole setup+write+rename inside try/except: makedirs (perm/ENOSPC) and
+    # mkstemp previously ran BEFORE the try, so a cache-dir failure raised
+    # uncaught through the caller. A cache write must NEVER crash the caller —
+    # log and return cleanly. SECURITY/data-integrity boundary (explicit).
+    fd = None
+    tmp = None
+    owned = False   # True once os.fdopen takes ownership of fd (it closes it)
     try:
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".save-", suffix=".tmp")
         with os.fdopen(fd, "w") as f:
+            owned = True
             json.dump(obj, f)
         os.replace(tmp, path)
     except Exception as e:
         logging.warning("atomic save to %s failed: %s", path, e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        # Close the raw fd ONLY if fdopen never claimed it (avoids double-close
+        # + fd leak when fdopen/json fails mid-setup). Unlink the temp stub so
+        # half-written .save-*.tmp files don't accumulate in the cache dir.
+        if fd is not None and not owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 def _save_win_map():
     # Snapshot under _lock (values are immutable pids -> shallow copy is a
@@ -1530,6 +1547,9 @@ def _weather_loop():
         except (TypeError, ValueError):
             interval = 900.0
             log("bad weather.refresh_sec %r, using 900", cfg.weather_refresh_sec)
+        # Floor at 30s: a refresh_sec of 0/negative makes time.sleep a no-op,
+        # turning this background thread into a 100%-CPU busy-loop hammering NWS.
+        interval = max(interval, 30)
         time.sleep(interval)
 
 def _cpu_pct():
