@@ -45,6 +45,17 @@ FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_R = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 if not os.path.exists(FONT_R):
     FONT_R = FONT_B
+# Font cache: ImageFont.truetype re-parses the TTF on every call (~23 sites,
+# many in the 20fps render path). Cache by (path, size) — FreeTypeFont objects
+# are immutable and safe to reuse across frames.
+_FONT_CACHE = {}
+def _font(path, size):
+    key = (path, size)
+    f = _FONT_CACHE.get(key)
+    if f is None:
+        f = ImageFont.truetype(path, size)
+        _FONT_CACHE[key] = f
+    return f
 REFRESH_SECS = 2
 MENU_TIMEOUT = 12          # seconds before an open picker reverts to the board
 SLEEP_SECS = 3600         # idle seconds before the OLEDs blank (wake on any input)
@@ -1421,7 +1432,7 @@ def _mem_pct():
 def _bars(d, x, y, items):
     """items = [(label, value_0_1, color), ...] — mini bars + label."""
     for label, v, color in items:
-        d.text((x, y - 2), label, font=ImageFont.truetype(FONT_R, 11), fill=(220, 220, 220))
+        d.text((x, y - 2), label, font=_font(FONT_R, 11), fill=(220, 220, 220))
         d.rectangle([x + 28, y, x + 28 + int(40 * max(0, min(1, v))), y + 6], fill=color)
         x += 78
 
@@ -1646,7 +1657,7 @@ def _render_text(d, img, text, sub=None, text_fill=TXT_DIM, size=20):
     max_w = img.width - PAD * 2
     # Auto-shrink title font until the longest line fits the key.
     while size >= 11:
-        f = ImageFont.truetype(FONT_B, size)
+        f = _font(FONT_B, size)
         lines = _multiline(d, text, f, max_w)
         if max((d.textlength(ln, font=f) for ln in lines), default=0) <= max_w:
             break
@@ -1655,7 +1666,7 @@ def _render_text(d, img, text, sub=None, text_fill=TXT_DIM, size=20):
     sub_size = 15; sf = None
     if sub:
         while sub_size >= 10:
-            sf = ImageFont.truetype(FONT_R, sub_size)
+            sf = _font(FONT_R, sub_size)
             if d.textlength(sub, font=sf) <= max_w:
                 break
             sub_size -= 1
@@ -1865,14 +1876,14 @@ def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
     mid_x = x0 + 150
     if not fail and isinstance(snap["temp_f"], (int, float)):
         d.text((mid_x, y0 + 8), "%d°F" % int(snap["temp_f"]),
-               font=ImageFont.truetype(FONT_B, 22), anchor="ma", fill=TXT_BRIGHT)
+               font=_font(FONT_B, 22), anchor="ma", fill=TXT_BRIGHT)
         d.text((mid_x, y0 + 32), icon_word or snap["short"][:8] or "—",
-               font=ImageFont.truetype(FONT_R, 13), anchor="ma", fill=TXT_DIM)
+               font=_font(FONT_R, 13), anchor="ma", fill=TXT_DIM)
         d.text((mid_x, y0 + 46), "the city",
-               font=ImageFont.truetype(FONT_R, 10), anchor="ma", fill=(140, 140, 140))
+               font=_font(FONT_R, 10), anchor="ma", fill=(140, 140, 140))
     else:
         d.text((mid_x, y0 + h/2), "no signal",
-               font=ImageFont.truetype(FONT_R, 13), anchor="mm", fill=(140, 140, 140))
+               font=_font(FONT_R, 13), anchor="mm", fill=(140, 140, 140))
     # divider before grill badge
     d.line([(x0 + 300, y0 + 8), (x0 + 300, y0 + h - 4)], fill=(30, 32, 38), width=1)
     # ---- grill verdict (right 100px, x=x0+300..x0+400) ----
@@ -1884,9 +1895,9 @@ def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
     else:
         bg_c, label_c, sub = (80, 35, 35), (240, 170, 170), (grill["reason"].lower() or "no")
     d.rectangle([x0 + 304, y0 + 6, x0 + 396, y0 + h - 4], fill=bg_c)
-    d.text((badge_x, y0 + 14), "GRILL", font=ImageFont.truetype(FONT_B, 13),
+    d.text((badge_x, y0 + 14), "GRILL", font=_font(FONT_B, 13),
            anchor="ma", fill=label_c)
-    d.text((badge_x, y0 + 36), sub, font=ImageFont.truetype(FONT_B, 13),
+    d.text((badge_x, y0 + 36), sub, font=_font(FONT_B, 13),
            anchor="ma", fill=label_c)
 
 def _render_reply_key(deck, zone, rec_zone):
@@ -1999,7 +2010,7 @@ def _overlay_title(draw, img, title):
     """Session title pinned to the top-left corner with a dark drop-shadow on
     all four sides so it reads against any scene background without a backing
     rectangle (classic pixel-art text technique — no alpha needed for JPEG)."""
-    f = ImageFont.truetype(FONT_B, 13)
+    f = _font(FONT_B, 13)
     txt = title[:11]
     y = 4
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -2035,7 +2046,7 @@ def _overlay_activity(draw, img, phase, label=None):
     if label and label != "thinking":
         # Slightly larger legibility per user request — was 11pt / 16 chars.
         # 13pt + 18 chars still fits the XL tile alongside the 12px spinner arc.
-        f = ImageFont.truetype(FONT_R, 13)
+        f = _font(FONT_R, 13)
         txt = label[:18]
         tx, ty = cx + r + 4, cy - 7
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -2106,7 +2117,7 @@ def _render_reply_tile(tile, zone, rec_zone):
         wash = Image.new("RGB", tile.size, GHIBLI["meadow"])
         tile = Image.blend(tile, wash, 0.25 + pulse * 0.25)
     d = ImageDraw.Draw(tile)
-    f = ImageFont.truetype(FONT_B, 26)
+    f = _font(FONT_B, 26)
     cx, cy = tile.width / 2, tile.height / 2
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         d.text((cx + dx, cy + dy), label, font=f, anchor="mm", fill=(0, 0, 0))
@@ -2328,13 +2339,13 @@ def _overlay_xl_control(tile, key, rec_zone):
         _render_text(d, tile, label, text_fill=fill, size=18)
         return tile
     d = ImageDraw.Draw(tile)
-    f = ImageFont.truetype(FONT_B, 26)
+    f = _font(FONT_B, 26)
     cx, cy = tile.width / 2, tile.height / 2 - (7 if sub else 0)
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         d.text((cx + dx, cy + dy), label, font=f, anchor="mm", fill=(0, 0, 0))
     d.text((cx, cy), label, font=f, anchor="mm", fill=TXT_BANNER)
     if sub:
-        sf = ImageFont.truetype(FONT_R, 12)
+        sf = _font(FONT_R, 12)
         sy = cy + 18
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             d.text((cx + dx, sy + dy), sub, font=sf, anchor="mm", fill=(0, 0, 0))
@@ -2473,12 +2484,12 @@ def render_touchscreen(deck):
     d.rectangle([0, 0, img.width, img.height], fill=(6, 7, 12))
     if _ui_mode == "tool":
         d.text((16, 30), "pick agent for new session  ·  Cancel = key 8",
-               font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
+               font=_font(FONT_B, 24), fill=(95, 140, 180))
     elif _ui_mode == "place":
         _what = (_pending_tool[0] if _pending_tool
                  else _pending_session.get("title", "session") if _pending_session else "")
         d.text((16, 30), "placement for '%s'  ·  Cancel = key 8" % _what,
-               font=ImageFont.truetype(FONT_B, 24), fill=(95, 140, 180))
+               font=_font(FONT_B, 24), fill=(95, 140, 180))
     else:
         # Board mode: panorama (laputa or beach) or flat dark (normal).
         _lcd_drop_shadows = _lcd_mode != "normal"
@@ -2517,17 +2528,17 @@ def render_touchscreen(deck):
         # shadow makes any text readable over the scene without a backing rect).
         if _lcd_drop_shadows:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                d.text((16 + dx, 6 + dy), head, font=ImageFont.truetype(FONT_B, 24), fill=(0, 0, 0))
-        d.text((16, 6), head, font=ImageFont.truetype(FONT_B, 24), fill=txt_c)
+                d.text((16 + dx, 6 + dy), head, font=_font(FONT_B, 24), fill=(0, 0, 0))
+        d.text((16, 6), head, font=_font(FONT_B, 24), fill=txt_c)
         # Change 6a — time + date in top-right (replaces the old setinfo draw;
         # reply-set info has moved into knob zone 2 per Change 4).
         _timestr = time.strftime("%a %H:%M:%S")           # "Fri 14:32:07"
         if _lcd_drop_shadows:
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 d.text((img.width - 12 + dx, 8 + dy), _timestr,
-                       font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
+                       font=_font(FONT_R, 16), anchor="ra", fill=(0, 0, 0))
         d.text((img.width - 12, 8), _timestr,
-               font=ImageFont.truetype(FONT_R, 16), anchor="ra", fill=txt_c)
+               font=_font(FONT_R, 16), anchor="ra", fill=txt_c)
         # M-SD10: needy-count badge — shows "⚠ N waiting" when >1 session needs
         # input, so the breathing pulse on a single key isn't the only signal.
         # Hidden when count ≤ 1 (no noise during normal single-session use).
@@ -2536,7 +2547,7 @@ def render_touchscreen(deck):
         if _needy > 1:
             _badge = "\u26a0 %d waiting" % _needy
             _bx = img.width - 135
-            _bf = ImageFont.truetype(FONT_R, 14)
+            _bf = _font(FONT_R, 14)
             # LCD improvement: pulse the badge (1.0s period) to draw the eye.
             _pulse = 0.5 + 0.5 * math.sin(_anim_phase / 1.0 * 2 * math.pi)
             _bc = tuple(int(c * (0.55 + 0.45 * _pulse)) for c in (220, 180, 60))
@@ -2565,7 +2576,7 @@ def render_touchscreen(deck):
                     color = (140, 180, 200)   # other valid options: muted blue
                 else:
                     color = (60, 60, 60)      # empty zone: dim
-                f = ImageFont.truetype(FONT_R, 14)
+                f = _font(FONT_R, 14)
                 if _lcd_drop_shadows:
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                         d.text((x0 + 10 + dx, 28 + dy), label, font=f, fill=(0, 0, 0))
@@ -2652,7 +2663,7 @@ def render_touchscreen(deck):
             # Text label (skipped for weather zone — it has its own text).
             # Drop-shadow in panorama modes so text reads over photo-real backgrounds.
             if label is not None:
-                _lbl_font = ImageFont.truetype(FONT_R, 13)
+                _lbl_font = _font(FONT_R, 13)
                 if _lcd_drop_shadows:
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                         d.text((x0 + zw / 2 + dx, 84 + dy), label,
