@@ -154,12 +154,19 @@ class Config:
             return default
         valid = []
         for entry in raw:
-            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            # Both elements must be str: a non-string mode (entry[1]) later
+            # reaches place_konsole's mode == "window"/"tab"/... comparisons and
+            # the key-render path uses entry[0] as a label. The len==2 shape
+            # check alone is insufficient — mirror deck.tools. F12: never brick
+            # import over a structural config error.
+            if (isinstance(entry, (list, tuple)) and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], str)):
                 valid.append([entry[0], entry[1]])
             else:
                 logging.warning(
                     "config: skipping malformed deck.placements entry %r "
-                    "(need [label, mode])", entry)
+                    "(need [str label, str mode])", entry)
         return valid if valid else default
 
     @property
