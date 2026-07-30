@@ -3230,7 +3230,17 @@ def main():
         log("no Stream Deck found"); sys.exit(1)
     IS_XL = "XL" in plus.deck_type()
     HAS_DIALS = "+" in plus.deck_type()          # XL+ and Plus have dials+touch
-    plus.reset(); plus.set_brightness(_brightness)
+    # FIX: boot device reset/brightness sit in the microsecond window between
+    # the HID open-retry guard above and the render loop's WRITE_FAIL_LIMIT
+    # guard below — a USB drop here (cable settle, hub enumerate) raised and
+    # crashed startup with plus never closed. Wrap so a transient boot hiccup
+    # logs and falls through to the render loop, which will detect a persistent
+    # disconnect via WRITE_FAIL_LIMIT and exit for systemd re-enumeration.
+    # SECURITY/crash-prevention exempt from minimization.
+    try:
+        plus.reset(); plus.set_brightness(_brightness)
+    except Exception as _e:
+        log("boot device reset failed (will retry in render loop): %s", _e)
     if IS_XL:
         # XL: all input on keys; menu-cancel lives on the first reply key
         # (XL_REPLY0 = key 9). Reply set's 4th label is "4" (was "Go"; the
@@ -3275,7 +3285,18 @@ def main():
     _last_input = time.monotonic()
     _bg(_host_status_loop)
     _bg(_weather_loop)
-    repaint(plus)
+    # FIX: startup repaint runs BEFORE the render loop's try/finally (whose
+    # finally does plus.reset()+plus.close()). A boot device-write hiccup here
+    # (OSError on the first set_key_image) would raise past the unguarded call
+    # and skip plus.close() on the way out. Wrap so a boot repaint failure logs
+    # and falls through into the render loop — the render loop arms the finally
+    # (plus.close on exit) and its WRITE_FAIL_LIMIT catches a persistent
+    # disconnect. After the fetch_sessions boundary filter (FIX 2), _sessions
+    # is guaranteed clean, so s["id"] in the repaint path can't KeyError.
+    try:
+        repaint(plus)
+    except Exception as _e:
+        log("startup repaint failed (will retry in render loop): %s", _e)
     log("session board ready: %d sessions, tools=%s", len(_sessions),
         [t[0] for t in TOOLS])
 
