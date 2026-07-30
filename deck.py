@@ -3199,8 +3199,17 @@ def main():
     _load_dbus_map()
     _load_pane_order()
     _sessions = fetch_sessions()
-    _active_id = _sessions[0]["id"] if _sessions else None
-    _activity = {s["id"]: session_activity(s) for s in _sessions[:MAX_SESSIONS]}
+    # Guard the startup snapshot: a session dict missing 'id' (schema drift /
+    # half-spawned session) must not raise KeyError at boot and trigger a
+    # restart loop. Fall back to an empty board — the next 2s refresh tick
+    # repopulates. Mirrors the live loop's refresh-poll try/except.
+    try:
+        _active_id = _sessions[0]["id"] if _sessions else None
+        _activity = {s["id"]: session_activity(s) for s in _sessions[:MAX_SESSIONS]}
+    except (KeyError, TypeError, IndexError) as e:
+        log("startup snapshot incomplete (%s) — booting empty board", e)
+        _active_id = None
+        _activity = {}
     _last_input = time.monotonic()
     _bg(_host_status_loop)
     _bg(_weather_loop)
