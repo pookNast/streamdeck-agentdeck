@@ -117,12 +117,19 @@ class Config:
             return default
         valid = []
         for entry in raw:
-            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            # Both elements must be str: a non-string command (entry[1]) later
+            # reaches cfg.remote_command() -> shlex.quote() -> TypeError, and a
+            # non-string label breaks the key-render path. The len==2 shape
+            # check alone is insufficient. F12: never brick import over a
+            # structural config error.
+            if (isinstance(entry, (list, tuple)) and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], str)):
                 valid.append([entry[0], entry[1]])
             else:
                 logging.warning(
                     "config: skipping malformed deck.tools entry %r "
-                    "(need [label, command])", entry)
+                    "(need [str label, str command])", entry)
         return valid if valid else default
 
     @property
