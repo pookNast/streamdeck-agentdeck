@@ -817,6 +817,7 @@ def _prune_dead(sessions):
                 _needed_since.pop(sid, None)
                 _dismissed.pop(sid, None)
                 _suggest_sticky.pop(sid, None)
+                _menu_opts.pop(sid, None)
                 _dbus_map.pop(sid, None)
                 _win_map.pop(sid, None)
                 if _forget_pane_locked(sid):
