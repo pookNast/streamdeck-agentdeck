@@ -134,6 +134,15 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 log = logging.getLogger("deck").info
 
 _lock = threading.Lock()
+# Serializes _prune_dead across its two callers (render loop ~3279 every 2s,
+# AND the key-35 long-press Timer via _manual_prune ~2936). _prune_dead does
+# multi-phase read+mutation of _win_map/_dbus_map/_pane_order and runs slow
+# agent-deck subprocess calls between phases — concurrent invocations raced
+# each other on the same shared maps. _prune_lock wraps the whole body so the
+# two callers serialize. It is ALWAYS acquired BEFORE _lock (and never the
+# reverse) inside _prune_dead, so no lock-ordering deadlock is possible.
+# SECURITY/concurrency-boundary exempt from minimization.
+_prune_lock = threading.Lock()
 _sessions = []
 _active_id = None
 # Top row (keys 0-3) shows a paginated 4-session window; bottom row (keys 4-7)
@@ -572,7 +581,16 @@ def _prune_dead(sessions):
       2. SSH-tunnel session whose remote process exited — the pane fell back
          from 'ssh' to 'bash' (shows 'Connection to ... closed' on screen).
     agent-deck's list keeps showing dead sessions with stale status.
-    One batched `tmux list-panes -a` call checks all sessions at once."""
+    One batched `tmux list-panes -a` call checks all sessions at once.
+
+    Concurrency: _prune_lock serializes the two callers (render loop ~3279
+    every 2s, AND the key-35 long-press Timer via _manual_prune ~2951). All
+    shared-dict (_win_map/_dbus_map/_pane_order) read+mutation happens under
+    _lock; the slow agent-deck stop+remove subprocess runs OUTSIDE both locks
+    (never hold a lock across a subprocess). _prune_lock is always acquired
+    BEFORE _lock and released between phases — no lock-ordering deadlock."""
+    # tmux liveness check: builds a dict from the `sessions` arg only (no
+    # shared-dict access), so the tmux subprocess runs lock-free.
     tmux_sess = {s.get("tmux_session"): s for s in sessions
                  if s.get("tmux_session")}
     if not tmux_sess:
@@ -587,140 +605,164 @@ def _prune_dead(sessions):
         parts = line.split("\t")
         if len(parts) >= 3:
             pane_info[parts[0]] = (parts[1], parts[2])
-    dead_ids = set()
-    now = time.monotonic()
-    for tname, s in tmux_sess.items():
-        sid = s["id"]
-        # Skip sessions we already pruned recently (agent-deck's remove may
-        # take a couple of poll cycles to clear from list --json).
-        if sid in _pruned:
+
+    with _prune_lock:
+        # === DETECTION PHASE — shared-dict reads under _lock ===
+        dead_ids = set()
+        now = time.monotonic()
+        for tname, s in tmux_sess.items():
+            sid = s["id"]
+            # Skip sessions we already pruned recently (agent-deck's remove may
+            # take a couple of poll cycles to clear from list --json).
+            if sid in _pruned:
+                dead_ids.add(sid)
+                continue
+            if tname not in pane_info:
+                dead_ids.add(sid)
+                log("prune dead '%s' (tmux '%s' gone)", s.get("title"), tname)
+                continue
+            cmd, pane_dead = pane_info[tname]
+            is_ssh = s.get("command", "").lstrip().startswith("ssh")
+            # SSH-tunnel session dies when pane falls back from 'ssh' to anything
+            # else (usually 'bash') — catches 'Connection to ... closed'.
+            # Whitelist tool executable names: pane_current_command can show the
+            # deep foreground (e.g. 'claude') on some tmux/kernel combinations even
+            # while the outer ssh is alive — don't false-positive those as dead.
+            _ALIVE_CMDS = frozenset(["ssh"] + [t[0] for t in TOOLS])
+            if is_ssh and (pane_dead == "1" or cmd not in _ALIVE_CMDS):
+                dead_ids.add(sid)
+                log("prune dead '%s' (SSH closed, pane now %s/%s)",
+                    s.get("title"), cmd, pane_dead)
+        # Third signal: tracked Konsole window was closed (user closed the terminal).
+        # When the Konsole PID in _win_map has no X windows left, the terminal is gone.
+        # We stop+remove the session so it clears off the Stream Deck immediately.
+        # _win_miss is exclusive to _prune_dead (serialized by _prune_lock) so its
+        # read-modify-write below needs no _lock; _win_map IS shared with
+        # _new_window/place_* threads, so every _win_map access is under _lock.
+        for s in sessions:
+            sid = s["id"]
+            if sid in dead_ids or sid in _pruned:
+                continue
+            with _lock:
+                konsole_pid = _win_map.get(sid)
+            if not konsole_pid:
+                continue
+            wins = _windows_of_pid(konsole_pid)
+            if wins is None:
+                # Query failed (e.g. transient X BadWindow error) — unknown state,
+                # NOT evidence the window closed. Leave the miss counter as-is so a
+                # genuine close isn't masked by one flaky poll in the middle of it.
+                continue
+            if wins:
+                _win_miss.pop(sid, None)
+                continue
+            misses = _win_miss.get(sid, 0) + 1
+            _win_miss[sid] = misses
+            if misses < _WIN_MISS_THRESHOLD:
+                continue
             dead_ids.add(sid)
-            continue
-        if tname not in pane_info:
-            dead_ids.add(sid)
-            log("prune dead '%s' (tmux '%s' gone)", s.get("title"), tname)
-            continue
-        cmd, pane_dead = pane_info[tname]
-        is_ssh = s.get("command", "").lstrip().startswith("ssh")
-        # SSH-tunnel session dies when pane falls back from 'ssh' to anything
-        # else (usually 'bash') — catches 'Connection to ... closed'.
-        # Whitelist tool executable names: pane_current_command can show the
-        # deep foreground (e.g. 'claude') on some tmux/kernel combinations even
-        # while the outer ssh is alive — don't false-positive those as dead.
-        _ALIVE_CMDS = frozenset(["ssh"] + [t[0] for t in TOOLS])
-        if is_ssh and (pane_dead == "1" or cmd not in _ALIVE_CMDS):
-            dead_ids.add(sid)
-            log("prune dead '%s' (SSH closed, pane now %s/%s)",
-                s.get("title"), cmd, pane_dead)
-    # Third signal: tracked Konsole window was closed (user closed the terminal).
-    # When the Konsole PID in _win_map has no X windows left, the terminal is gone.
-    # We stop+remove the session so it clears off the Stream Deck immediately.
-    for s in sessions:
-        sid = s["id"]
-        if sid in dead_ids or sid in _pruned:
-            continue
-        with _lock:
-            konsole_pid = _win_map.get(sid)
-        if not konsole_pid:
-            continue
-        wins = _windows_of_pid(konsole_pid)
-        if wins is None:
-            # Query failed (e.g. transient X BadWindow error) — unknown state,
-            # NOT evidence the window closed. Leave the miss counter as-is so a
-            # genuine close isn't masked by one flaky poll in the middle of it.
-            continue
-        if wins:
             _win_miss.pop(sid, None)
-            continue
-        misses = _win_miss.get(sid, 0) + 1
-        _win_miss[sid] = misses
-        if misses < _WIN_MISS_THRESHOLD:
-            continue
-        dead_ids.add(sid)
-        _win_miss.pop(sid, None)
+            # TOCTOU fix: re-check the pid is unchanged inside the SAME lock
+            # scope as the pop. Between the read above and this pop, a
+            # _new_window/place_* thread could have remapped _win_map[sid] to
+            # a fresh konsole; popping blindly would drop that new mapping.
+            with _lock:
+                if _win_map.get(sid) == konsole_pid:
+                    _win_map.pop(sid, None)
+                    _save_win_map()
+            log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
+        # Signal 4: tracked Konsole D-Bus session path no longer exists in
+        # sessionList. Catches per-tab close: closing one tab in a multi-tab
+        # window leaves the konsole PROCESS alive (other tabs hold it open), so
+        # Signal 3's whole-PID window check misses it. The D-Bus ksid is per-tab
+        # — if it's gone from sessionList, that specific tab was closed (user
+        # closed it, even though tmux + ssh underneath kept running). Batched:
+        # one qdbus call per unique konsole PID. _dbus_map/_win_map reads under
+        # _lock (shared with other writers); qdbus subprocess runs lock-free.
+        _dbus_live = {}                     # svc -> (ok, set-of-ksids) per prune
+        for s in sessions:
+            sid = s["id"]
+            if sid in dead_ids or sid in _pruned:
+                continue
+            with _lock:
+                ksid_tracked = _dbus_map.get(sid)
+                pid = _win_map.get(sid)
+            if not ksid_tracked:
+                continue                    # new-window session — Signal 3 covers it
+            if not pid:
+                continue
+            svc = "org.kde.konsole-%s" % pid
+            if svc not in _dbus_live:
+                ok, out = _xrun_checked(
+                    ["qdbus", svc, "/Windows/1", "org.kde.konsole.Window.sessionList"])
+                _dbus_live[svc] = (ok, {p.strip() for p in out.split() if p.strip()})
+            ok, live = _dbus_live[svc]
+            if ok and ksid_tracked not in live:
+                dead_ids.add(sid)
+                log("prune dead '%s' (konsole D-Bus session %s gone)",
+                    s.get("title"), ksid_tracked)
+        # Expire stale prune cache entries (session could be re-created with same id)
+        for sid in list(_pruned):
+            if sid not in {s["id"] for s in sessions} and now - _pruned[sid] > 60:
+                del _pruned[sid]
+
+        # Reconcile caches: remove stale entries from _win_map and _pane_order for
+        # sessions that disappeared from agent-deck between polls (no prune signal
+        # fired because we missed the death event). This prevents ghost entries from
+        # accumulating in pane_order.json and windows.json.
+        live_ids = {s["id"] for s in sessions}
         with _lock:
-            _win_map.pop(sid, None)
-            _save_win_map()
-        log("prune dead '%s' (konsole pid %s window closed)", s.get("title"), konsole_pid)
-    # Signal 4: tracked Konsole D-Bus session path no longer exists in
-    # sessionList. Catches per-tab close: closing one tab in a multi-tab
-    # window leaves the konsole PROCESS alive (other tabs hold it open), so
-    # Signal 3's whole-PID window check misses it. The D-Bus ksid is per-tab
-    # — if it's gone from sessionList, that specific tab was closed (user
-    # closed it, even though tmux + ssh underneath kept running). Batched:
-    # one qdbus call per unique konsole PID.
-    _dbus_live = {}                     # svc -> (ok, set-of-ksids) per prune
-    for s in sessions:
-        sid = s["id"]
-        if sid in dead_ids or sid in _pruned:
-            continue
-        ksid_tracked = _dbus_map.get(sid)
-        if not ksid_tracked:
-            continue                    # new-window session — Signal 3 covers it
-        pid = _win_map.get(sid)
-        if not pid:
-            continue
-        svc = "org.kde.konsole-%s" % pid
-        if svc not in _dbus_live:
-            ok, out = _xrun_checked(
-                ["qdbus", svc, "/Windows/1", "org.kde.konsole.Window.sessionList"])
-            _dbus_live[svc] = (ok, {p.strip() for p in out.split() if p.strip()})
-        ok, live = _dbus_live[svc]
-        if ok and ksid_tracked not in live:
-            dead_ids.add(sid)
-            log("prune dead '%s' (konsole D-Bus session %s gone)",
-                s.get("title"), ksid_tracked)
-    # Expire stale prune cache entries (session could be re-created with same id)
-    for sid in list(_pruned):
-        if sid not in {s["id"] for s in sessions} and now - _pruned[sid] > 60:
-            del _pruned[sid]
+            # Mutations + saves under the lock: _new_window/place_* write these same
+            # maps from other threads; an unlocked read-modify-write raced them.
+            stale_win = [sid for sid in list(_win_map) if sid not in live_ids]
+            for sid in stale_win:
+                _win_map.pop(sid, None)
+                _forget_pane_locked(sid)
+                log("cache prune: stale win_map entry %s", sid[:8])
+            if stale_win:
+                _save_win_map()
+            # Also prune _dbus_map entries for vanished sessions
+            stale_dbus = [sid for sid in list(_dbus_map) if sid not in live_ids]
+            for sid in stale_dbus:
+                _dbus_map.pop(sid, None)
+            if stale_dbus:
+                _save_dbus_map()
 
-    # Reconcile caches: remove stale entries from _win_map and _pane_order for
-    # sessions that disappeared from agent-deck between polls (no prune signal
-    # fired because we missed the death event). This prevents ghost entries from
-    # accumulating in pane_order.json and windows.json.
-    live_ids = {s["id"] for s in sessions}
-    with _lock:
-        # Mutations + saves under the lock: _new_window/place_* write these same
-        # maps from other threads; an unlocked read-modify-write raced them.
-        stale_win = [sid for sid in list(_win_map) if sid not in live_ids]
-        for sid in stale_win:
-            _win_map.pop(sid, None)
-            _forget_pane_locked(sid)
-            log("cache prune: stale win_map entry %s", sid[:8])
-        if stale_win:
-            _save_win_map()
-        # Also prune _dbus_map entries for vanished sessions
-        stale_dbus = [sid for sid in list(_dbus_map) if sid not in live_ids]
-        for sid in stale_dbus:
-            _dbus_map.pop(sid, None)
-        if stale_dbus:
-            _save_dbus_map()
+        if not dead_ids:
+            return sessions
 
-    if not dead_ids:
-        return sessions
-    # Slow agent-deck stop+remove runs OUTSIDE the lock — never hold _lock across
-    # a subprocess call (it would stall every writer for up to 10s per session).
+    # === SLOW SUBPROCESS PHASE — OUTSIDE both locks ===
+    # Never hold a lock across a subprocess call (would stall every render-loop
+    # writer on _lock for up to 10s×N sessions; _prune_lock would block the
+    # long-press Timer caller needlessly). The `if sid not in _pruned` guard is
+    # the idempotency check; a benign double-stop+remove race between two
+    # callers (window between _prune_lock release and this check) is tolerated
+    # — agent-deck handles already-stopped sessions gracefully and --force
+    # makes remove idempotent. SECURITY/concurrency-boundary exempt.
     for sid in dead_ids:
         if sid not in _pruned:
             _run([AD, "session", "stop", sid], timeout=10)
             _run([AD, "session", "remove", sid, "--force"], timeout=10)
             _pruned[sid] = now
             log("prune: stop+remove %s", sid[:8])
-    # Cache mutations + saves INSIDE the lock — same maps are written by
-    # _new_window/place_* from other threads.
-    with _lock:
-        for sid in dead_ids:
-            _activity.pop(sid, None)
-            _urgency.pop(sid, None)
-            _needed_since.pop(sid, None)
-            _dismissed.pop(sid, None)
-            _suggest_sticky.pop(sid, None)
-            _dbus_map.pop(sid, None)
-            _win_map.pop(sid, None)
-            _forget_pane_locked(sid)
-        _save_dbus_map()
-        _save_win_map()
+
+    # === FINAL CACHE CLEANUP — _prune_lock reacquired + _lock ===
+    # Cache mutations + saves INSIDE _lock — same maps are written by
+    # _new_window/place_* from other threads. _prune_lock keeps the two callers
+    # from interleaving this pop-pass with a detection phase.
+    with _prune_lock:
+        with _lock:
+            for sid in dead_ids:
+                _activity.pop(sid, None)
+                _urgency.pop(sid, None)
+                _needed_since.pop(sid, None)
+                _dismissed.pop(sid, None)
+                _suggest_sticky.pop(sid, None)
+                _dbus_map.pop(sid, None)
+                _win_map.pop(sid, None)
+                _forget_pane_locked(sid)
+            _save_dbus_map()
+            _save_win_map()
     return [s for s in sessions if s["id"] not in dead_ids]
 
 def tmux_send(sess, keys):
