@@ -540,6 +540,17 @@ def fetch_sessions():
     except Exception:
         return []
     data = data if isinstance(data, list) else data.get("items", data.get("sessions", []))
+    # FIX: filter malformed sessions at the boundary. agent-deck can return
+    # dicts missing 'id' (half-spawned / schema drift); keeping them made
+    # downstream s["id"] accesses (render_touchscreen needy-count, startup
+    # repaint, _prune_dead) raise KeyError. Dropping them here makes EVERY
+    # downstream s["id"]/s["title"] access safe by construction — closing
+    # the whole schema-drift crash class. SECURITY/error-boundary exempt.
+    _orig = len(data) if isinstance(data, list) else 0
+    data = [s for s in data if isinstance(s, dict) and s.get("id")]
+    if len(data) != _orig:
+        log("fetch_sessions: dropped %d malformed session(s) (missing id / not a dict)",
+            _orig - len(data))
     # Stream Deck button order mirrors actual on-screen Konsole layout:
     # left-to-right = window-open order, and within a window, top-to-bottom
     # (split) / left-to-right (tab) = placement order, both tracked live in
