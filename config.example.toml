@@ -57,27 +57,9 @@ reply_sets = [
     },
 ]
 
-[terminal]
-# Terminal integration mode.
-# "konsole" — use Konsole D-Bus for window management (Linux/KDE only)
-# "tmux"      — tmux-only mode (portable; no X11/D-Bus dependency)
-# "none"      — no terminal integration (session order not visual-mapped)
-mode = "konsole"
-
-# Konsole-specific settings (only used when mode = "konsole")
-# [terminal.konsole]
-# exec = "konsole"           # path to konsole binary
-# dbus_service = "org.kde.konsole"
-
-# tmux-specific settings (only used when mode = "tmux")
-# [terminal.tmux]
-# split_direction_default = "vertical"
-
 [pruning]
 # Session pruning settings
 win_miss_threshold = 2        # consecutive misses before pruning a window
-idle_timeout_sec = 0          # seconds of idle before pruning (0 = disabled)
-prune_cooldown_sec = 60       # seconds before a pruned session ID can be reused
 
 [weather]
 # NWS weather display (the coast area by default)

@@ -4,9 +4,14 @@ Reads ~/.config/streamdeck-agentdeck/config.toml or ~/.streamdeck-agentdeck.toml
 Missing keys fall back to built-in defaults — the file is optional.
 """
 import os
+import shlex
 
 def _load_toml(path):
-    """Load a TOML file, returning dict. Falls back to built-in tomllib (3.11+)."""
+    """Load a TOML file, returning dict. Falls back to built-in tomllib (3.11+).
+
+    A malformed config file logs a warning and returns {} so the service falls
+    back to defaults instead of bricking on a TOMLDecodeError propagating through
+    Config() at startup."""
     try:
         from tomllib import load  # Python 3.11+
     except ImportError:
@@ -16,10 +21,22 @@ def _load_toml(path):
         except ImportError:
             # Last resort: try toml package
             import toml  # type: ignore
-            with open(path) as f:
-                return toml.load(f)
-    with open(path, "rb") as f:
-        return load(f)
+            try:
+                with open(path) as f:
+                    return toml.load(f)
+            except Exception as e:
+                import logging
+                logging.warning("config %s malformed (%s); using defaults", path, e)
+                return {}
+    try:
+        with open(path, "rb") as f:
+            return load(f)
+    except Exception as e:
+        # tomllib.TOMLDecodeError (or toml's parse error) on a syntax error —
+        # never let this escape Config() and brick the systemd service.
+        import logging
+        logging.warning("config %s malformed (%s); using defaults", path, e)
+        return {}
 
 def _resolve_path():
     """Find config file: ~/.config/streamdeck-agentdeck/config.toml > ~/.streamdeck-agentdeck.toml"""
@@ -118,29 +135,11 @@ class Config:
             },
         ])
 
-    # --- Terminal section ---
-    @property
-    def terminal_mode(self):
-        """Terminal integration mode: 'konsole', 'tmux', or 'none'."""
-        return self._get("terminal.mode", "konsole")
-
-    @property
-    def win_miss_threshold(self):
-        """Number of missed checks before declaring a konsole window dead."""
-        return self._get("terminal.win_miss_threshold", 2)
-
     # --- Pruning section ---
     @property
     def win_miss_threshold(self):
+        """Number of missed checks before declaring a konsole window dead."""
         return self._get("pruning.win_miss_threshold", 2)
-
-    @property
-    def idle_timeout_sec(self):
-        return self._get("pruning.idle_timeout_sec", 0)
-
-    @property
-    def prune_cooldown_sec(self):
-        return self._get("pruning.prune_cooldown_sec", 60)
 
     # --- Weather section ---
     @property
@@ -176,5 +175,11 @@ class Config:
     def remote_command(self, tool_cmd):
         """Wrap a tool command with SSH if ssh_host is set."""
         if self.ssh_host:
-            return "ssh -t %s bash -lc %s" % (self.ssh_host, tool_cmd)
+            # shlex.quote both fields: tool_cmd becomes one bash arg, and the
+            # trailing `_` absorbs $0 so `bash -lc CMD _ --flag` runs the whole
+            # command (without it, `bash -lc claude --model X` runs only `claude`
+            # with $0=--model). No current default tool has args, but quote it
+            # correctly so a future flag-bearing tool runs remotely as written.
+            return "ssh -t %s bash -lc %s _" % (
+                shlex.quote(self.ssh_host), shlex.quote(tool_cmd))
         return tool_cmd
