@@ -59,6 +59,12 @@ def _font(path, size):
 REFRESH_SECS = 2
 MENU_TIMEOUT = 12          # seconds before an open picker reverts to the board
 SLEEP_SECS = 3600         # idle seconds before the OLEDs blank (wake on any input)
+# Max consecutive OSError device-write failures before we exit so systemd's
+# Restart=always can re-enumerate the USB device. ~12 ticks @20fps ≈ 0.6s —
+# tolerates a transient write hiccup but tears down on a persistent disconnect
+# (cable bump / hub glitch / S3) so the hidraw FD can't silently leak. SECURITY/
+# crash-prevention exempt from minimization — explicit robust version.
+WRITE_FAIL_LIMIT = 12
 
 # All agent commands run on the-deck-host over `ssh -t` (PTY): the agent-deck session
 # lives on the-host (so it's on the board and you reply via tmux send-keys), but the
@@ -3205,6 +3211,7 @@ def main():
     ANIM = 0.05
     per_refresh = max(1, round(REFRESH_SECS / ANIM))   # 40 ticks per state poll
     tick = 0
+    _write_fail = 0   # consecutive OSError device-write failures (see WRITE_FAIL_LIMIT)
     global _anim_phase
     try:
         while not stop.wait(ANIM):
@@ -3335,6 +3342,18 @@ def main():
                     # Menus are static between interactions — only repaint on the
                     # slow cadence (or when a callback forces it via repaint()).
                     repaint(plus)
+                _write_fail = 0   # any device write above succeeded — reset the streak
+            except OSError as e:
+                # Device write dropped (USB glitch / cable bump / S3). A bounded
+                # run of these is tolerated; a persistent streak means the device
+                # is gone — re-raise so the outer try/finally closes the deck and
+                # the process exits for systemd Restart=always to re-enumerate it.
+                # Without this the loop spun forever on a dead FD (silent outage).
+                _write_fail += 1
+                log("device write failed (%d/%d): %s", _write_fail, WRITE_FAIL_LIMIT, e)
+                if _write_fail >= WRITE_FAIL_LIMIT:
+                    log("device unresponsive -- exiting for systemd re-enumerate")
+                    raise
             except Exception as e:
                 log("repaint error: %s", e)
     finally:
