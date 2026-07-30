@@ -8,7 +8,7 @@ import shlex
 import logging
 
 def _load_toml(path):
-    """Load a TOML file, returning dict. Falls back to built-in tomllib (3.11+).
+    """Load a TOML file, returning dict. Uses stdlib tomllib (Python 3.11+).
 
     A malformed config file logs a warning and returns {} so the service falls
     back to defaults instead of bricking on a TOMLDecodeError propagating through
@@ -16,26 +16,20 @@ def _load_toml(path):
     try:
         from tomllib import load  # Python 3.11+
     except ImportError:
-        try:
-            import toml as tomllib
-            load = tomllib.load  # type: ignore
-        except ImportError:
-            # Last resort: try toml package
-            import toml  # type: ignore
-            try:
-                with open(path) as f:
-                    return toml.load(f)
-            except Exception as e:
-                import logging
-                logging.warning("config %s malformed (%s); using defaults", path, e)
-                return {}
+        # The systemd unit pins /usr/bin/python3 (py3.11+ ships tomllib); a
+        # third-party `toml` fallback is unreachable here — if tomllib is absent,
+        # the unit wouldn't run. The old `import toml` nested fallback was also
+        # dead logic: `import toml as tomllib` above raised ImportError from the
+        # SAME package, so `import toml` would fail identically. ponytail: drop
+        # the dead fallback.
+        logging.warning("config: tomllib unavailable (need py3.11+); using defaults")
+        return {}
     try:
         with open(path, "rb") as f:
             return load(f)
     except Exception as e:
-        # tomllib.TOMLDecodeError (or toml's parse error) on a syntax error —
-        # never let this escape Config() and brick the systemd service.
-        import logging
+        # tomllib.TOMLDecodeError on a syntax error — never let this escape
+        # Config() and brick the systemd service. (F12 guard.)
         logging.warning("config %s malformed (%s); using defaults", path, e)
         return {}
 

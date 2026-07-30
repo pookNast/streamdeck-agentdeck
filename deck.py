@@ -417,13 +417,6 @@ def _forget_pane_locked(sid):
             if not sids:
                 del _pane_order[p]
     return changed
-
-def _forget_pane(sid):
-    changed = False
-    with _lock:
-        changed = _forget_pane_locked(sid)
-    if changed:
-        _save_pane_order()
 _reply_set = 0             # index into REPLY_SETS (no longer cycled — Set key removed); default "select" 1/2/3/4
 _activity = {}             # session id -> (label, needs_choice, rec_zone) from pane parsing
 _needed_since = {}         # session id -> monotonic timestamp when first detected as needing input
@@ -1235,22 +1228,6 @@ def _focus_konsole_window(svc):
     wid = next((w for w in wins if _window_visible(w)), wins[0])
     _xrun(["xdotool", "windowactivate", "--sync", wid], timeout=3)
 
-def focus_active_terminal():
-    """Raise + focus the active session's konsole window. XL+ knob 1.
-    Same xdotool/wmctrl path toggle_or_place uses on second tap."""
-    sid = _active_id
-    if not sid:
-        log("focus-terminal: no active session"); return
-    with _lock:
-        pid = _win_map.get(sid)
-    wins = _windows_of_pid(pid)
-    if not wins:
-        log("focus-terminal: no window for sid=%s", sid); return
-    wid = next((w for w in wins if _window_visible(w)), wins[0])
-    _xrun(["wmctrl", "-i", "-a", wid])
-    _xrun(["xdotool", "windowactivate", "--sync", wid], timeout=3)
-    log("focus-terminal: raised wid=%s for sid=%s", wid, sid)
-
 def _new_window(cmd, sid=None):
     env = _dbus_env()
     # stderr inherited (not DEVNULL): Konsole/Qt D-Bus warnings need to land in
@@ -1590,13 +1567,6 @@ def _mem_pct():
     except Exception:
         return 0.0
 
-def _bars(d, x, y, items):
-    """items = [(label, value_0_1, color), ...] — mini bars + label."""
-    for label, v, color in items:
-        d.text((x, y - 2), label, font=_font(FONT_R, 11), fill=(220, 220, 220))
-        d.rectangle([x + 28, y, x + 28 + int(40 * max(0, min(1, v))), y + 6], fill=color)
-        x += 78
-
 def active_is_suggest():
     """True if the active session is at a free-text / auto-suggest prompt
     (label "suggest…"), OR was within the last few seconds — agent-deck flickers
@@ -1872,38 +1842,6 @@ def _centered(deck, bg, text, size=20, sub=None, border=None, border_w=4,
         d.rectangle([1, 1, img.width - 2, img.height - 2], outline=border, width=border_w)
     return PILHelper.to_native_key_format(deck, img)
 
-# ---- weather + grill label/color helpers (used by LCD renderer) ------------
-def _weather_bg(icon_word, temp_f):
-    """Pick a background color from the condition word + temp. Ghibli-muted."""
-    if icon_word == "TSTM":    return (50, 40, 70)    # purple-ish (matches XL_GOAL palette)
-    if icon_word == "RAIN":    return (40, 50, 70)    # dark blue-gray
-    if icon_word in ("DRIZ", "FOG", "SNOW"): return (45, 50, 58)  # neutral gray
-    if icon_word == "CLD":     return (50, 55, 65)    # neutral cloudy
-    if isinstance(temp_f, (int, float)) and temp_f >= 95:
-        return (70, 50, 30)                           # amber (matches XL_TOOL_SWAP)
-    return (40, 60, 80)                               # cool blue (fair/clear)
-
-def _weather_label():
-    """Short label string used by both render paths. Cinema overlays call this."""
-    with _weather_lock:
-        t = _weather["temp_f"]
-        w = _weather["icon_word"]
-        fail = _weather["fail_streak"]
-    if fail > 4 or t is None:
-        return "?"
-    return "%d %s" % (int(t), w or "—")
-
-def _grill_label():
-    """Short label string used by both render paths."""
-    with _grill_lock:
-        ok = _grill["ok"]
-        reason = _grill["reason"]
-    if ok is None:
-        return "?"
-    if ok:
-        return "GRILL"
-    return ("GRILL %s" % reason) if reason else "GRILL"
-
 # ---- animation renderers (Ghibli accents) ---------------------------------
 # Each takes the PIL draw context, a 0..1 phase, an accent color, and the dark
 # base color. They mutate the image in place. Renderers are pure: same phase +
@@ -1965,84 +1903,6 @@ def _anim_sweep_rects(draw, phase, color, base, rect):
         hh = (y1 - y0) * scale / 2
         draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh],
                        fill=_lerp_color(base, color, alpha))
-
-# ---- weather animation primitives (LCD weather zone) ----------------------
-# Each takes a PIL draw context + a bounding region + phase 0..1 + color.
-# Pure: same phase + color → same pixels. Used by _render_weather_lcd_zone to
-# animate the condition icon at the left of the weather strip. ponytail: no
-# asset files — all procedural with PIL primitives. upgrade: PNG sprites if a
-# richer look is ever worth the disk footprint.
-def _draw_sun(d, cx, cy, r, phase, color):
-    """Sun disk + 8 rotating spokes. phase 0..1 = one full rotation."""
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
-    for k in range(8):
-        a = phase * 2 * math.pi + k * (math.pi / 4)
-        x1 = cx + math.cos(a) * (r + 4)
-        y1 = cy + math.sin(a) * (r + 4)
-        x2 = cx + math.cos(a) * (r + 10)
-        y2 = cy + math.sin(a) * (r + 10)
-        d.line([x1, y1, x2, y2], fill=color, width=2)
-
-def _draw_cloud(d, cx, cy, w, phase, color):
-    """3 overlapping ellipses drifting right; wraps modulo w."""
-    drift = (phase * w) % w
-    for k, off in enumerate((-w/3, 0, w/3)):
-        x = (cx + off + drift - w/2) % w + (cx - w/2)
-        ew = w / 3
-        d.ellipse([x - ew/2, cy - 6, x + ew/2, cy + 6], fill=color)
-
-def _draw_rain(d, x0, y0, w, h, phase, density, color):
-    """Vertical streaks falling. density = number of drops. phase 0..1 = one wrap."""
-    span = h + 8
-    for k in range(density):
-        # Stable per-drop x position; only y animates.
-        x = x0 + int((k * 37.5) % w)
-        y_off = (phase * span + k * (span / density)) % span
-        y_top = y0 + y_off - 6
-        d.line([x, y_top, x, y_top + 6], fill=color, width=1)
-
-def _draw_lightning(d, cx, cy, h, phase, color):
-    """Jagged bolt + brief bright flash every cycle."""
-    # Flash background on first 10% of cycle.
-    if phase < 0.1:
-        flash = (255, 255, 200) if color == (255, 220, 80) else color
-        # caller's rect should already be drawn; we just add the bolt brighter.
-    bolt_h = h - 8
-    pts = [(cx - 3, cy - bolt_h/2), (cx + 4, cy - bolt_h/4),
-           (cx - 2, cy), (cx + 3, cy + bolt_h/4), (cx, cy + bolt_h/2)]
-    d.line(pts, fill=color, width=2, joint="curve")
-
-def _draw_fog(d, x0, y0, w, h, phase, color):
-    """Three horizontal translucent bands drifting at different speeds."""
-    for k in range(3):
-        speed = (1.0, 0.6, 0.4)[k]
-        offset = (phase * w * speed + k * w/3) % w
-        y = y0 + 8 + k * 12
-        # Bands wrap; draw two copies to cover the seam.
-        for off in (offset - w, offset):
-            d.rectangle([x0 + off, y, x0 + off + w * 0.6, y + 4], fill=color)
-
-def _draw_snow(d, x0, y0, w, h, phase, density, color):
-    """Small dots falling with sine-wave horizontal drift."""
-    span = h + 6
-    for k in range(density):
-        sx = (k * 41.0) % w
-        drift = math.sin((phase + k * 0.3) * 2 * math.pi) * 4
-        x = x0 + int(sx + drift)
-        y_off = (phase * span + k * (span / density)) % span
-        y = y0 + y_off
-        d.ellipse([x - 1, y - 1, x + 1, y + 1], fill=color)
-
-def _draw_heat_shimmer(d, x0, y0, w, h, phase, color):
-    """Three wavy horizontal lines below the sun (heat rising)."""
-    for k in range(3):
-        y = y0 + 4 + k * 6
-        pts = []
-        for x in range(0, int(w), 3):
-            wave = math.sin((x / w) * 2 * math.pi + phase * 2 * math.pi + k) * 2
-            pts.append((x0 + x, y + wave))
-        if len(pts) > 1:
-            d.line(pts, fill=color, width=1)
 
 def _render_weather_lcd_zone(d, x0, y0, w, h, phase):
     """Draw the 400px weather zone: temp+condition+city (left 300px),
@@ -2968,7 +2828,6 @@ def on_key(deck, key, pressed):
         open_menu("tool"); _repaint_pending = True
 
 # M-SD3: long-press detection — state + helper.
-_press_ts = {}       # key -> monotonic timestamp of key-down edge
 _long_fired = set()  # keys whose long-press action already fired (cleared on key-up)
 _long_timers = {}    # key -> threading.Timer handle for the pending long-press
 # Guards _long_fired between the StreamDeck read thread (key-up) and the Timer
@@ -3123,9 +2982,7 @@ def _track_press(key, pressed):
     ponytail: threading.Timer over a poll-loop check — the 20fps render loop
     shouldn't care about press timing. Daemon threads never block shutdown.
     Upgrade: single timer wheel if concurrent holds ever matter (they won't)."""
-    now = time.monotonic()
     if pressed:
-        _press_ts[key] = now
         spec = _LONG_PRESS.get(key)
         if spec is None:
             return False
@@ -3147,7 +3004,6 @@ def _track_press(key, pressed):
         _long_timers[key] = t
         t.start()
         return True
-    _press_ts.pop(key, None)
     t = _long_timers.pop(key, None)
     if t is not None:
         t.cancel()
