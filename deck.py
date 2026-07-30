@@ -31,7 +31,7 @@ from core.config import Config
 
 cfg = Config()
 
-AD = os.path.expanduser("~/.local/bin/agent-deck")
+AD = cfg.agent_deck_bin
 
 # Shared UI text colors (extracted from repeated per-call-site literals).
 TXT_DIM = (205, 210, 220)      # secondary / label text
@@ -389,7 +389,7 @@ _dismissed = {}            # session id -> monotonic dismiss timestamp
 _suggest_sticky = {}       # session id -> monotonic timestamp of last "suggest…" label
 _pruned = {}               # session id -> monotonic timestamp (suppress re-prune noise)
 _win_miss = {}             # session id -> consecutive confirmed-empty window polls
-_WIN_MISS_THRESHOLD = 2    # confirmed misses needed before a window-close prune fires
+_WIN_MISS_THRESHOLD = cfg.win_miss_threshold    # documented [pruning] knob (default 2)
 DISMISS_TIMEOUT = 300.0    # safety max before a dismissed session auto-rearms
 _last_input = 0.0          # monotonic time of last user input (for sleep timer)
 _asleep = False            # True when the OLEDs are blanked
@@ -2816,7 +2816,7 @@ def _status_blast():
 
 # M-SD6: tool swap — cycle the focused session's CLI tool.
 _TOOL_CYCLE = ["claude", "glm", "gpt", "local"]
-_TOOL_CMDS = {t: c for t, c in [(l, _remote(cmd)) for l, cmd in
+_TOOL_CMDS = {t: c for t, c in [(l, cfg.remote_command(cmd)) for l, cmd in
     [("claude", "claude"), ("glm", "claude-glm"), ("gpt", "claude-gpt"), ("local", "oc-start")]]}
 _tool_swap_at = {}  # session id -> monotonic ts of last swap (10s cooldown)
 
