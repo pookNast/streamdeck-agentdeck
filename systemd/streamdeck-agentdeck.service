@@ -1,9 +1,19 @@
 [Unit]
 Description=Stream Deck Plus -> agent-deck headless bridge
 After=graphical-session.target
-# Forgive transient start races (USB not ready at boot) without locking the unit
-# out permanently. If a persistent lockout does occur, clear it with:
+# StartLimit is an INTENTIONAL backstop, not a bug. The app is boot-robust
+# (config validation coerces/filters every cfg.* field; sessions are filtered
+# at the fetch_sessions boundary; USB write failures exit cleanly so systemd
+# re-enumerates the device), so under normal operation StartLimit should never
+# trigger. If it DOES fire (30 starts in 300s), that signals a GENUINE
+# persistent failure (bad cable, dead hub, hardware fault) — at that point
+# thrashing the CPU with restart attempts helps no one. systemd's designed
+# recovery is a one-shot manual reset AFTER the operator inspects the fault:
 #   systemctl --user reset-failed streamdeck-agentdeck.service
+# This prevents CPU-thrash on real hardware failure and is systemd's intended
+# behavior for a Restart=always unit, not a lockout bug. We deliberately do
+# NOT auto-reset and do NOT add an in-process import-retry loop that would
+# mask the underlying fault.
 StartLimitIntervalSec=300
 StartLimitBurst=30
 
