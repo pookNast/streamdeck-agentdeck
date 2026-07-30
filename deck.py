@@ -1546,8 +1546,13 @@ def dismiss_session(sess):
     from the focus queue, WITHOUT sending keys to the agent. Rearms when the
     agent next goes busy (spinner) or stops needing input, or after DISMISS_TIMEOUT."""
     sid = sess.get("id")
-    _dismissed[sid] = time.monotonic()
-    _needed_since.pop(sid, None)
+    # FIX: guard the write+pop under _lock — dismiss_session runs from the
+    # HID read-thread/bg callback context, while the render loop reads+muts
+    # both dicts (~3344-3359). Without _lock this is a read-modify-write
+    # hazard (pop between the render loop's get and setdefault).
+    with _lock:
+        _dismissed[sid] = time.monotonic()
+        _needed_since.pop(sid, None)
     log("dismissed input gate for %s", sess.get("title"))
 
 def act_reply(slot, reply_set=None, allow_dismiss=True):
@@ -3339,24 +3344,30 @@ def main():
                     # needing input, or DISMISS_TIMEOUT elapses. Time-based, not content
                     # based — the pane footer drifts every refresh and would clear a
                     # fingerprint match instantly.
-                    for sid in list(act.keys()):
-                        lbl, need, rec = act[sid]
-                        ts = _dismissed.get(sid)
-                        if ts and (not need or now - ts > DISMISS_TIMEOUT):
-                            _dismissed.pop(sid, None)
-                        elif ts and need:
-                            act[sid] = (lbl, False, None)
+                    # FIX: _dismissed read+pop under _lock — dismiss_session writes
+                    # the same dict from the HID/bg callback context (~1549).
+                    with _lock:
+                        for sid in list(act.keys()):
+                            lbl, need, rec = act[sid]
+                            ts = _dismissed.get(sid)
+                            if ts and (not need or now - ts > DISMISS_TIMEOUT):
+                                _dismissed.pop(sid, None)
+                            elif ts and need:
+                                act[sid] = (lbl, False, None)
                     # Refresh sticky-suggest timestamps so active_is_suggest() bridges
                     # the agent-deck running↔waiting status flicker (5s window).
                     for sid, (lbl, _n, _r) in act.items():
                         if lbl == "suggest…":
                             _suggest_sticky[sid] = now
                     # Track when sessions first started needing input (for 10s slow-blink).
-                    for sid, (label, need, _r) in act.items():
-                        if need:
-                            _needed_since.setdefault(sid, now)
-                        else:
-                            _needed_since.pop(sid, None)
+                    # FIX: _needed_since setdefault/pop under _lock — same hazard as
+                    # _dismissed above (dismiss_session pops this dict too).
+                    with _lock:
+                        for sid, (label, need, _r) in act.items():
+                            if need:
+                                _needed_since.setdefault(sid, now)
+                            else:
+                                _needed_since.pop(sid, None)
                     # Classify urgency:
                     #   "menu"    = numbered choice → fast blink, top focus priority
                     #   "suggest" = auto-suggest/text prompt → slow blink immediately
