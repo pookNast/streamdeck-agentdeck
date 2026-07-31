@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ghibli_beach — the coast panorama for the Stream Deck XL+ LCD strip.
+ghibli_beach — beach panorama for the Stream Deck XL+ LCD strip.
 
 Procedural PIL renderer producing a 1200×100 RGB image that depicts a
 Gulf-coast beach scene with live weather conditions and a time-of-day
@@ -734,7 +734,7 @@ def _draw_fog_bands(d, phase, color):
 
 
 def _draw_snow_overlay(d, phase, color):
-    """Drifting snow flakes. Rare for the city but spec-complete."""
+    """Drifting snow flakes. Rare for a beach scene but spec-complete."""
     flakes = 60
     for i in range(flakes):
         seed_x = _hash(i + 6000)
